@@ -1,0 +1,15 @@
+Hydra Manga TL has been installed successfully.
+
+After installation:
+1. Launch Hydra Manga TL from the Start Menu or Desktop.
+2. Import manga images or a folder.
+3. Select Translate All Pending.
+4. Review and correct the translated pages.
+5. Export the completed PNG images.
+
+The first translation may take longer while OCR and translation models download.
+
+Projects and logs are stored under:
+%LOCALAPPDATA%\Hydra Manga TL
+
+Uninstalling the application does not automatically delete your saved projects.

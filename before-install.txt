@@ -1,0 +1,12 @@
+Welcome to Hydra Manga TL 0.5.0
+
+Hydra Manga TL translates Japanese and Chinese manga pages into English using local OCR and translation models.
+
+Important:
+- Windows 10 or Windows 11 64-bit is required.
+- Several gigabytes of free disk space are recommended.
+- An internet connection is required during the first translation so the AI models can be downloaded.
+- Original manga images are never modified.
+- Automatic translations should be reviewed before publication.
+
+Click Next to install Hydra Manga TL.
