@@ -18,6 +18,8 @@ class RegionEdit:
     font_family: str = "Arial"
     color: str = "#111111"
     alignment: str = "center"
+    original_text: str | None = None
+    bubble_type: str | None = None
 
 
 @dataclass

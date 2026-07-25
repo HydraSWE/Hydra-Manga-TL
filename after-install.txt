@@ -1,4 +1,4 @@
-Hydra Manga TL has been installed successfully.
+Hydra Manga TL v0.8.0 has been installed successfully.
 
 After installation:
 1. Launch Hydra Manga TL from the Start Menu or Desktop.
@@ -6,6 +6,10 @@ After installation:
 3. Select Translate All Pending.
 4. Review and correct the translated pages.
 5. Export the completed PNG images.
+
+Release notes:
+- v0.8.0 is the finished pipeline checkpoint and is currently under polishing.
+- v0.7.0 was the HydraMangaAi milestone and remains available as the legacy bridge layer.
 
 The first translation may take longer while OCR and translation models download.
 

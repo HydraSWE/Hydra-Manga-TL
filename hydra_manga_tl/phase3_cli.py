@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .art_inpaint import InpaintRuntimeUnavailable, clean_art_text_background, inpaint_python, is_art_text_group, render_art_text
+from .segmentation import reusable_segmentation
 # Updated imports to match the new layout engine in renderer.py
 from .renderer import (
     clean_background, 
@@ -33,6 +35,19 @@ STYLE_DEFAULTS = {
     "Comic": {"font_family": "Comic Sans MS", "alignment": "center", "max_lines": 3},
     "Novel": {"font_family": "Segoe UI", "alignment": "left", "max_lines": 5},
 }
+
+PREVIEW_MAX_SIDE = 1800
+
+
+def _preview_pair(original: Image.Image, final: Image.Image) -> Image.Image:
+    """Build a bounded side-by-side preview without duplicating full pages."""
+    left = ImageOps.contain(original, (PREVIEW_MAX_SIDE // 2, PREVIEW_MAX_SIDE), Image.Resampling.LANCZOS)
+    right = ImageOps.contain(final, (PREVIEW_MAX_SIDE // 2, PREVIEW_MAX_SIDE), Image.Resampling.LANCZOS)
+    height = max(left.height, right.height)
+    preview = Image.new("RGB", (left.width + right.width, height), "white")
+    preview.paste(left, (0, (height - left.height) // 2))
+    preview.paste(right, (left.width, (height - right.height) // 2))
+    return preview
 
 
 def resolve_font_path(font_family: str, fallback: Path = DEFAULT_FONT) -> Path:
@@ -89,6 +104,92 @@ def _same_box(first: list[int], second: list[int]) -> bool:
     return all(abs(int(a) - int(b)) <= 1 for a, b in zip(first, second))
 
 
+def _box_from_polygon(polygon: list[list[int]]) -> list[int]:
+    xs = [int(point[0]) for point in polygon]
+    ys = [int(point[1]) for point in polygon]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _box_area(box: list[int]) -> int:
+    return max(0, int(box[2]) - int(box[0])) * max(0, int(box[3]) - int(box[1]))
+
+
+def _intersection_area(first: list[int], second: list[int]) -> int:
+    x1 = max(int(first[0]), int(second[0]))
+    y1 = max(int(first[1]), int(second[1]))
+    x2 = min(int(first[2]), int(second[2]))
+    y2 = min(int(first[3]), int(second[3]))
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def _center_distance_ratio(first: list[int], second: list[int]) -> float:
+    first_w = max(1, int(first[2]) - int(first[0]))
+    first_h = max(1, int(first[3]) - int(first[1]))
+    first_cx = (int(first[0]) + int(first[2])) / 2.0
+    first_cy = (int(first[1]) + int(first[3])) / 2.0
+    second_cx = (int(second[0]) + int(second[2])) / 2.0
+    second_cy = (int(second[1]) + int(second[3])) / 2.0
+    return (((second_cx - first_cx) / first_w) ** 2 + ((second_cy - first_cy) / first_h) ** 2) ** 0.5
+
+
+def _validated_segmentation_box(group: dict, segmentation: dict, image_size: tuple[int, int]) -> list[int] | None:
+    safe_area = _clip_box([int(value) for value in segmentation["safe_area"]], image_size)
+    source_box = _clip_box(_box_from_polygon(group["polygon"]), image_size)
+    source_area = max(1, _box_area(source_box))
+    safe_area_size = _box_area(safe_area)
+    if safe_area_size <= 0:
+        return None
+    overlap = _intersection_area(source_box, safe_area) / source_area
+    distance = _center_distance_ratio(source_box, safe_area)
+    if overlap < 0.18 and distance > 0.65:
+        return None
+    source_w = max(1, source_box[2] - source_box[0])
+    source_h = max(1, source_box[3] - source_box[1])
+    safe_w = max(1, safe_area[2] - safe_area[0])
+    safe_h = max(1, safe_area[3] - safe_area[1])
+    if safe_w < min(42, source_w * 0.55) and safe_h < min(72, source_h * 0.45):
+        return None
+    return safe_area
+
+
+def _manual_exact_box(group: dict, image_size: tuple[int, int]) -> list[int] | None:
+    if group.get("placement_policy") != "exact" and not group.get("manual"):
+        return None
+    rect = group.get("manual_rect")
+    if isinstance(rect, list) and len(rect) == 4:
+        return _clip_box([int(value) for value in rect], image_size)
+    polygon = group.get("polygon") or []
+    if polygon:
+        return _clip_box(_box_from_polygon(polygon), image_size)
+    return None
+
+
+def _vertical_source_cluster_box(group: dict, image_size: tuple[int, int]) -> list[int] | None:
+    """Use the main vertical OCR column cluster when a stray SFX column was grouped."""
+    if group.get("source_direction", group.get("direction")) != "vertical-rtl":
+        return None
+    polygons = [polygon for polygon in group.get("source_polygons", []) if polygon]
+    if len(polygons) < 2:
+        return None
+    boxes = [_box_from_polygon(polygon) for polygon in polygons]
+    centers = [((box[0] + box[2]) / 2.0, box) for box in boxes]
+    widths = [max(1, box[2] - box[0]) for box in boxes]
+    median_width = sorted(widths)[len(widths) // 2]
+    tolerance = max(70, median_width * 1.8)
+    best_cluster: list[list[int]] = []
+    for center_x, _ in centers:
+        cluster = [box for other_x, box in centers if abs(other_x - center_x) <= tolerance]
+        if len(cluster) > len(best_cluster):
+            best_cluster = cluster
+    if len(best_cluster) < 2 or len(best_cluster) == len(boxes):
+        return None
+    x1 = min(box[0] for box in best_cluster)
+    y1 = min(box[1] for box in best_cluster)
+    x2 = max(box[2] for box in best_cluster)
+    y2 = max(box[3] for box in best_cluster)
+    return expanded_box([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], image_size)
+
+
 def placement_candidates(group: dict, image_size: tuple[int, int], image: Image.Image | None = None) -> list[tuple[str, list[int]]]:
     """Return anchored-first placement boxes, falling back to detected bubbles."""
     polygon = group["polygon"]
@@ -105,9 +206,22 @@ def placement_candidates(group: dict, image_size: tuple[int, int], image: Image.
             return
         candidates.append((name, clipped))
 
+    exact_box = _manual_exact_box(group, image_size)
+    if exact_box is not None:
+        add("manual_exact_bounds", exact_box)
+        return candidates
+
+    segmentation = reusable_segmentation(group.get("bubble_segmentation"), image_size)
+    if segmentation is not None:
+        add("segmented_safe_area", _validated_segmentation_box(group, segmentation, image_size))
+    add("source_cluster_bounds", _vertical_source_cluster_box(group, image_size))
+    if segmentation is None:
+        add("segmented_safe_area", group.get("safe_area"))
     add("anchored_text_bounds", expanded_box(polygon, image_size))
 
-    if group.get("placement_policy") != "exact" and image is not None:
+    # A validated phase-2 segmentation is authoritative. Avoid repeating
+    # connected-component bubble detection for each render candidate.
+    if segmentation is None and group.get("placement_policy") != "exact" and image is not None:
         padding = int(group.get("bubble_padding", 5))
         add("detected_bubble", detect_bubble_box(image, polygon, padding))
         add("safe_bubble_area", compute_safe_text_area(image, polygon, padding))
@@ -123,6 +237,8 @@ def placement_box(group: dict, image_size: tuple[int, int], image: Image.Image |
 def prepare_group_fit(
     group: dict, image_size: tuple[int, int], fallback_font: Path = DEFAULT_FONT,
     image: Image.Image | None = None,
+    *,
+    strict_font_override: bool = True,
 ):
     """Resolve a group's font and fit, rejecting invalid fixed sizes explicitly."""
     defaults = STYLE_DEFAULTS.get(group.get("text_style", "Manga"), STYLE_DEFAULTS["Manga"])
@@ -130,29 +246,46 @@ def prepare_group_fit(
     orig_polygon = group["polygon"]
     orig_h = max(1, max(p[1] for p in orig_polygon) - min(p[1] for p in orig_polygon))
     dynamic_max = min(72, int(orig_h * 1.5))
+    if group.get("placement_policy") == "exact" or group.get("manual"):
+        dynamic_max = min(72, max(dynamic_max, int(orig_h * 0.32)))
     if group.get("source_direction", group.get("direction")) == "vertical-rtl":
-        dynamic_max = min(dynamic_max, 32)
+        dynamic_max = min(dynamic_max, 40 if (group.get("placement_policy") == "exact" or group.get("manual")) else 32)
     maximum = 28 if decorative_horizontal(group, image_size) else dynamic_max
     max_lines = int(group.get("max_lines", defaults["max_lines"]) or 0)
+    if (group.get("placement_policy") == "exact" or group.get("manual")) and max_lines <= defaults["max_lines"]:
+        box = _manual_exact_box(group, image_size)
+        if box is not None:
+            box_height = max(1, box[3] - box[1])
+            max_lines = max(max_lines, min(8, max(3, box_height // 42)))
 
     override = int(group.get("font_size_override", 0) or 0)
+    auto_minimum = int(group.get("minimum_font_size") or 0)
+    if auto_minimum <= 0:
+        exact_or_manual = group.get("placement_policy") == "exact" or group.get("manual")
+        vertical_source = group.get("source_direction", group.get("direction")) == "vertical-rtl"
+        auto_minimum = 10 if (vertical_source and not exact_or_manual) else 5
     largest = None
     for strategy, box in placement_candidates(group, image_size, image):
         if override > 0:
             fitted = fit_text(group["translated_text"], box, group_font, maximum=override, minimum=override, max_lines=max_lines)
             if fitted is None:
-                fallback = fit_text(group["translated_text"], box, group_font, maximum=max(5, override - 1), minimum=5, max_lines=max_lines)
+                fallback = fit_text(group["translated_text"], box, group_font, maximum=max(auto_minimum, override - 1), minimum=auto_minimum, max_lines=max_lines)
                 if fallback is not None and (largest is None or fallback.font_size > largest.font_size):
+                    setattr(fallback, "placement_strategy", strategy)
                     largest = fallback
                 continue
         else:
-            fitted = fit_text(group["translated_text"], box, group_font, maximum=maximum, max_lines=max_lines)
+            fitted = fit_text(group["translated_text"], box, group_font, maximum=maximum, minimum=auto_minimum, max_lines=max_lines)
             if fitted is None:
                 continue
         setattr(fitted, "placement_strategy", strategy)
         return fitted, group_font
 
     if override > 0:
+        if not strict_font_override and largest is not None:
+            setattr(largest, "placement_strategy", getattr(largest, "placement_strategy", "font_override_clamped"))
+            setattr(largest, "requested_font_size", override)
+            return largest, group_font
         suggestion = f"; the largest fitting size is {largest.font_size}" if largest is not None else ""
         raise ValueError(f"Font size {override} does not fit text block {group['index']}{suggestion}.")
     return None, group_font
@@ -166,6 +299,7 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
     output.mkdir(parents=True, exist_ok=True)
     reports = []
     for number, path in enumerate(files, 1):
+        gc.collect()
         payload = json.loads(path.read_text(encoding="utf-8"))
         source = Path(payload["source"])
         print(f"[{number}/{len(files)}] Reconstructing {source.name} ...", flush=True)
@@ -198,7 +332,7 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
             direction = group.get("render_direction", group.get("direction", "horizontal-ltr"))
             if direction == "vertical-rtl":
                 group["translated_text"] = group["translated_text"].replace(" ", "\n")
-            fitted, group_font = prepare_group_fit(group, size, font_path, original)
+            fitted, group_font = prepare_group_fit(group, size, font_path, original, strict_font_override=False)
             if fitted is None:
                 skipped.append({"group": group["index"], "reason": "text_does_not_fit"})
                 continue
@@ -212,15 +346,15 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
             mask = np.maximum(normal_mask, art_mask)
         else:
             mask = make_mask(size, eligible)
-        source_array = np.asarray(original)
         cleaning_method = "unchanged"
         inpaint_warning = ""
         cleaned = None
+        mask_image = Image.fromarray(mask)
         if art_jobs:
             try:
                 configured_inpaint_python = payload.get("inpaint_python")
                 cleaned, cleaning_method = clean_art_text_background(
-                    original, Image.fromarray(mask), output / "_inpaint_work", stem,
+                    original, mask_image, output / "_inpaint_work", stem,
                     python_executable=configured_inpaint_python or inpaint_python(),
                 )
             except InpaintRuntimeUnavailable as error:
@@ -232,11 +366,18 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
                 inpaint_warning = str(error) or type(error).__name__
                 cleaning_method = f"opencv-inpaint-fallback:{type(error).__name__}"
         if cleaned is None:
+            source_array = np.asarray(original)
             cleaned_array, base_method = clean_background(source_array, mask)
             cleaned = Image.fromarray(cleaned_array)
+            del source_array, cleaned_array
             if cleaning_method == "unchanged":
                 cleaning_method = base_method
-        final = cleaned.copy()
+        cleaned_path = output / f"{stem}_cleaned.png"
+        final_path = output / f"{stem}_translated_en.png"
+        mask_path = output / f"{stem}_mask.png"
+        preview_path = output / f"{stem}_preview.png"
+        cleaned.save(cleaned_path)
+        final = cleaned
         rendered = []
         for group, fitted, group_font in render_jobs:
             safe_text = str(group["translated_text"]).encode("ascii", "backslashreplace").decode("ascii")
@@ -259,7 +400,7 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
             details = render_art_text(
                 final,
                 original,
-                Image.fromarray(mask),
+                mask_image,
                 group,
                 maximum=int(group.get("art_text_max_font", 74) or 74),
             )
@@ -268,17 +409,11 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
             details["placement_strategy"] = "art_text_columns"
             rendered.append(details)
 
-        cleaned_path = output / f"{stem}_cleaned.png"
-        final_path = output / f"{stem}_translated_en.png"
-        mask_path = output / f"{stem}_mask.png"
-        preview_path = output / f"{stem}_preview.png"
-        cleaned.save(cleaned_path)
         final.save(final_path)
-        Image.fromarray(mask).save(mask_path)
-        preview = Image.new("RGB", (size[0] * 2, size[1]), "white")
-        preview.paste(original, (0, 0))
-        preview.paste(final, (size[0], 0))
+        mask_image.save(mask_path)
+        preview = _preview_pair(original, final)
         preview.save(preview_path)
+        preview.close()
         image_report = {
             "source": str(source.resolve()), "output": final_path.name,
             "cleaning_method": cleaning_method, "rendered_groups": rendered,
@@ -292,6 +427,10 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
         (output / f"{stem}_render.json").write_text(json.dumps(image_report, ensure_ascii=False, indent=2), encoding="utf-8")
         reports.append({"file": source.name, "rendered": len(rendered), "skipped": len(skipped), "output": final_path.name})
         print(f"  rendered {len(rendered)} in-place; skipped {len(skipped)}")
+        original.close()
+        final.close()
+        mask_image.close()
+        gc.collect()
     report = {"count": len(reports), "replacement_policy": policy, "images": reports}
     (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report

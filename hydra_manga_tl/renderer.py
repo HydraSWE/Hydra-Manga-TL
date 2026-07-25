@@ -405,8 +405,10 @@ def expanded_box(polygon: list[list[int]], image_size: tuple[int, int]) -> list[
     
     if is_vertical:
         # Vertical-to-horizontal: Keep text near the original bubble area
-        # Gentle expansion to avoid overflowing into character faces
-        desired_width = min(width, max(80, int(box_width * 1.8)))
+        # Expand narrow speech columns, but avoid turning larger bubbles into
+        # panel-wide boxes that spill text outside the cleaned area.
+        expansion = 1.8 if box_width < 120 else 1.22
+        desired_width = min(width, max(80, int(box_width * expansion)))
         pad_y = max(5, int(box_height * 0.08))
     else:
         pad_x = max(3, round(box_width * 0.12))

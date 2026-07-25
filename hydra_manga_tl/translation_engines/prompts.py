@@ -42,6 +42,8 @@ def build_page_prompt(
         f"- Do not make the speaker perform an action that the source attributes to the addressed character.\n"
         f"- Preserve honorifics such as senpai, sensei, san, and chan when they show relationships.\n"
         f"- Use concise manga-style phrasing: contractions, natural reactions, and bubble-friendly rhythm.\n"
+        f"- Use ellipses for pauses or abrupt dialogue turns; avoid em dashes and en dashes between English dialogue clauses.\n"
+        f"- If the user, glossary, source metadata, or page context marks the work as hManga/hentai manga/adult manga, keep that adult manga tone and explicit intensity instead of sanitizing it or making it sound generic.\n"
         f"- Preserve jokes/wordplay where possible.\n"
         f"- Do not merge entries; keep one translation per provided id.\n"
         f"- Treat protected entity placeholders as fixed names that must stay unchanged.\n"

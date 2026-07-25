@@ -13,6 +13,15 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from .title import (
+    TitleObject,
+    TitleRenderSettings,
+    composite_title,
+    extract_title_style,
+    render_title,
+)
+from .title.style_profile import FillProfile, OutlineProfile, TitleStyleProfile
+
 
 class InpaintRuntimeUnavailable(RuntimeError):
     """Raised when the optional LaMa/iopaint helper runtime is not installed."""
@@ -90,7 +99,13 @@ def is_art_text_group(group: dict, image_size: tuple[int, int]) -> bool:
     if group.get("art_text") is True or group.get("render_mode") == "art_text":
         return True
     if group.get("manual"):
-        return group.get("placement_policy") == "exact"
+        return group.get("art_text") is True or group.get("render_mode") == "art_text"
+
+    group_type = str(group.get("type") or group.get("bubble_type") or "").strip().lower()
+    if group_type in {"dialogue", "speech", "narration"}:
+        return False
+    if group_type and group_type not in {"sfx", "sound_effect", "credit", "decorative", "title", "sign"}:
+        return False
 
     width, height = image_size
     polygon = group.get("polygon") or []
@@ -154,23 +169,23 @@ def clean_art_text_background(
 
 
 def sample_style(original: Image.Image, mask: Image.Image, polygon: list[list[int]]) -> dict[str, tuple[int, int, int]]:
-    box = _box(polygon)
-    crop = np.asarray(original.crop(tuple(box)).convert("RGB"))
-    mask_crop = np.asarray(mask.crop(tuple(box)).convert("L")) > 0
-    pixels = crop[mask_crop] if mask_crop.any() else crop.reshape(-1, 3)
-    if pixels.size == 0:
-        return {"fill": (255, 255, 255), "stroke": (0, 0, 0), "accent": (120, 105, 190)}
-    luminance = pixels @ np.asarray([0.2126, 0.7152, 0.0722])
-    bright = pixels[luminance >= np.percentile(luminance, 90)]
-    dark = pixels[luminance <= np.percentile(luminance, 10)]
-    white = tuple(int(v) for v in np.percentile(bright if len(bright) else pixels, 75, axis=0))
-    black = tuple(int(v) for v in np.percentile(dark if len(dark) else pixels, 25, axis=0))
-    rgb = pixels.astype(np.float32)
-    saturation = rgb.max(axis=1) - rgb.min(axis=1)
-    colorful = pixels[(saturation >= np.percentile(saturation, 78)) & (luminance > 45) & (luminance < 235)]
-    accent_values = np.median(colorful, axis=0) if len(colorful) else np.median(pixels, axis=0)
-    accent = tuple(int(v) for v in accent_values)
-    return {"fill": white, "stroke": black, "accent": accent}
+    title = TitleObject(
+        id="sample",
+        polygon=polygon,
+        original_text="",
+        translated_text="",
+        render_settings=TitleRenderSettings(),
+        metadata={"renderable_type": "title", "render_mode": "art_text"},
+    )
+    profile = extract_title_style(original, mask, title)
+    fill = (profile.fill.dominant_color if profile.fill else None) or (255, 255, 255)
+    stroke = (profile.outline.color if profile.outline else None) or (0, 0, 0)
+    accent = (
+        profile.glow.color if profile.glow and profile.glow.color else
+        profile.shadow.color if profile.shadow and profile.shadow.color else
+        fill
+    )
+    return {"fill": fill, "stroke": stroke, "accent": accent}
 
 
 def split_translation_for_polygons(text: str, source_texts: list[str], count: int) -> list[str]:
@@ -229,36 +244,50 @@ def render_art_text(
     polygons = [polygon for polygon in polygons if polygon]
     source_texts = group.get("source_member_texts") or []
     chunks = split_translation_for_polygons(group.get("translated_text", ""), source_texts, len(polygons))
-    canvas = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
     rendered = []
     for polygon, chunk in zip(polygons, chunks):
-        words = [word.strip().upper() for word in chunk.split() if word.strip()]
-        if not words:
+        if not str(chunk).strip():
             continue
-        box = _box(polygon)
-        fitted = _fit_words(words, box, maximum=maximum)
-        if fitted is None:
-            continue
-        scale, stroke, gap, metrics = fitted
+        title = TitleObject(
+            id=str(group.get("title_id") or group.get("index") or "art"),
+            polygon=[[int(x), int(y)] for x, y in polygon],
+            original_text=str(group.get("original_text") or ""),
+            translated_text=str(chunk).upper(),
+            style_profile=TitleStyleProfile.from_dict(group.get("style_profile") if isinstance(group.get("style_profile"), dict) else None),
+            render_settings=TitleRenderSettings(
+                max_font_size=int(group.get("art_text_max_font", maximum) or maximum),
+                min_font_size=10,
+                alignment=str(group.get("alignment", "center")),
+            ),
+            metadata={"renderable_type": "title", "render_mode": "art_text"},
+        )
+        profile = title.style_profile
+        if profile.fill is None or profile.outline is None:
+            extracted = extract_title_style(original, mask, title)
+            profile = TitleStyleProfile(
+                fill=profile.fill or extracted.fill or FillProfile(),
+                outline=profile.outline or extracted.outline or OutlineProfile(),
+                shadow=profile.shadow or extracted.shadow,
+                glow=profile.glow or extracted.glow,
+                gradient=profile.gradient or extracted.gradient,
+                typography=profile.typography or extracted.typography,
+                rotation=profile.rotation if profile.rotation is not None else extracted.rotation,
+                opacity=profile.opacity if profile.opacity is not None else extracted.opacity,
+                blend_mode=profile.blend_mode or extracted.blend_mode,
+                metadata={**extracted.metadata, **profile.metadata},
+            )
+        layer = render_title(image, title, profile)
+        composited = composite_title(image, layer, title.render_settings)
+        image.paste(composited)
+        report = layer.report()
         style = sample_style(original, mask, polygon)
-        fill_bgr = tuple(int(v) for v in reversed(style["fill"]))
-        stroke_bgr = tuple(int(v) for v in reversed(style["stroke"]))
-        accent_bgr = tuple(int(v) for v in reversed(style["accent"]))
-        outer = max(stroke + 3, 4)
-        accent_offset = max(2, int(maximum // 18))
-        x1, y1, x2, y2 = box
-        total_h = sum(h + baseline for _, h, baseline in metrics) + gap * (len(words) - 1)
-        y = y1 + max(0, (y2 - y1 - total_h) // 2)
-        positions = []
-        for word, (word_w, word_h, baseline) in zip(words, metrics):
-            x = x1 + max(0, (x2 - x1 - word_w) // 2)
-            baseline_y = y + word_h
-            cv2.putText(canvas, word, (x + accent_offset, baseline_y + accent_offset), cv2.FONT_HERSHEY_TRIPLEX, scale, fill_bgr, outer, cv2.LINE_AA)
-            cv2.putText(canvas, word, (x + accent_offset, baseline_y + accent_offset), cv2.FONT_HERSHEY_TRIPLEX, scale, accent_bgr, stroke, cv2.LINE_AA)
-            cv2.putText(canvas, word, (x, baseline_y), cv2.FONT_HERSHEY_TRIPLEX, scale, stroke_bgr, outer, cv2.LINE_AA)
-            cv2.putText(canvas, word, (x, baseline_y), cv2.FONT_HERSHEY_TRIPLEX, scale, fill_bgr, stroke, cv2.LINE_AA)
-            positions.append([int(x), int(baseline_y - word_h)])
-            y += word_h + baseline + gap
-        rendered.append({"polygon": polygon, "text": chunk, "positions": positions, "sampled_style": style})
-    image.paste(Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)))
+        rendered.append({
+            "polygon": polygon,
+            "text": chunk,
+            "positions": report["positions"],
+            "sampled_style": style,
+            "style_profile": report["style_profile"],
+            "font_size": report["font_size"],
+            "overflow": report["overflow"],
+        })
     return {"text": group.get("translated_text", ""), "art_runs": rendered}

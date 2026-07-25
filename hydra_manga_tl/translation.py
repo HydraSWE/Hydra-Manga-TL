@@ -385,7 +385,7 @@ def _localization_prompt(
         for index, (original, literal) in enumerate(zip(originals, literals), 1)
     ]
     return f"""Localize these {source_language} manga dialogue blocks into {target_language}.
-Style: {style}. Preserve meaning, character tone, punctuation, and glossary spellings. Use concise natural dialogue that fits the supplied layout. Do not invent missing content or intensify profanity. Flag uncertain names, pronouns, idioms, incomplete OCR, and incomplete sentences.
+Style: {style}. Preserve meaning, character tone, punctuation, and glossary spellings. Use concise natural dialogue that fits the supplied layout. Use ellipses for pauses or abrupt dialogue turns; avoid em dashes and en dashes between English dialogue clauses. Do not invent missing content or intensify profanity. If the user, glossary, source metadata, or page context marks the work as hManga/hentai manga/adult manga, keep that adult manga tone and explicit intensity instead of sanitizing it or making it sound generic. Flag uncertain names, pronouns, idioms, incomplete OCR, and incomplete sentences.
 Glossary: {json.dumps(glossary, ensure_ascii=False)}
 Blocks: {json.dumps(blocks, ensure_ascii=False)}
 Return exactly one JSON object with a translations array. Each entry must contain index, translated_text, review_reasons (array of short snake_case codes), alternatives (up to 3 strings), and note. Preserve every index exactly once."""

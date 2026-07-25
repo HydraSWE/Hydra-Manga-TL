@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-import subprocess
+import multiprocessing
 import sys
 from pathlib import Path
 
@@ -29,9 +29,11 @@ def _apply_qwen_runtime_defaults() -> None:
 
 
 def _activate_project_runtime() -> None:
-    """Relaunch global-Python invocations with the project virtual environment."""
+    """Replace global-Python invocations with the project virtual environment."""
     if getattr(sys, "frozen", False) or sys.prefix != sys.base_prefix:
         return
+    if os.environ.get("HYDRA_VENV_REEXEC") == "1":
+        raise RuntimeError("Hydra virtual environment activation loop detected.")
     root = Path(__file__).resolve().parent
     venv_python = root / ".venv" / "Scripts" / "python.exe"
     if not venv_python.is_file():
@@ -39,12 +41,13 @@ def _activate_project_runtime() -> None:
             "Hydra Manga TL dependencies are not installed. Run: "
             "python -m venv .venv; .\\.venv\\Scripts\\python -m pip install -r requirements.txt"
         )
-    completed = subprocess.run([str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
-    raise SystemExit(completed.returncode)
+    os.environ["HYDRA_VENV_REEXEC"] = "1"
+    os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 _apply_qwen_runtime_defaults()
 _activate_project_runtime()
+multiprocessing.freeze_support()
 
 from hydra_manga_tl.application import MangaApplication
 

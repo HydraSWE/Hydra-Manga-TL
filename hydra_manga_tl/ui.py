@@ -6,17 +6,18 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPolygonF, QPixmap, QWheelEvent
+from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QColor, QDrag, QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPolygonF, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGraphicsPixmapItem, QGraphicsPolygonItem, QGraphicsRectItem, QGraphicsScene,
     QGraphicsView, QGridLayout, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem, QMainWindow,
-    QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
-    QStackedWidget, QStyle, QTabWidget, QSizePolicy, QTextEdit, QToolButton, QVBoxLayout, QWidget,
+    QKeySequenceEdit, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QStackedWidget, QStyle, QTabWidget, QSizePolicy, QTextEdit, QToolButton, QToolTip, QVBoxLayout, QWidget,
 )
 
 from .editor_project import RegionEdit
+from .ai_bridge import HYDRA_AI
 from .import_scan import ImportScanResult, ImportScanWorker, ThumbnailWorker
 from .language import resolve_source_language
 from .manual_region import normalize_image_rect
@@ -30,6 +31,210 @@ from .workspace import WORKSPACE, RecentProjectSummary
 TARGET_LANGUAGE_NAMES = {"en": "English"}
 FILMSTRIP_CARD_SIZE = QSize(88, 104)
 FILMSTRIP_PREVIEW_SIZE = QSize(72, 78)
+
+
+class AiCenterDialog(QDialog):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Hydra AI Dataset Dashboard"); self.resize(760, 720)
+        layout = QVBoxLayout(self)
+        title = QLabel("Hydra AI Center"); title.setObjectName("Heading"); layout.addWidget(title)
+        self.profile_label = QLabel(); self.profile_label.setObjectName("Muted"); layout.addWidget(self.profile_label)
+        intro = QLabel("Dataset readiness • Japanese → English • only explicitly approved corrections count toward training")
+        intro.setWordWrap(True); intro.setObjectName("Muted"); layout.addWidget(intro)
+        self.training_state = QLabel(); self.training_state.setWordWrap(True); layout.addWidget(self.training_state)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame)
+        host = QWidget(); self.cards_layout = QVBoxLayout(host); self.cards_layout.setContentsMargins(0, 4, 4, 4); self.cards_layout.setSpacing(8)
+        self.cards = {}
+        tasks = (("OCR Expert", "ocr"), ("Translation Expert", "translation"), ("Bubble Detector", "bubble"),
+                 ("Layout Expert", "layout"), ("Image Cleaner", "cleaner"), ("Quality Judge", "quality"))
+        for label, task in tasks:
+            card = QFrame(); card.setObjectName("ProgressPanel")
+            card_layout = QVBoxLayout(card); card_layout.setContentsMargins(12, 9, 12, 9); card_layout.setSpacing(5)
+            heading_row = QHBoxLayout(); heading = QLabel(label); heading.setObjectName("JobTitle")
+            count = QLabel("0 / 0"); count.setObjectName("Muted"); heading_row.addWidget(heading); heading_row.addStretch(); heading_row.addWidget(count)
+            progress = QProgressBar(); progress.setRange(0, 1); progress.setValue(0); progress.setTextVisible(True)
+            detail = QLabel("Waiting for approved corrections"); detail.setObjectName("Muted"); detail.setWordWrap(True)
+            button_row = QHBoxLayout()
+            dry_run = QPushButton("Dry Run"); dry_run.clicked.connect(lambda _=False, value=task: self._dry_run(value))
+            button = QPushButton("Not Ready"); button.setEnabled(False); button.clicked.connect(lambda _=False, value=task: self._queue(value))
+            button_row.addWidget(dry_run); button_row.addWidget(button)
+            card_layout.addLayout(heading_row); card_layout.addWidget(progress); card_layout.addWidget(detail); card_layout.addLayout(button_row)
+            self.cards_layout.addWidget(card); self.cards[task] = {"count": count, "progress": progress, "detail": detail, "button": button, "dry_run": dry_run}
+        self.cards_layout.addStretch(); scroll.setWidget(host); layout.addWidget(scroll, 1)
+        controls = QHBoxLayout()
+        refresh = QPushButton("Refresh"); refresh.clicked.connect(self.refresh)
+        pause = QPushButton("Pause Training"); pause.clicked.connect(self._pause)
+        resume = QPushButton("Resume Training"); resume.clicked.connect(self._resume)
+        close = QPushButton("Close"); close.clicked.connect(self.accept)
+        controls.addWidget(refresh); controls.addWidget(pause); controls.addWidget(resume); controls.addStretch(); controls.addWidget(close)
+        layout.addLayout(controls); self.refresh()
+
+    def refresh(self) -> None:
+        payload = HYDRA_AI.model_status()
+        style = WORKSPACE.current.text_style if WORKSPACE.current else "Manga"
+        self.profile_label.setText(f"Style profile: {style} • Data root: {SETTINGS.ai_data_root}")
+        paused = bool(payload.get("paused"))
+        self.training_state.setText("Training is paused." if paused else "Training is available only when a model reaches both dataset and golden-set thresholds.")
+        progress_data = payload.get("progress", {})
+        for task, widgets in self.cards.items():
+            profile = style if task in {"translation", "layout"} else "global"
+            item = progress_data.get(f"{task}:{profile}", {})
+            approved = int(item.get("approved", 0)); required = max(1, int(item.get("required", 1)))
+            unit = item.get("unit", "samples")
+            widgets["count"].setText(f"{approved:,} / {required:,} {unit}")
+            widgets["progress"].setRange(0, required); widgets["progress"].setValue(min(approved, required))
+            widgets["progress"].setFormat(f"%p%  •  %v / {required:,}")
+            golden = int(item.get("golden", 0)); required_golden = int(item.get("required_golden", 0))
+            details = [f"Golden set: {golden:,} / {required_golden:,}"]
+            if task == "bubble":
+                details.append(f"Approved regions: {int(item.get('regions', 0)):,} / {int(item.get('required_regions', 2000)):,}")
+            reasons = item.get("reasons", [])
+            if reasons:
+                details.append("Blocked: " + "; ".join(reasons[:2]))
+            elif item.get("ready"):
+                details.append("Ready to train")
+            widgets["detail"].setText(" • ".join(details))
+            ready = bool(item.get("ready")) and not paused
+            widgets["button"].setEnabled(ready); widgets["button"].setText("Queue Training" if ready else "Not Ready")
+
+    def _queue(self, task: str) -> None:
+        style = WORKSPACE.current.text_style if WORKSPACE.current else "Manga"
+        run_id = HYDRA_AI.queue_training(task, style)
+        self.refresh()
+        QMessageBox.information(self, "Training queue", f"Run recorded: {run_id}" if run_id else "HydraMangaAi is unavailable.")
+
+    def _dry_run(self, task: str) -> None:
+        style = WORKSPACE.current.text_style if WORKSPACE.current else "Manga"
+        result = HYDRA_AI.training_dry_run(task, style)
+        readiness = result.get("readiness", {})
+        reasons = readiness.get("reasons") or result.get("reasons") or ()
+        lines = [
+            f"Task: {result.get('task', task)}",
+            f"Profile: {result.get('profile', style)}",
+            f"Ready: {'yes' if result.get('ready') else 'no'}",
+        ]
+        if readiness:
+            lines.extend([
+                f"Approved pairs: {readiness.get('approved_pairs', 0):,}",
+                f"Golden pairs: {readiness.get('golden_pairs', 0):,}",
+                f"Projects: {readiness.get('project_count', 0):,}",
+            ])
+        if reasons:
+            lines.append("Blocked: " + "; ".join(str(reason) for reason in reasons))
+        if result.get("next_step"):
+            lines.append(str(result["next_step"]))
+        QMessageBox.information(self, "Training dry run", "\n".join(lines))
+
+    def _pause(self) -> None:
+        HYDRA_AI.pause_training(); self.refresh()
+
+    def _resume(self) -> None:
+        HYDRA_AI.resume_training(); self.refresh()
+
+
+class WorkingDialog(QDialog):
+    def __init__(self, title: str, message: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("WorkingDialog")
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setFixedWidth(460)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+        heading = QLabel(title)
+        heading.setObjectName("WorkingTitle")
+        self.message = QLabel(message)
+        self.message.setObjectName("Muted")
+        self.message.setWordWrap(True)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.log = QTextEdit()
+        self.log.setObjectName("WorkingLog")
+        self.log.setReadOnly(True)
+        self.log.setFixedHeight(120)
+        self.log.hide()
+        layout.addWidget(heading)
+        layout.addWidget(self.message)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.log)
+
+    def set_message(self, message: str) -> None:
+        self.message.setText(message)
+        QApplication.processEvents()
+
+    def append_log(self, message: str) -> None:
+        line = message.strip()
+        if not line:
+            return
+        self.log.show()
+        self.log.append(line)
+        scrollbar = self.log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        QApplication.processEvents()
+
+
+class ExportOptionsDialog(QDialog):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export")
+        self.setModal(True)
+        self.setFixedWidth(380)
+
+        self.output_type = QComboBox()
+        self.output_type.addItem("Image folder", "folder")
+        self.output_type.addItem("ZIP archive", "zip")
+        self.output_type.addItem("CBZ comic archive", "cbz")
+
+        self.image_format = QComboBox()
+        self.image_format.addItem("PNG", "png")
+        self.image_format.addItem("JPEG", "jpg")
+        self.image_format.addItem("WebP", "webp")
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.addRow("Output", self.output_type)
+        form.addRow("Image format", self.image_format)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Export")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+
+class CollapsibleSection(QFrame):
+    def __init__(self, title: str, expanded: bool = False, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("InspectorSection")
+        self.toggle = QToolButton()
+        self.toggle.setObjectName("SectionToggle")
+        self.toggle.setText(title)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.clicked.connect(self._set_expanded)
+
+        self.body = QWidget()
+        self.body.setVisible(expanded)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.toggle)
+        layout.addWidget(self.body)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.body.setVisible(expanded)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
 
 
 def _page_label(path: str, index: int) -> str:
@@ -92,21 +297,114 @@ def _landing_icon(kind: str, size: int) -> QPixmap:
     return pixmap
 
 
+def _speaker_icon(color: str = "#69a0ff", size: int = 18) -> QIcon:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), max(2, size // 9), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(QColor(color))
+    speaker = QPolygonF([
+        QPointF(size * 0.12, size * 0.40),
+        QPointF(size * 0.34, size * 0.40),
+        QPointF(size * 0.58, size * 0.20),
+        QPointF(size * 0.58, size * 0.80),
+        QPointF(size * 0.34, size * 0.60),
+        QPointF(size * 0.12, size * 0.60),
+    ])
+    painter.drawPolygon(speaker)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawArc(int(size * 0.56), int(size * 0.30), int(size * 0.26), int(size * 0.40), -45 * 16, 90 * 16)
+    painter.drawArc(int(size * 0.50), int(size * 0.18), int(size * 0.44), int(size * 0.64), -45 * 16, 90 * 16)
+    painter.end()
+    return QIcon(pixmap)
+
+
 class ReorderableFilmstrip(QListWidget):
     """Horizontal page list that reports its stable ID order after a move."""
 
     order_changed = Signal(list)
+    reorder_hint = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self._reorder_enabled = True
+        self._drop_target_index: int | None = None
+        self._drop_bar_x = -1
+        self._drop_hover_row = -1
+        self._dragged_ids: set[str] = set()
+        self._last_moved_ids: set[str] = set()
+        self._drag_original_icons: dict[str, QIcon] = {}
+        self._drag_original_sizes: dict[str, QSize] = {}
+        self._gap_index: int | None = None
+        self._plain_press_item: QListWidgetItem | None = None
+        self._plain_press_pos = None
+        self._autoscroll_direction = 0
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.setInterval(55)
+        self._autoscroll_timer.timeout.connect(self._auto_scroll_drag)
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.setDragDropOverwriteMode(False)
         self.setDropIndicatorShown(True)
         self.setDragEnabled(True)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
         self.viewport().setAcceptDrops(True)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
+    def mousePressEvent(self, event) -> None:
+        position = self._event_position(event)
+        is_plain_left = (
+            event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+        )
+        self._plain_press_item = self.itemAt(position) if is_plain_left else None
+        self._plain_press_pos = position if self._plain_press_item is not None else None
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        position = self._event_position(event)
+        press_item = self._plain_press_item
+        press_pos = self._plain_press_pos
+        self._plain_press_item = None
+        self._plain_press_pos = None
+        super().mouseReleaseEvent(event)
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and press_item is not None
+            and press_item is self.itemAt(position)
+            and press_pos is not None
+            and (position - press_pos).manhattanLength() <= QApplication.startDragDistance()
+        ):
+            self._select_single_item(press_item)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.RightButton:
+            item = self.itemAt(self._event_position(event))
+            if item is not None:
+                self._select_single_item(item)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        delta = event.angleDelta().y() or event.angleDelta().x() or event.pixelDelta().y() or event.pixelDelta().x()
+        bar = self.horizontalScrollBar()
+        if delta and bar.maximum() > 0:
+            bar.setValue(bar.value() - delta)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def _event_position(self, event):
+        return event.position().toPoint() if hasattr(event, "position") else event.pos()
+
+    def _select_single_item(self, item: QListWidgetItem) -> None:
+        self.clearSelection()
+        item.setSelected(True)
+        self.setCurrentItem(item)
 
     def set_reorder_enabled(self, enabled: bool) -> None:
         self._reorder_enabled = enabled
@@ -118,21 +416,60 @@ class ReorderableFilmstrip(QListWidget):
             if enabled else "Page order cannot be changed while translation is running."
         )
 
-    def dropEvent(self, event: QDropEvent) -> None:
+    def startDrag(self, supported_actions: Qt.DropAction) -> None:
+        self._begin_drag_feedback()
+        try:
+            indexes = self.selectedIndexes()
+            if not indexes:
+                return
+            drag = QDrag(self)
+            drag.setMimeData(self.model().mimeData(indexes))
+            current = self.currentItem() or (self.selectedItems()[0] if self.selectedItems() else None)
+            if current is not None:
+                preview = self._drag_preview_pixmap(current)
+                if not preview.isNull():
+                    drag.setPixmap(preview)
+                    drag.setHotSpot(preview.rect().center())
+            drag.exec(supported_actions, Qt.DropAction.MoveAction)
+        finally:
+            self._clear_drag_feedback()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if self._reorder_enabled and event.source() is self:
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
         if not self._reorder_enabled or event.source() is not self:
             event.ignore()
             return
         position = event.position().toPoint()
-        target_item = self.itemAt(position)
-        if target_item is None:
-            target_index = self.count()
-        else:
-            target_index = self.row(target_item)
-            if position.x() >= self.visualItemRect(target_item).center().x():
-                target_index += 1
-        self._move_selected_to(target_index)
+        self._update_drop_feedback(position)
+        self._update_drag_autoscroll(position)
         event.setDropAction(Qt.DropAction.MoveAction)
         event.accept()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._clear_drop_feedback()
+        self._stop_drag_autoscroll()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if not self._reorder_enabled or event.source() is not self:
+            event.ignore()
+            return
+        self._update_drop_feedback(event.position().toPoint())
+        target_index = self._drop_target_index if self._drop_target_index is not None else self.count()
+        moved = self._move_selected_to(target_index)
+        self._clear_drop_feedback()
+        self._stop_drag_autoscroll()
+        event.setDropAction(Qt.DropAction.MoveAction)
+        if moved:
+            event.accept()
+        else:
+            event.ignore()
 
     def _move_selected_to(self, target_index: int) -> bool:
         before = self.ordered_ids()
@@ -164,11 +501,210 @@ class ReorderableFilmstrip(QListWidget):
                 items[image_id].setSelected(True)
         finally:
             self.blockSignals(blocked)
+        self._last_moved_ids = set(selected_ids)
         self.order_changed.emit(after)
         return True
 
     def ordered_ids(self) -> list[str]:
         return [str(self.item(row).data(Qt.ItemDataRole.UserRole)) for row in range(self.count())]
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self._drop_target_index is None or self._drop_bar_x < 0:
+            return
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        top = 8
+        bottom = max(top + 1, self.viewport().height() - 10)
+        painter.setPen(QPen(QColor("#69a0ff"), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(self._drop_bar_x, top, self._drop_bar_x, bottom)
+        painter.setPen(QPen(QColor("#69a0ff"), 2))
+        if 0 <= self._drop_hover_row < self.count():
+            rect = self.visualItemRect(self.item(self._drop_hover_row)).adjusted(2, 2, -2, -2)
+            painter.drawRoundedRect(rect, 5, 5)
+        painter.end()
+
+    def _begin_drag_feedback(self) -> None:
+        self._dragged_ids = {str(item.data(Qt.ItemDataRole.UserRole)) for item in self.selectedItems()}
+        self._drag_original_icons.clear()
+        self._drag_original_sizes = {
+            str(self.item(row).data(Qt.ItemDataRole.UserRole)): self.item(row).sizeHint()
+            for row in range(self.count())
+            if self.item(row) is not None
+        }
+        for item in self.selectedItems():
+            image_id = str(item.data(Qt.ItemDataRole.UserRole))
+            icon = item.icon()
+            self._drag_original_icons[image_id] = icon
+            pixmap = icon.pixmap(FILMSTRIP_PREVIEW_SIZE)
+            if pixmap.isNull():
+                continue
+            muted = QPixmap(pixmap.size())
+            muted.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(muted)
+            painter.setOpacity(0.45)
+            painter.drawPixmap(0, 0, pixmap)
+            painter.end()
+            item.setIcon(QIcon(muted))
+        current = self.currentItem() or (self.selectedItems()[0] if self.selectedItems() else None)
+        if current is not None:
+            drag_pixmap = self._drag_preview_pixmap(current)
+            if not drag_pixmap.isNull():
+                self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.viewport().update()
+
+    def _drag_preview_pixmap(self, item: QListWidgetItem) -> QPixmap:
+        image_id = str(item.data(Qt.ItemDataRole.UserRole))
+        source_icon = self._drag_original_icons.get(image_id, item.icon())
+        source = source_icon.pixmap(FILMSTRIP_PREVIEW_SIZE)
+        if source.isNull():
+            return source
+        scale = 1.08
+        lifted = source.scaled(
+            max(1, int(source.width() * scale)),
+            max(1, int(source.height() * scale)),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        canvas = QPixmap(lifted.width() + 10, lifted.height() + 10)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 80))
+        painter.drawRoundedRect(7, 7, lifted.width(), lifted.height(), 5, 5)
+        painter.drawPixmap(2, 2, lifted)
+        painter.end()
+        return canvas
+
+    def _clear_drag_feedback(self) -> None:
+        self._clear_drop_feedback()
+        self._stop_drag_autoscroll()
+        if self._drag_original_icons:
+            for row in range(self.count()):
+                item = self.item(row)
+                if item is None:
+                    continue
+                image_id = str(item.data(Qt.ItemDataRole.UserRole))
+                if image_id in self._drag_original_icons:
+                    item.setIcon(self._drag_original_icons[image_id])
+        self._drag_original_icons.clear()
+        self._drag_original_sizes.clear()
+        self._dragged_ids.clear()
+        self.viewport().update()
+
+    def _target_index_at(self, position) -> int:
+        target_item = self.itemAt(position)
+        if target_item is None:
+            return self.count()
+        target_index = self.row(target_item)
+        if position.x() >= self.visualItemRect(target_item).center().x():
+            target_index += 1
+        return max(0, min(self.count(), target_index))
+
+    def _update_drop_feedback(self, position) -> None:
+        target_index = self._target_index_at(position)
+        if target_index < self.count():
+            target_rect = self.visualItemRect(self.item(target_index))
+            bar_x = target_rect.left() - max(3, self.spacing() // 2)
+            hover_row = target_index
+        elif self.count():
+            target_rect = self.visualItemRect(self.item(self.count() - 1))
+            bar_x = target_rect.right() + max(3, self.spacing() // 2)
+            hover_row = self.count() - 1
+        else:
+            bar_x = 8
+            hover_row = -1
+        changed = target_index != self._drop_target_index or bar_x != self._drop_bar_x
+        self._drop_target_index = target_index
+        self._drop_bar_x = bar_x
+        self._drop_hover_row = hover_row
+        self._apply_gap(target_index)
+        if changed:
+            selected_ids = self._dragged_ids or {str(item.data(Qt.ItemDataRole.UserRole)) for item in self.selectedItems()}
+            before = self.ordered_ids()
+            selected_positions = [index for index, image_id in enumerate(before) if image_id in selected_ids]
+            display_position = target_index - sum(index < target_index for index in selected_positions) + 1
+            display_position = max(1, min(max(1, self.count() - len(selected_positions) + 1), display_position))
+            source_text = ""
+            if len(selected_ids) == 1:
+                source_id = next(iter(selected_ids))
+                if source_id in before:
+                    source_text = f"Page {before.index(source_id) + 1} -> "
+            message = f"{source_text}Position {display_position}"
+            QToolTip.showText(self.viewport().mapToGlobal(position), f"Move to {message}", self.viewport())
+            self.reorder_hint.emit(f"Move {len(selected_ids)} page{'s' if len(selected_ids) != 1 else ''} to position {display_position}")
+        self.viewport().update()
+
+    def _apply_gap(self, target_index: int) -> None:
+        if not self._drag_original_sizes:
+            self._drag_original_sizes = {
+                str(self.item(row).data(Qt.ItemDataRole.UserRole)): self.item(row).sizeHint()
+                for row in range(self.count())
+                if self.item(row) is not None
+            }
+        for row in range(self.count()):
+            item = self.item(row)
+            if item is None:
+                continue
+            image_id = str(item.data(Qt.ItemDataRole.UserRole))
+            original = self._drag_original_sizes.get(image_id, FILMSTRIP_CARD_SIZE)
+            if item.sizeHint() != original:
+                item.setSizeHint(original)
+        self._gap_index = None
+        if not self.count():
+            return
+        gap_row = target_index if target_index < self.count() else self.count() - 1
+        item = self.item(gap_row)
+        if item is None:
+            return
+        image_id = str(item.data(Qt.ItemDataRole.UserRole))
+        original = self._drag_original_sizes.get(image_id, item.sizeHint())
+        item.setSizeHint(QSize(original.width() + 24, original.height()))
+        self._gap_index = gap_row
+
+    def _clear_drop_feedback(self) -> None:
+        for row in range(self.count()):
+            item = self.item(row)
+            if item is None:
+                continue
+            image_id = str(item.data(Qt.ItemDataRole.UserRole))
+            original = self._drag_original_sizes.get(image_id)
+            if original is not None:
+                item.setSizeHint(original)
+        self._drop_target_index = None
+        self._drop_bar_x = -1
+        self._drop_hover_row = -1
+        self._gap_index = None
+        QToolTip.hideText()
+        self.viewport().update()
+
+    def _update_drag_autoscroll(self, position) -> None:
+        margin = 34
+        if position.x() < margin:
+            self._autoscroll_direction = -1
+        elif position.x() > self.viewport().width() - margin:
+            self._autoscroll_direction = 1
+        else:
+            self._autoscroll_direction = 0
+        if self._autoscroll_direction and not self._autoscroll_timer.isActive():
+            self._autoscroll_timer.start()
+        elif not self._autoscroll_direction:
+            self._stop_drag_autoscroll()
+
+    def _auto_scroll_drag(self) -> None:
+        if not self._autoscroll_direction:
+            self._stop_drag_autoscroll()
+            return
+        bar = self.horizontalScrollBar()
+        before = bar.value()
+        bar.setValue(before + self._autoscroll_direction * 16)
+        if bar.value() == before:
+            self._stop_drag_autoscroll()
+
+    def _stop_drag_autoscroll(self) -> None:
+        self._autoscroll_direction = 0
+        self._autoscroll_timer.stop()
 
 
 class DropZone(QFrame):
@@ -651,6 +1187,53 @@ class CanvasView(QGraphicsView):
         self._pixmap.setTransformationMode(mode)
 
 
+class TranslationTestWorker(QObject):
+    completed = Signal(bool, str)
+
+    def __init__(
+        self,
+        *,
+        qwen_model_path: str | None,
+        preferred_engine: str,
+        fallback_engine: str | None,
+        qwen_model_name: str,
+        provider_models: dict[str, str],
+    ) -> None:
+        super().__init__()
+        self.qwen_model_path = qwen_model_path
+        self.preferred_engine = preferred_engine
+        self.fallback_engine = fallback_engine
+        self.qwen_model_name = qwen_model_name
+        self.provider_models = provider_models
+
+    @Slot()
+    def run(self) -> None:
+        from .translation_engines import PageDialogue, TranslationEngineManager
+
+        manager = TranslationEngineManager(
+            glossary={},
+            qwen_model_path=self.qwen_model_path,
+            preferred_engine=self.preferred_engine,
+            fallback_engine=self.fallback_engine,
+            qwen_model_name=self.qwen_model_name,
+            provider_models=self.provider_models,
+        )
+        page = PageDialogue(
+            source_language="Japanese",
+            target_language="en",
+            dialogue=[{"id": "r1", "text": "待て！"}],
+        )
+        try:
+            manager.load()
+            result = manager.translate_page(page)
+            sample = str(result.translations[0].get("text", "")) if result.translations else ""
+            self.completed.emit(True, sample)
+        except Exception as error:
+            self.completed.emit(False, str(error) or type(error).__name__)
+        finally:
+            manager.unload()
+
+
 class SettingsDialog(QDialog):
     """Local-first provider preferences with secrets stored outside settings JSON."""
 
@@ -665,8 +1248,18 @@ class SettingsDialog(QDialog):
         for label, value in (("Local manga cleanup", "local"), ("Gemini", "gemini"), ("Groq", "groq"), ("DeepSeek", "deepseek")):
             self.localization.addItem(label, value)
         self.translation_engine = QComboBox()
+        self.translation_engine.addItem("Groq", "groq")
+        self.translation_engine.addItem("Google Translate", "google")
+        self.translation_engine.addItem("Gemini", "gemini")
         self.translation_engine.addItem("Marian fallback", "marian")
         self.translation_engine.addItem("Local Qwen (optional)", "qwen")
+        self.translation_fallback = QComboBox()
+        self.translation_fallback.addItem("No automatic fallback", "")
+        self.translation_fallback.addItem("Marian (local)", "marian")
+        self.translation_fallback.addItem("Groq", "groq")
+        self.translation_fallback.addItem("Google Translate", "google")
+        self.translation_fallback.addItem("Gemini", "gemini")
+        self.debug_artifacts = QCheckBox("Write OCR crops and diagnostic overlays")
         self.qwen_model = QComboBox()
         for package in KNOWN_MODEL_PACKAGES.values():
             self.qwen_model.addItem(package.label, package.key)
@@ -684,13 +1277,22 @@ class SettingsDialog(QDialog):
         self.gemini_model = QLineEdit(SETTINGS.gemini_model)
         self.groq_model = QLineEdit(SETTINGS.groq_model)
         self.deepseek_model = QLineEdit(SETTINGS.deepseek_model)
+        self.manual_shortcut = QKeySequenceEdit(QKeySequence(SETTINGS.manual_textbox_shortcut or "Ctrl+D"))
         self.keys = {}
         for provider in ("google", "gemini", "groq", "deepseek"):
             field = QLineEdit(); field.setEchoMode(QLineEdit.EchoMode.Password)
             field.setPlaceholderText("Stored securely" if CREDENTIALS.get(provider) else "Not configured")
             self.keys[provider] = field
-        form.addRow("Literal translation", self.literal); form.addRow("Manga localization", self.localization)
-        form.addRow("Translation engine", self.translation_engine)
+        self.literal.setToolTip("Manual text-box literal pass. Batch pages use Batch translation engine.")
+        self.localization.setToolTip("Primary engine used by manual text boxes.")
+        self.translation_engine.setToolTip("Provider used by Translate All Pending and selected-page retranslation.")
+        self.translation_fallback.setToolTip("Used when the selected automatic or manual engine supports fallback.")
+        self.manual_shortcut.setToolTip("Keyboard shortcut for Add Text Box in the workspace.")
+        form.addRow("Manual literal pass", self.literal); form.addRow("Manual translation engine", self.localization)
+        form.addRow("Batch translation engine", self.translation_engine)
+        form.addRow("Fallback engine", self.translation_fallback)
+        form.addRow("Manual text box shortcut", self.manual_shortcut)
+        form.addRow("Debug artifacts", self.debug_artifacts)
         form.addRow("Model", self.qwen_model)
         form.addRow("Qwen GGUF model", qwen_layout)
         form.addRow("Status", self.qwen_status)
@@ -701,7 +1303,7 @@ class SettingsDialog(QDialog):
         form.addRow("Groq model", self.groq_model); form.addRow("Groq API key", self.keys["groq"])
         form.addRow("DeepSeek model", self.deepseek_model); form.addRow("DeepSeek API key", self.keys["deepseek"])
         form.addRow("Google Translate key", self.keys["google"])
-        warning = QLabel("Cloud services are optional and may enforce quotas or charges. Hydra never switches to a cloud provider automatically.")
+        warning = QLabel("Cloud services are optional and may enforce quotas or charges. Automatic pages use Batch translation engine; manual text boxes use Manual translation engine.")
         warning.setWordWrap(True); warning.setObjectName("Muted")
         layout.addLayout(form); layout.addWidget(warning)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -709,6 +1311,8 @@ class SettingsDialog(QDialog):
         self.literal.setCurrentIndex(max(0, self.literal.findData(SETTINGS.literal_provider)))
         self.localization.setCurrentIndex(max(0, self.localization.findData(SETTINGS.localization_provider)))
         self.translation_engine.setCurrentIndex(max(0, self.translation_engine.findData(SETTINGS.translation_engine)))
+        self.translation_fallback.setCurrentIndex(max(0, self.translation_fallback.findData(SETTINGS.translation_fallback_engine)))
+        self.debug_artifacts.setChecked(SETTINGS.debug_artifacts_enabled)
         model_index = max(0, self.qwen_model.findData(SETTINGS.qwen_model_name or "qwen3-4b"))
         self.qwen_model.setCurrentIndex(model_index)
         self._refresh_qwen_metadata()
@@ -728,23 +1332,43 @@ class SettingsDialog(QDialog):
             self._refresh_qwen_metadata()
 
     def _test_qwen_translation(self) -> None:
-        from .translation_engines import PageDialogue, TranslationEngineManager
-        page = PageDialogue(source_language="Japanese", target_language="en", dialogue=[{"id": "r1", "text": "待て！"}])
-        manager = TranslationEngineManager(
-            glossary={},
+        if getattr(self, "_test_thread", None) is not None:
+            return
+        self.qwen_test.setEnabled(False)
+        self.qwen_test.setText("Testing...")
+        self._test_thread = QThread(self)
+        self._test_worker = TranslationTestWorker(
             qwen_model_path=self.qwen_model_path.text().strip() or None,
             preferred_engine=self.translation_engine.currentData() or "qwen",
+            fallback_engine=self.translation_fallback.currentData() or None,
             qwen_model_name=self.qwen_model.currentData() or "qwen3-4b",
+            provider_models={
+                "groq": self.groq_model.text().strip() or SETTINGS.groq_model,
+                "gemini": self.gemini_model.text().strip() or SETTINGS.gemini_model,
+                "deepseek": self.deepseek_model.text().strip() or SETTINGS.deepseek_model,
+            },
         )
-        try:
-            manager.load()
-            result = manager.translate_page(page)
-            sample = result.translations[0]["text"] if result.translations else ""
-            QMessageBox.information(self, "Test translation", sample or "The engine returned an empty translation.")
-        except Exception as error:
-            QMessageBox.warning(self, "Test translation failed", str(error))
-        finally:
-            manager.unload()
+        self._test_worker.moveToThread(self._test_thread)
+        self._test_thread.started.connect(self._test_worker.run)
+        self._test_worker.completed.connect(self._translation_test_finished)
+        self._test_worker.completed.connect(self._test_thread.quit)
+        self._test_thread.finished.connect(self._test_worker.deleteLater)
+        self._test_thread.finished.connect(self._clear_translation_test_thread)
+        self._test_thread.start()
+
+    @Slot(bool, str)
+    def _translation_test_finished(self, ok: bool, message: str) -> None:
+        self.qwen_test.setEnabled(True)
+        self.qwen_test.setText("Test translation")
+        if ok:
+            QMessageBox.information(self, "Test translation", message or "The engine returned an empty translation.")
+        else:
+            QMessageBox.warning(self, "Test translation failed", message)
+
+    @Slot()
+    def _clear_translation_test_thread(self) -> None:
+        self._test_thread = None
+        self._test_worker = None
 
     def _refresh_qwen_metadata(self) -> None:
         package = KNOWN_MODEL_PACKAGES.get(self.qwen_model.currentData() or "qwen3-4b")
@@ -763,12 +1387,16 @@ class SettingsDialog(QDialog):
         SETTINGS.literal_provider = self.literal.currentData()
         SETTINGS.localization_provider = self.localization.currentData()
         SETTINGS.translation_engine = self.translation_engine.currentData() or "qwen"
+        SETTINGS.translation_fallback_engine = self.translation_fallback.currentData() or ""
+        SETTINGS.debug_artifacts_enabled = self.debug_artifacts.isChecked()
         SETTINGS.qwen_model_path = self.qwen_model_path.text().strip()
         SETTINGS.qwen_model_name = self.qwen_model.currentData() or "qwen3-4b"
         SETTINGS.qwen_model_status = self.qwen_status.text().strip() or "Not installed"
         SETTINGS.gemini_model = self.gemini_model.text().strip() or "gemini-3.5-flash"
-        SETTINGS.groq_model = self.groq_model.text().strip() or "qwen/qwen3-32b"
+        SETTINGS.groq_model = self.groq_model.text().strip() or "openai/gpt-oss-120b"
         SETTINGS.deepseek_model = self.deepseek_model.text().strip() or "deepseek-v4-flash"
+        shortcut = self.manual_shortcut.keySequence().toString(QKeySequence.SequenceFormat.PortableText).strip()
+        SETTINGS.manual_textbox_shortcut = shortcut or "Ctrl+D"
         SETTINGS.save()
         if WORKSPACE.current is not None:
             WORKSPACE.current.literal_provider = SETTINGS.literal_provider
@@ -811,10 +1439,14 @@ class WorkspaceScreen(QWidget):
     close_requested = Signal()
 
     _PROGRESS_RANGES = {
+        "preprocessing": (0.0, 5.0),
         "analyzing": (0.0, 5.0),
+        "OCR": (5.0, 30.0),
         "ocr": (5.0, 30.0),
         "translating": (30.0, 50.0),
+        "rendering": (50.0, 90.0),
         "reconstructing": (50.0, 98.0),
+        "review": (90.0, 98.0),
     }
 
     def __init__(self) -> None:
@@ -839,9 +1471,12 @@ class WorkspaceScreen(QWidget):
         self._has_job_details = False
         self._terminal_job_state = ""
         self._job_is_busy = False
+        self._manual_busy = False
+        self._manual_shortcut: QShortcut | None = None
         self.speech = SpeechService(self)
         self.speech.unavailable.connect(lambda message: QMessageBox.information(self, "Original text voice", message))
         self._build()
+        self._configure_manual_shortcut()
         self._progress_timer = QTimer(self); self._progress_timer.setInterval(100)
         self._progress_timer.timeout.connect(self._advance_progress_animation)
         self._job_collapse_timer = QTimer(self); self._job_collapse_timer.setSingleShot(True); self._job_collapse_timer.setInterval(3000)
@@ -854,6 +1489,9 @@ class WorkspaceScreen(QWidget):
         WORKSPACE.manual_region_finished.connect(self._on_manual_region_finished)
         WORKSPACE.manual_region_failed.connect(self._on_manual_region_failed)
         WORKSPACE.manual_region_busy_changed.connect(self._on_manual_region_busy)
+        WORKSPACE.translation_request_state_changed.connect(
+            self._on_translation_request_state,
+        )
 
     def _build(self) -> None:
         root = QVBoxLayout(self); root.setContentsMargins(12, 10, 12, 8); root.setSpacing(8)
@@ -871,15 +1509,16 @@ class WorkspaceScreen(QWidget):
         self.style_combo = QComboBox(); self.style_combo.addItems(["Manga", "Comic", "Novel"]); self.style_combo.currentTextChanged.connect(self._set_text_style)
         self.start_button = QPushButton("Translate All Pending"); self.start_button.setObjectName("Primary"); self.start_button.clicked.connect(lambda: WORKSPACE.start_pipeline())
         self.selected_button = QPushButton("Translate Selected"); self.selected_button.clicked.connect(self._translate_selected_from_button)
-        self.cancel_button = QPushButton("Cancel"); self.cancel_button.clicked.connect(WORKSPACE.cancel_pipeline); self.cancel_button.setEnabled(False)
+        self.cancel_button = QPushButton("Cancel"); self.cancel_button.clicked.connect(WORKSPACE.cancel_active_requests); self.cancel_button.setEnabled(False)
         save = QPushButton("Save"); save.clicked.connect(WORKSPACE.save)
         export = QPushButton("Export"); export.clicked.connect(self._export)
         self.close_button = QPushButton("Close"); self.close_button.clicked.connect(self.close_requested)
         settings = QPushButton("Settings"); settings.clicked.connect(self._open_settings)
+        ai_center = QPushButton("AI Center"); ai_center.clicked.connect(lambda: AiCenterDialog(self).exec())
         glossary = QPushButton("Glossary"); glossary.clicked.connect(lambda: GlossaryDialog(self).exec())
         for widget in (self.project_title, self.count_label): row.addWidget(widget)
         row.addStretch()
-        for widget in (self.source_combo, self.target_combo, self.quality_combo, self.style_combo, self.selected_button, self.start_button, self.cancel_button, glossary, settings, save, export, self.close_button): row.addWidget(widget)
+        for widget in (self.source_combo, self.target_combo, self.quality_combo, self.style_combo, self.selected_button, self.start_button, self.cancel_button, glossary, ai_center, settings, save, export, self.close_button): row.addWidget(widget)
         root.addWidget(header)
 
         tools = QHBoxLayout()
@@ -887,10 +1526,12 @@ class WorkspaceScreen(QWidget):
         next_button = QPushButton("›"); next_button.clicked.connect(lambda: self._move_image(1))
         fit = QPushButton("Fit"); fit.clicked.connect(self._fit_both)
         actual = QPushButton("100%"); actual.clicked.connect(self._actual_both)
+        self.next_ocr_issue = QPushButton("Next OCR Issue"); self.next_ocr_issue.clicked.connect(self._next_ocr_issue)
+        self.next_review_issue = QPushButton("Next Review Issue"); self.next_review_issue.clicked.connect(self._next_review_issue)
         self.add_box = QPushButton("Add Text Box"); self.add_box.clicked.connect(self._begin_manual_box)
         self.image_label = QLabel("No image")
         self.selection_label = QLabel("1 selected"); self.selection_label.setObjectName("Muted")
-        tools.addWidget(previous); tools.addWidget(next_button); tools.addWidget(self.image_label); tools.addWidget(self.selection_label); tools.addStretch(); tools.addWidget(self.add_box); tools.addWidget(fit); tools.addWidget(actual)
+        tools.addWidget(previous); tools.addWidget(next_button); tools.addWidget(self.image_label); tools.addWidget(self.selection_label); tools.addStretch(); tools.addWidget(self.next_ocr_issue); tools.addWidget(self.next_review_issue); tools.addWidget(self.add_box); tools.addWidget(fit); tools.addWidget(actual)
         root.addLayout(tools)
 
         main = QSplitter(Qt.Orientation.Horizontal); self.main_splitter = main
@@ -903,9 +1544,11 @@ class WorkspaceScreen(QWidget):
         self.filmstrip.setViewMode(QListView.ViewMode.IconMode); self.filmstrip.setFlow(QListView.Flow.LeftToRight)
         self.filmstrip.setResizeMode(QListView.ResizeMode.Adjust); self.filmstrip.setMovement(QListView.Movement.Snap)
         self.filmstrip.setWrapping(False); self.filmstrip.setUniformItemSizes(True); self.filmstrip.setSpacing(5)
+        self.filmstrip.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.filmstrip.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.filmstrip.setIconSize(FILMSTRIP_PREVIEW_SIZE); self.filmstrip.setMaximumHeight(124); self.filmstrip.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.filmstrip.set_reorder_enabled(True); self.filmstrip.order_changed.connect(self._on_filmstrip_reordered)
+        self.filmstrip.reorder_hint.connect(lambda text: self.status.setText(text) if hasattr(self, "status") else None)
         self.filmstrip.currentRowChanged.connect(self._filmstrip_current_changed)
         self.filmstrip.itemSelectionChanged.connect(self._selection_changed)
         self.filmstrip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -914,7 +1557,7 @@ class WorkspaceScreen(QWidget):
         main.addWidget(canvas_host)
         self.inspector = self._build_inspector(); main.addWidget(self.inspector)
         main.setStretchFactor(0, 1); main.setStretchFactor(1, 0)
-        self.inspector.setMinimumWidth(420); main.setSizes([1000, 500])
+        self.inspector.setMinimumWidth(540); self.inspector.setMaximumWidth(760); main.setSizes([1200, 640])
         root.addWidget(main, 1)
         self.job_panel = QFrame(); self.job_panel.setObjectName("ProgressPanel")
         job_layout = QVBoxLayout(self.job_panel); job_layout.setContentsMargins(10, 5, 10, 5); job_layout.setSpacing(4)
@@ -941,24 +1584,52 @@ class WorkspaceScreen(QWidget):
         self.original.zoom_changed.connect(self.translated.set_zoom); self.translated.zoom_changed.connect(self.original.set_zoom)
         self._sync_scrollbars(self.original, self.translated); self._sync_scrollbars(self.translated, self.original)
 
+    def _manual_shortcut_sequence(self) -> QKeySequence:
+        sequence = QKeySequence(SETTINGS.manual_textbox_shortcut or "Ctrl+D")
+        return sequence if not sequence.isEmpty() else QKeySequence("Ctrl+D")
+
+    def _configure_manual_shortcut(self) -> None:
+        sequence = self._manual_shortcut_sequence()
+        if self._manual_shortcut is None:
+            self._manual_shortcut = QShortcut(sequence, self)
+            self._manual_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            self._manual_shortcut.activated.connect(self._begin_manual_box)
+        else:
+            self._manual_shortcut.setKey(sequence)
+        label = sequence.toString(QKeySequence.SequenceFormat.NativeText) or "Ctrl+D"
+        self.add_box.setToolTip(f"Draw a manual text box ({label})")
+
     def _build_inspector(self) -> QFrame:
         frame = QFrame(); frame.setObjectName("Inspector"); layout = QVBoxLayout(frame)
+        layout.setContentsMargins(10, 8, 10, 8); layout.setSpacing(6)
         tabs = QTabWidget(); layout.addWidget(tabs)
         text_tab = QWidget(); text_layout = QVBoxLayout(text_tab)
-        self.blocks = QListWidget(); self.blocks.setWordWrap(True); self.blocks.setTextElideMode(Qt.TextElideMode.ElideRight); self.blocks.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.blocks.setMinimumHeight(125); self.blocks.currentRowChanged.connect(self._select_block)
-        text_layout.addWidget(self.blocks, 1)
+        text_layout.setContentsMargins(8, 7, 8, 8); text_layout.setSpacing(7)
+        self.blocks = QListWidget(); self.blocks.setObjectName("TextBlocksList"); self.blocks.setWordWrap(True); self.blocks.setTextElideMode(Qt.TextElideMode.ElideRight); self.blocks.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.blocks.setMinimumHeight(140); self.blocks.setMaximumHeight(175); self.blocks.currentRowChanged.connect(self._select_block)
+        text_layout.addWidget(self.blocks)
+        editor_host = QWidget(); editor_layout = QVBoxLayout(editor_host)
+        editor_layout.setContentsMargins(0, 0, 0, 0); editor_layout.setSpacing(7)
         form_host = QWidget(); form = QFormLayout(form_host); form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        self.original_text = QTextEdit(); self.original_text.setReadOnly(True); self.original_text.setMaximumHeight(58)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setContentsMargins(0, 0, 0, 0); form.setHorizontalSpacing(8); form.setVerticalSpacing(7)
+        self.original_text = QTextEdit(); self.original_text.setReadOnly(False); self.original_text.setFixedHeight(50)
+        self.original_text.setToolTip("Correct OCR source text here; approval is separate from Apply & Rerender")
         self.original_text.setMinimumWidth(0); self.original_text.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         original_host = QWidget(); original_host.setMinimumWidth(0); original_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         original_row = QHBoxLayout(original_host); original_row.setContentsMargins(0, 0, 0, 0); original_row.setSpacing(6)
-        self.speak_original = QToolButton(); self.speak_original.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume))
+        self.speak_original = QToolButton(); self.speak_original.setObjectName("SpeechButton"); self.speak_original.setIcon(_speaker_icon())
+        self.speak_original.setIconSize(QSize(18, 18))
         self.speak_original.setToolTip("Play or stop the original text")
         self.speak_original.setFixedSize(30, 30)
         self.speak_original.setEnabled(False); self.speak_original.clicked.connect(self._speak_original)
         original_row.addWidget(self.original_text, 1); original_row.addWidget(self.speak_original)
-        self.translation = QTextEdit(); self.translation.setMaximumHeight(72)
-        self.confidence = QLabel("—"); self.replace = QCheckBox("Replace source text"); self.replace.setChecked(True)
+        self.translation = QTextEdit(); self.translation.setFixedHeight(50)
+        self.translation.setMinimumWidth(0); self.translation.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.confidence = QLabel("—"); self.confidence.setObjectName("Muted")
+        self.confidence_bar = QProgressBar(); self.confidence_bar.setRange(0, 1000); self.confidence_bar.setTextVisible(False); self.confidence_bar.setFixedHeight(8)
+        confidence_host = QWidget(); confidence_row = QHBoxLayout(confidence_host); confidence_row.setContentsMargins(0, 0, 0, 0); confidence_row.setSpacing(8)
+        confidence_row.addWidget(self.confidence, 0); confidence_row.addWidget(self.confidence_bar, 1)
+        self.replace = QCheckBox("Replace source text"); self.replace.setChecked(True)
         self.font = QComboBox()
         font_options = [
             ("Arial", QFont("Arial")), ("Arial Bold", QFont("Arial", weight=QFont.Weight.Bold)),
@@ -971,36 +1642,76 @@ class WorkspaceScreen(QWidget):
         self.alignment = QComboBox()
         for label, value in (("Left", "left"), ("Center", "center"), ("Right", "right")): self.alignment.addItem(label, value)
         self.alignment.setCurrentIndex(self.alignment.findData("center"))
+        self.bubble_type = QComboBox()
+        for label, value in (("Speech", "speech"), ("Narration", "narration"), ("SFX", "sfx"), ("Sign", "sign")):
+            self.bubble_type.addItem(label, value)
         self.color = QPushButton("#111111"); self.color.clicked.connect(self._choose_color)
         self.offset_x = QSpinBox(); self.offset_x.setRange(-500, 500); self.offset_x.setSuffix(" px")
         self.offset_y = QSpinBox(); self.offset_y.setRange(-500, 500); self.offset_y.setSuffix(" px")
         self.offset_x.setSingleStep(5); self.offset_y.setSingleStep(5)
-        x_host = self._build_offset_control(self.offset_x, "left", "right")
-        y_host = self._build_offset_control(self.offset_y, "up", "down")
-        for label, widget in (("Original", original_host), ("Translation", self.translation), ("Confidence", self.confidence)): form.addRow(label, widget)
+        self.offset_x.setButtonSymbols(QSpinBox.ButtonSymbols.UpDownArrows)
+        self.offset_y.setButtonSymbols(QSpinBox.ButtonSymbols.UpDownArrows)
+        for label, widget in (("Original", original_host), ("Translation", self.translation), ("Confidence", confidence_host)): form.addRow(label, widget)
         form.addRow(self.replace)
-        for label, widget in (("Font", self.font), ("Size", self.font_size), ("Color", self.color), ("Alignment", self.alignment), ("X", x_host), ("Y", y_host)): form.addRow(label, widget)
+        editor_layout.addWidget(self._build_static_inspector_section("1. Translation", form_host))
+        editor_layout.addWidget(self._build_inspector_section("2. Bubble", (("Bubble type", self.bubble_type), ("Alignment", self.alignment)), expanded=True))
+        editor_layout.addWidget(self._build_inspector_section("3. Typography", (("Font", self.font), ("Size", self.font_size)), expanded=False))
+        editor_layout.addWidget(self._build_inspector_section("4. Transform", (("X", self.offset_x), ("Y", self.offset_y)), expanded=False))
+        editor_layout.addWidget(self._build_inspector_section("5. Appearance", (("Color", self.color),), expanded=False))
+        editor_layout.addStretch()
         form_scroll = QScrollArea(); form_scroll.setWidgetResizable(True); form_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); form_scroll.setWidget(form_host)
-        form_scroll.setMinimumHeight(245); form_scroll.setMaximumHeight(440)
-        text_layout.addWidget(form_scroll)
+        form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); form_scroll.setWidget(editor_host)
+        text_layout.addWidget(form_scroll, 1)
+        footer = QFrame(); footer.setObjectName("InspectorFooter")
+        footer_layout = QVBoxLayout(footer); footer_layout.setContentsMargins(0, 7, 0, 0); footer_layout.setSpacing(6)
         actions = QGridLayout(); actions.setHorizontalSpacing(6); actions.setVerticalSpacing(6)
-        self.remove_block = QPushButton("Remove Block"); self.remove_block.clicked.connect(self._remove_selected_block); self.remove_block.setEnabled(False)
+        self.remove_block = QPushButton("Remove Block"); self.remove_block.setObjectName("DangerButton"); self.remove_block.clicked.connect(self._remove_selected_block); self.remove_block.setEnabled(False)
         self.remove_block.setToolTip("Remove the selected automatic block, or delete the selected manual block")
         self.restore_auto = QPushButton("Restore Auto"); self.restore_auto.clicked.connect(self._restore_auto_blocks); self.restore_auto.setEnabled(False)
         self.restore_auto.setToolTip("Restore automatic blocks that were removed from this page")
-        self.apply_button = QPushButton("Apply && Rerender"); self.apply_button.setObjectName("Primary"); self.apply_button.clicked.connect(self._apply)
+        self.apply_button = QPushButton("Apply && Rerender"); self.apply_button.setObjectName("InspectorPrimary"); self.apply_button.clicked.connect(self._apply)
         self.apply_button.setToolTip("Save these text settings and rebuild the translated page")
         self.reset_button = QPushButton("Reset"); self.reset_button.clicked.connect(self._reset_edit)
         self.reset_button.setToolTip("Reset this block to its automatic text settings")
-        actions.addWidget(self.remove_block, 0, 0); actions.addWidget(self.restore_auto, 0, 1)
-        actions.addWidget(self.reset_button, 1, 0, 1, 2); actions.addWidget(self.apply_button, 2, 0, 1, 2)
-        text_layout.addLayout(actions); tabs.addTab(text_tab, "Text Blocks")
+        self.approve_block = QPushButton("Approve Bubble"); self.approve_block.setToolTip("Approve this bubble for learning"); self.approve_block.clicked.connect(self._approve_ai_block)
+        self.approve_page_bubbles = QPushButton("Approve Page OCR"); self.approve_page_bubbles.setToolTip("Approve all OCR/bubble issues on this page for learning"); self.approve_page_bubbles.clicked.connect(self._approve_ai_page_bubbles)
+        self.approve_page_reviews = QPushButton("Approve Page Review"); self.approve_page_reviews.setToolTip("Approve all non-OCR review issues on this page for learning"); self.approve_page_reviews.clicked.connect(self._approve_ai_page_reviews)
+        actions.addWidget(self.apply_button, 0, 0, 1, 2)
+        actions.addWidget(self.remove_block, 1, 0); actions.addWidget(self.restore_auto, 1, 1)
+        actions.addWidget(self.reset_button, 2, 0, 1, 2)
+        actions.addWidget(self.approve_block, 3, 0, 1, 2)
+        actions.addWidget(self.approve_page_bubbles, 4, 0); actions.addWidget(self.approve_page_reviews, 4, 1)
+        footer_layout.addLayout(actions)
+        text_layout.addWidget(footer)
+        tabs.addTab(text_tab, "Text Blocks")
         self._update_font_preview(self.font.currentText()); self._update_color_swatch("#111111")
         info_tab = QWidget(); info_layout = QFormLayout(info_tab)
         self.info_path = QLabel("—"); self.info_path.setWordWrap(True); self.info_language = QLabel("—"); self.info_status = QLabel("—")
         info_layout.addRow("Source", self.info_path); info_layout.addRow("Language", self.info_language); info_layout.addRow("Status", self.info_status); tabs.addTab(info_tab, "Image Info")
         return frame
+
+    def _build_static_inspector_section(self, title: str, content: QWidget) -> QFrame:
+        section = QFrame(self)
+        section.setObjectName("InspectorSection")
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(10, 7, 10, 8)
+        layout.setSpacing(6)
+        heading = QLabel(title)
+        heading.setObjectName("InspectorSectionTitle")
+        layout.addWidget(heading)
+        layout.addWidget(content)
+        return section
+
+    def _build_inspector_section(self, title: str, rows: tuple[tuple[str, QWidget], ...], *, expanded: bool = False) -> CollapsibleSection:
+        section = CollapsibleSection(title, expanded, self)
+        form = QFormLayout(section.body)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setContentsMargins(10, 2, 10, 9)
+        form.setHorizontalSpacing(8); form.setVerticalSpacing(7)
+        for label, widget in rows:
+            form.addRow(label, widget)
+        return section
 
     def _build_offset_control(self, spinbox: QSpinBox, negative_label: str, positive_label: str) -> QWidget:
         host = QWidget()
@@ -1012,20 +1723,22 @@ class WorkspaceScreen(QWidget):
         layout.addWidget(negative); layout.addWidget(spinbox, 1); layout.addWidget(positive)
         return host
 
-    def refresh(self, project) -> None:
+    def refresh(self, project, *, force_filmstrip_rebuild: bool = False) -> None:
         if project is None: return
         self._project_title_full = project.name; self.project_title.setToolTip(project.name); self._update_project_title()
         self.count_label.setText(f"{len(project.images)} images")
-        self.start_button.setEnabled(not APP_STATE.busy and any(image.status in {"queued", "partial", "failed", "cancelled"} for image in project.images))
+        self.start_button.setEnabled(not APP_STATE.busy and any(image.status in {"pending", "queued", "partial", "failed", "cancelled"} for image in project.images))
         self.quality_combo.setCurrentText(project.quality)
         self.style_combo.setCurrentText(project.text_style)
         source_index = self.source_combo.findData(project.source_language); self.source_combo.setCurrentIndex(max(0, source_index))
         current = max(0, min(APP_STATE.selected_image, len(project.images) - 1)) if project.images else -1
         image_ids = [self._image_id(image) for image in project.images]
         project_id = str(getattr(project, "id", project.name))
-        if project_id != self._filmstrip_project_id or image_ids != list(self._filmstrip_items):
+        live_items = self._current_filmstrip_items()
+        if force_filmstrip_rebuild or project_id != self._filmstrip_project_id or image_ids != list(live_items):
             self._rebuild_filmstrip(project, project_id, image_ids, current)
         else:
+            self._filmstrip_items = live_items
             for image_index, image in enumerate(project.images):
                 self._update_filmstrip_item(self._filmstrip_items[image_ids[image_index]], image, image_index)
             if current >= 0 and self.filmstrip.currentRow() < 0:
@@ -1061,6 +1774,13 @@ class WorkspaceScreen(QWidget):
         if thumbnail_inputs:
             self._start_thumbnail_loading(project_id, thumbnail_inputs)
 
+    def _current_filmstrip_items(self) -> dict[str, QListWidgetItem]:
+        return {
+            str(self.filmstrip.item(row).data(Qt.ItemDataRole.UserRole)): self.filmstrip.item(row)
+            for row in range(self.filmstrip.count())
+            if self.filmstrip.item(row) is not None
+        }
+
     @staticmethod
     def _update_filmstrip_item(item: QListWidgetItem, image, image_index: int) -> None:
         item.setText(_page_label(image.source_path, image_index))
@@ -1081,9 +1801,13 @@ class WorkspaceScreen(QWidget):
         thread.start()
 
     def _apply_thumbnail(self, project_id: str, image_id: str, image) -> None:
-        if project_id != self._filmstrip_project_id or image_id not in self._filmstrip_items:
+        if project_id != self._filmstrip_project_id:
             return
-        self._filmstrip_items[image_id].setIcon(self._thumbnail_icon(image))
+        self._filmstrip_items = self._current_filmstrip_items()
+        item = self._filmstrip_items.get(image_id)
+        if item is None:
+            return
+        item.setIcon(self._thumbnail_icon(image))
 
     @staticmethod
     def _thumbnail_icon(image=None) -> QIcon:
@@ -1126,6 +1850,15 @@ class WorkspaceScreen(QWidget):
     def _on_filmstrip_reordered(self, ordered_ids: list[str]) -> None:
         selected_ids = {
             str(item.data(Qt.ItemDataRole.UserRole)) for item in self.filmstrip.selectedItems()
+        } | set(getattr(self.filmstrip, "_last_moved_ids", set()))
+        before_ids = [image.id for image in WORKSPACE.current.images] if WORKSPACE.current is not None else []
+        moved_count = len(selected_ids) or 1
+        moved_id = next((image_id for image_id in ordered_ids if image_id in selected_ids), ordered_ids[0] if ordered_ids else "")
+        from_position = before_ids.index(moved_id) + 1 if moved_id in before_ids else 0
+        to_position = ordered_ids.index(moved_id) + 1 if moved_id in ordered_ids else 0
+        changed_ids = {
+            image_id for index, image_id in enumerate(ordered_ids)
+            if index >= len(before_ids) or before_ids[index] != image_id
         }
         self._filmstrip_items = {
             str(self.filmstrip.item(row).data(Qt.ItemDataRole.UserRole)): self.filmstrip.item(row)
@@ -1136,11 +1869,43 @@ class WorkspaceScreen(QWidget):
             if WORKSPACE.current is not None:
                 self.refresh(WORKSPACE.current)
             return
+        if WORKSPACE.current is not None:
+            self.refresh(WORKSPACE.current, force_filmstrip_rebuild=True)
         self.filmstrip.blockSignals(True); self.filmstrip.clearSelection()
+        first_selected = next((self._filmstrip_items[image_id] for image_id in ordered_ids if image_id in selected_ids and image_id in self._filmstrip_items), None)
+        if first_selected is not None:
+            self.filmstrip.setCurrentItem(first_selected)
+            self.filmstrip.scrollToItem(first_selected, QAbstractItemView.ScrollHint.PositionAtCenter)
         for image_id in selected_ids:
             if image_id in self._filmstrip_items:
                 self._filmstrip_items[image_id].setSelected(True)
         self.filmstrip.blockSignals(False); self._selection_changed()
+        self._flash_filmstrip_items(changed_ids or selected_ids)
+        if from_position and to_position:
+            message = (
+                f"Page moved: Page {from_position} -> Position {to_position}"
+                if moved_count == 1 else f"Moved {moved_count} pages -> Position {to_position}"
+            )
+            self.status.setText(message)
+            QTimer.singleShot(2500, lambda text=message: self.status.setText("Ready") if self.status.text() == text else None)
+
+    def _flash_filmstrip_items(self, image_ids: set[str]) -> None:
+        if not image_ids:
+            return
+        original_backgrounds = {}
+        for image_id in image_ids:
+            item = self._filmstrip_items.get(image_id)
+            if item is None:
+                continue
+            original_backgrounds[image_id] = item.background()
+            item.setBackground(QColor("#24486f"))
+        QTimer.singleShot(420, lambda: self._restore_filmstrip_backgrounds(original_backgrounds))
+
+    def _restore_filmstrip_backgrounds(self, backgrounds) -> None:
+        for image_id, background in backgrounds.items():
+            item = self._filmstrip_items.get(image_id)
+            if item is not None:
+                item.setBackground(background)
 
     def _selection_changed(self) -> None:
         count = len(self.filmstrip.selectedItems())
@@ -1176,7 +1941,7 @@ class WorkspaceScreen(QWidget):
             return selected
         return {
             image.id for image in WORKSPACE.current.images
-            if image.id in selected and image.status in {"queued", "partial", "failed", "cancelled"}
+            if image.id in selected and image.status in {"pending", "queued", "partial", "failed", "cancelled"}
         }
 
     @staticmethod
@@ -1213,11 +1978,16 @@ class WorkspaceScreen(QWidget):
             try: self._groups = WORKSPACE.effective_translation_payload(index)["translation_groups"]
             except (OSError, ValueError, json.JSONDecodeError): self._groups = []
         self.blocks.blockSignals(True); self.blocks.clear()
-        for group in self._groups:
-            badge = "[Manual] " if group.get("manual") else ""
-            item = QListWidgetItem(f"{badge}{group['index']}. {group['translated_text']}")
-            item.setToolTip(group["original_text"]); self.blocks.addItem(item)
+        for block_row, group in enumerate(self._groups, 1):
+            ocr_reasons = WORKSPACE.ocr_review_reasons(group)
+            item = QListWidgetItem(self._block_list_label(group, block_row, bool(ocr_reasons)))
+            tooltip = group["original_text"]
+            if ocr_reasons:
+                tooltip = f"{tooltip}\nOCR review: {', '.join(ocr_reasons)}"
+                item.setForeground(QColor("#ffcc66"))
+            item.setToolTip(tooltip); self.blocks.addItem(item)
         self.blocks.setCurrentRow(block); self.blocks.blockSignals(False)
+        self._update_ocr_queue_status()
         final = Path(image.rendered_image) if image.rendered_image else None
         self.original.set_content(Path(image.source_path), self._groups, block)
         self.translated.set_content(final, self._groups, block)
@@ -1228,20 +1998,87 @@ class WorkspaceScreen(QWidget):
         group = self._groups[row]; image = WORKSPACE.current.images[APP_STATE.selected_image]
         edit = image.edits.get(str(group["index"]), RegionEdit())
         self.original_text.setPlainText(group["original_text"]); self.translation.setPlainText(group["translated_text"])
-        quality = group.get("translation_quality", "review" if group.get("review_reasons") else "good")
-        reasons = ", ".join(group.get("review_reasons", []))
-        self.confidence.setText(f"OCR {group['ocr_confidence']:.1%} • Translation {quality}" + (f" • {reasons}" if reasons else ""))
+        self._update_confidence_display(group)
         self.speak_original.setEnabled(bool(group.get("original_text")))
         self.remove_block.setEnabled(True)
         self.remove_block.setText("Delete Manual" if group.get("manual") else "Remove Auto")
         self.replace.setChecked(edit.replace); self.font.setCurrentText(edit.font_family); self.font_size.setValue(edit.font_size)
         self._update_color_swatch(edit.color)
         alignment_index = self.alignment.findData(edit.alignment); self.alignment.setCurrentIndex(max(0, alignment_index))
+        bubble_index = self.bubble_type.findData(edit.bubble_type or group.get("bubble_type", "speech")); self.bubble_type.setCurrentIndex(max(0, bubble_index))
         self.offset_x.setValue(edit.offset_x); self.offset_y.setValue(edit.offset_y)
+        self._update_ocr_queue_status()
+
+    @staticmethod
+    def _block_list_label(group: dict, row: int, has_ocr_review: bool) -> str:
+        kind = "Manual Bubble" if group.get("manual") else ("OCR Bubble" if has_ocr_review else "Bubble")
+        number = row if group.get("manual") else group.get("index", row)
+        snippet = str(group.get("translated_text") or group.get("original_text") or "").strip().replace("\n", " ")
+        if len(snippet) > 34:
+            snippet = snippet[:31].rstrip() + "..."
+        return f"{kind} {number}" + (f" • {snippet}" if snippet else "")
+
+    def _update_confidence_display(self, group: dict) -> None:
+        ocr = max(0.0, min(1.0, float(group.get("ocr_confidence", 0.0) or 0.0)))
+        quality = str(group.get("translation_quality", "review" if group.get("review_reasons") else "good"))
+        reasons = ", ".join(str(reason) for reason in group.get("review_reasons", [])[:2])
+        label = f"OCR {ocr:.0%} • Translation {quality}"
+        if reasons:
+            label += f" • {reasons}"
+        self.confidence.setText(label)
+        self.confidence_bar.setValue(round(ocr * 1000))
 
     def _select_block(self, row: int) -> None:
         if row < 0: return
         APP_STATE.select(APP_STATE.selected_image, row); self.blocks.blockSignals(True); self.blocks.setCurrentRow(row); self.blocks.blockSignals(False)
+
+    def _update_ocr_queue_status(self) -> None:
+        count = len(WORKSPACE.ocr_review_queue())
+        self.next_ocr_issue.setText(f"Next OCR Issue ({count})" if count else "Next OCR Issue")
+        self.next_ocr_issue.setEnabled(count > 0 and not APP_STATE.busy)
+        review_count = len(WORKSPACE.review_issue_queue())
+        self.next_review_issue.setText(f"Next Review Issue ({review_count})" if review_count else "Next Review Issue")
+        self.next_review_issue.setEnabled(review_count > 0 and not APP_STATE.busy)
+
+    def _next_ocr_issue(self) -> None:
+        queue = WORKSPACE.ocr_review_queue()
+        if not queue:
+            self.status.setText("No suspicious OCR blocks found in completed pages")
+            self._update_ocr_queue_status()
+            return
+        current_image = APP_STATE.selected_image
+        current_block = APP_STATE.selected_block
+        selected = None
+        for item in queue:
+            if (item["image_index"], item["block_index"]) > (current_image, current_block):
+                selected = item
+                break
+        selected = selected or queue[0]
+        APP_STATE.select(int(selected["image_index"]), int(selected["block_index"]))
+        self.status.setText(
+            f"OCR review page {selected['page']}, block {selected['group_index']}: "
+            + ", ".join(selected["reasons"][:3])
+        )
+
+    def _next_review_issue(self) -> None:
+        queue = WORKSPACE.review_issue_queue()
+        if not queue:
+            self.status.setText("No review issues found in completed pages")
+            self._update_ocr_queue_status()
+            return
+        current_image = APP_STATE.selected_image
+        current_block = APP_STATE.selected_block
+        selected = None
+        for item in queue:
+            if (item["image_index"], item["block_index"]) > (current_image, current_block):
+                selected = item
+                break
+        selected = selected or queue[0]
+        APP_STATE.select(int(selected["image_index"]), int(selected["block_index"]))
+        self.status.setText(
+            f"Review page {selected['page']}, block {selected['group_index']}: "
+            + ", ".join(selected["reasons"][:3])
+        )
 
     def _on_selection(self, image: int, block: int) -> None:
         if image >= 0:
@@ -1265,18 +2102,116 @@ class WorkspaceScreen(QWidget):
         WORKSPACE.current.max_lines = 5 if style == "Novel" else 3
         WORKSPACE.save()
 
+    def _show_working(self, title: str, message: str) -> WorkingDialog:
+        dialog = WorkingDialog(title, message, self)
+        dialog.show()
+        QApplication.processEvents()
+        return dialog
+
+    def _close_working(self, dialog: WorkingDialog | None) -> None:
+        if dialog is None:
+            return
+        dialog.accept()
+        QApplication.processEvents()
+
     def _apply(self) -> None:
         row = APP_STATE.selected_block
         if row < 0 or row >= len(self._groups): return
         group = self._groups[row]
-        edit = RegionEdit(self.translation.toPlainText(), self.replace.isChecked(), self.font_size.value(), self.offset_x.value(), self.offset_y.value(), self.font.currentText(), self.color.text(), self.alignment.currentData())
+        edit = RegionEdit(self.translation.toPlainText(), self.replace.isChecked(), self.font_size.value(), self.offset_x.value(), self.offset_y.value(), self.font.currentText(), self.color.text(), self.alignment.currentData(), self.original_text.toPlainText(), self.bubble_type.currentData())
+        working = self._show_working("Apply & Rerender", "Preparing selected bubble...")
         try:
+            working.set_message("Validating text fit and render settings...")
             WORKSPACE.validate_edit(APP_STATE.selected_image, group["index"], edit)
+            working.set_message("Saving edits and learning drafts...")
             WORKSPACE.update_edit(APP_STATE.selected_image, group["index"], edit)
-            WORKSPACE.rerender_image(APP_STATE.selected_image)
+            working.set_message("Rendering the translated page...")
+            WORKSPACE.rerender_image(APP_STATE.selected_image, log_callback=working.append_log)
+            working.set_message("Refreshing the editor preview...")
             self._load_image(APP_STATE.selected_image, row)
             self.status.setText("Text style applied and page rerendered")
-        except (OSError, ValueError) as error: QMessageBox.warning(self, "Could not render", str(error))
+        except (MemoryError, OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
+            self._close_working(working); working = None
+            QMessageBox.warning(self, "Could not render", str(error))
+        finally:
+            self._close_working(working)
+
+    def _approve_ai_block(self) -> None:
+        row = APP_STATE.selected_block
+        if not (0 <= row < len(self._groups)):
+            return
+        group = self._groups[row]
+        working = self._show_working("Approve Bubble", "Capturing review outcome...")
+        try:
+            working.set_message("Sending bubble approval to Hydra AI...")
+            summary = WORKSPACE.approve_ai_block(APP_STATE.selected_image, group["index"])
+            if summary is None:
+                self._close_working(working); working = None
+                QMessageBox.warning(self, "Hydra AI", HYDRA_AI.error or "HydraMangaAi is unavailable.")
+                return
+            working.set_message("Refreshing review queues...")
+            self._update_ocr_queue_status()
+            self.status.setText(f"Approved {summary.approved} learning sample(s); skipped {summary.skipped}")
+        finally:
+            self._close_working(working)
+
+    def _approve_ai_page_bubbles(self) -> None:
+        if WORKSPACE.current is None or APP_STATE.selected_image < 0:
+            return
+        page_items = [item for item in WORKSPACE.ocr_review_queue() if int(item["image_index"]) == APP_STATE.selected_image]
+        if not page_items:
+            self.status.setText("No OCR/bubble issues remain on this page")
+            self._update_ocr_queue_status()
+            return
+        answer = QMessageBox.question(
+            self, "Approve page OCR",
+            f"Approve all OCR/bubble review items on this page ({len(page_items)} block(s))?\n\n"
+            "Only captured corrections become training samples; unchanged outputs remain review outcomes.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        working = self._show_working("Approve Page OCR", "Capturing OCR/bubble review outcomes...")
+        try:
+            working.set_message("Sending OCR/bubble approvals to Hydra AI...")
+            summary = WORKSPACE.approve_ai_page_bubbles(APP_STATE.selected_image)
+            if summary is None:
+                self._close_working(working); working = None
+                QMessageBox.warning(self, "Hydra AI", HYDRA_AI.error or "HydraMangaAi is unavailable.")
+                return
+            working.set_message("Refreshing review queues...")
+            self._update_ocr_queue_status()
+            self.status.setText(f"Approved {summary.approved} learning sample(s); skipped {summary.skipped}")
+        finally:
+            self._close_working(working)
+
+    def _approve_ai_page_reviews(self) -> None:
+        if WORKSPACE.current is None or APP_STATE.selected_image < 0:
+            return
+        page_items = [item for item in WORKSPACE.review_issue_queue() if int(item["image_index"]) == APP_STATE.selected_image]
+        if not page_items:
+            self.status.setText("No review issues remain on this page")
+            self._update_ocr_queue_status()
+            return
+        answer = QMessageBox.question(
+            self, "Approve page review",
+            f"Approve all non-OCR review items on this page ({len(page_items)} block(s))?\n\n"
+            "Only captured corrections become training samples; unchanged outputs remain review outcomes.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        working = self._show_working("Approve Page Review", "Capturing page review outcomes...")
+        try:
+            working.set_message("Sending review approvals to Hydra AI...")
+            summary = WORKSPACE.approve_ai_page_reviews(APP_STATE.selected_image)
+            if summary is None:
+                self._close_working(working); working = None
+                QMessageBox.warning(self, "Hydra AI", HYDRA_AI.error or "HydraMangaAi is unavailable.")
+                return
+            working.set_message("Refreshing review queues...")
+            self._update_ocr_queue_status()
+            self.status.setText(f"Approved {summary.approved} learning sample(s); skipped {summary.skipped}")
+        finally:
+            self._close_working(working)
 
     def _reset_edit(self) -> None:
             project = WORKSPACE.current
@@ -1310,9 +2245,31 @@ class WorkspaceScreen(QWidget):
             self.status.setText("Manual translation is already running")
 
     def _on_manual_region_busy(self, busy: bool) -> None:
+        self._manual_busy = busy
         self.add_box.setEnabled(not busy)
+        self.cancel_button.setEnabled(self._job_is_busy or busy)
+        self.close_button.setEnabled(not (self._job_is_busy or busy))
         if busy:
-            self.status.setText("Reading and translating the selected text...")
+            self.status.setText("Processing the selected text box...")
+
+    def _on_translation_request_state(
+        self,
+        request_id: str,
+        state: str,
+        message: str,
+    ) -> None:
+        if request_id.startswith(("batch:", "selected:")):
+            return
+        labels = {
+            "queued": "Manual translation queued",
+            "ocr": "Reading selected text",
+            "translating": "Translating selected text",
+            "rendering": "Manual render queued",
+            "done": "Manual text box translated",
+            "cancelled": "Manual translation cancelled",
+            "failed": "Manual translation failed",
+        }
+        self.status.setText(message or labels.get(state, state.title()))
 
     def _on_manual_region_finished(self, image_index: int, key: str) -> None:
         if image_index != APP_STATE.selected_image:
@@ -1382,7 +2339,8 @@ class WorkspaceScreen(QWidget):
         self.speech.speak(str(group.get("original_text", "")), str(language or ""))
 
     def _open_settings(self) -> None:
-        if SettingsDialog(self).exec() == QDialog.DialogCode.Accepted and WORKSPACE.current is not None:
+        if SettingsDialog(self).exec() == QDialog.DialogCode.Accepted:
+            self._configure_manual_shortcut()
             self.status.setText("Translation provider settings saved")
 
     def _update_project_title(self) -> None:
@@ -1529,8 +2487,9 @@ class WorkspaceScreen(QWidget):
         self.progress.setVisible(True); self.page_progress.setVisible(True)
 
         stage_name = {
-            "analyzing": "Preparing", "ocr": "Reading", "translating": "Translating",
-            "reconstructing": "Rebuilding", "complete": "Complete", "failed": "Failed",
+            "preprocessing": "Preparing", "analyzing": "Preparing", "OCR": "Reading", "ocr": "Reading",
+            "translating": "Translating", "rendering": "Rebuilding", "reconstructing": "Rebuilding",
+            "review": "Reviewing", "complete": "Complete", "failed": "Failed",
             "cancelled": "Cancelled", "ready": "Complete" if self._job_failure_count == 0 else "Finished with errors",
         }.get(self._progress_stage, "Waiting")
         if self._job_total:
@@ -1583,13 +2542,15 @@ class WorkspaceScreen(QWidget):
 
     @staticmethod
     def _stage_text(active: str) -> str:
-        stages = [("ocr", "Reading"), ("translating", "Translating"), ("localizing", "Localizing"), ("reconstructing", "Rebuilding"), ("complete", "Complete")]
+        aliases = {"analyzing": "preprocessing", "OCR": "ocr", "rendering": "reconstructing", "ready": "complete", "done": "complete"}
+        active = aliases.get(active, active)
+        stages = [("preprocessing", "Preparing"), ("ocr", "Reading"), ("translating", "Translating"), ("reconstructing", "Rendering"), ("review", "Review"), ("complete", "Complete")]
         active_index = next((index for index, (key, _) in enumerate(stages) if key == active), -1)
-        if active in {"ready"}:
+        if active in {"complete"}:
             active_index = len(stages)
         values = []
         for index, (_, label) in enumerate(stages):
-            marker = "[x]" if index < active_index or active == "ready" else ("[>]" if index == active_index else "[ ]")
+            marker = "[x]" if index < active_index or active == "complete" else ("[>]" if index == active_index else "[ ]")
             values.append(f"{marker} {label}")
         suffix = "     [!] Failed" if active == "failed" else ("     [!] Cancelled" if active == "cancelled" else "")
         return "     ".join(values) + suffix
@@ -1597,8 +2558,10 @@ class WorkspaceScreen(QWidget):
     def _on_busy(self, busy: bool) -> None:
         self._job_is_busy = busy
         self.filmstrip.set_reorder_enabled(not busy)
-        pending = bool(WORKSPACE.current and any(image.status in {"queued", "partial", "failed", "cancelled"} for image in WORKSPACE.current.images))
-        self.start_button.setEnabled(not busy and pending); self.cancel_button.setEnabled(busy); self.close_button.setEnabled(not busy)
+        pending = bool(WORKSPACE.current and any(image.status in {"pending", "queued", "partial", "failed", "cancelled"} for image in WORKSPACE.current.images))
+        self.start_button.setEnabled(not busy and pending)
+        self.cancel_button.setEnabled(busy or self._manual_busy)
+        self.close_button.setEnabled(not (busy or self._manual_busy))
         self._selection_changed()
         keep_result = self._job_total > 0 and self._progress_stage in {"ready", "cancelled", "failed", "complete"}
         self.progress.setVisible(busy or keep_result); self.page_progress.setVisible(busy or keep_result)
@@ -1606,9 +2569,33 @@ class WorkspaceScreen(QWidget):
             self.progress.setValue(0); self.page_progress.setValue(0)
 
     def _export(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Export translated images")
-        if folder:
-            count = WORKSPACE.export(Path(folder)); QMessageBox.information(self, "Export complete", f"Exported {count} image(s).")
+        dialog = ExportOptionsDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        output_type = str(dialog.output_type.currentData())
+        image_format = str(dialog.image_format.currentData())
+        if output_type == "folder":
+            folder = QFileDialog.getExistingDirectory(self, "Export image folder")
+            if not folder:
+                return
+            try:
+                count = WORKSPACE.export(Path(folder), image_format=image_format)
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(self, "Export failed", str(error)); return
+            QMessageBox.information(self, "Export complete", f"Exported {count} image(s).")
+            return
+
+        archive_format = "cbz" if output_type == "cbz" else "zip"
+        filter_label = "CBZ comic archive (*.cbz)" if archive_format == "cbz" else "ZIP archive (*.zip)"
+        path, _ = QFileDialog.getSaveFileName(self, "Export archive", "", f"{filter_label};;All files (*.*)")
+        if not path:
+            return
+        try:
+            archive = WORKSPACE.export_archive(Path(path), image_format=image_format, archive_format=archive_format)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Export failed", str(error)); return
+        if archive is not None:
+            QMessageBox.information(self, "Export complete", f"Exported archive:\n{archive}")
 
 
 class MainWindow(QMainWindow):

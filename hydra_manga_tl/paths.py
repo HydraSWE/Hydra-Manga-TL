@@ -14,10 +14,15 @@ class AppPaths:
         self.settings = self.root / "settings.json"
         self.recent = self.root / "recent.json"
         self.logs = self.root / "logs"
+        self.cache = self.root / "cache"
+        self.ocr_cache = self.cache / "ocr"
+        self.page_translation_cache = self.cache / "page_translation"
 
     def initialize(self) -> None:
         self.projects.mkdir(parents=True, exist_ok=True)
         self.logs.mkdir(parents=True, exist_ok=True)
+        self.ocr_cache.mkdir(parents=True, exist_ok=True)
+        self.page_translation_cache.mkdir(parents=True, exist_ok=True)
 
 
 PATHS = AppPaths()

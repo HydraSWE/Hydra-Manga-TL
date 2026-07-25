@@ -363,13 +363,18 @@ class MangaStyleRewriter:
         if not self.text:
             return
         if self.features.has_pause:
-            self.text = re.sub(r"[.!?。！？]*$", "...", self.text)
+            self.text = re.sub(r"[.!?。！？]+$", "", self.text) + "..."
             return
         if self.features.is_question:
-            self.text = re.sub(r"[.!?。！？]*$", "?", self.text)
+            self.text = re.sub(r"[.!?。！？]+$", "", self.text) + "?"
             return
         if self.features.is_exclamation or self.features.is_negative or self.features.is_acknowledgement:
-            self.text = re.sub(r"[.!?。！？]*$", "!", self.text)
+            if self.text.endswith(("!!", "！！")):
+                return
+            if self.text.endswith(("!", "！")):
+                self.text += "!"
+                return
+            self.text = re.sub(r"[.!?。！？]+$", "", self.text) + "!"
             return
         if not self.text.endswith((".", "!", "?", "...")):
             self.text += "."
@@ -379,11 +384,17 @@ def html_unescape_punctuation(text: str) -> str:
     return re.sub(r"\s+([,.!?])", r"\1", str(text).strip())
 
 
+def normalize_dialogue_dashes(text: str) -> str:
+    text = str(text).replace("\\u2014", "—")
+    text = re.sub(r"\s*[—–]\s*", "... ", text)
+    return re.sub(r"\.{3,}\s+", "... ", text).strip()
+
+
 def normalize_manga_line(
     original: str, translated: str, aliases: dict[str, str], *, target_person: str = "",
 ) -> str:
     features = extract_source_features(original, translated, aliases, target_person=target_person)
-    return MangaStyleRewriter(features, translated).rewrite()
+    return normalize_dialogue_dashes(MangaStyleRewriter(features, translated).rewrite())
 
 
 def normalize_page_translation(page: PageDialogue, result: PageTranslation) -> PageTranslation:

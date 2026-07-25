@@ -1,58 +1,79 @@
-# Hydra Manga TL — Catalog
+# Hydra Manga TL — v0.8.0 Catalog
 
 ## Translate manga without giving up control
 
-Hydra Manga TL is a local-first Windows desktop workspace that turns Japanese or
-Chinese manga pages into editable English PNGs. It combines OCR, translation,
-artwork reconstruction, typesetting, review, and export in one application while
-keeping the original images untouched.
+Hydra Manga TL is a local-first Windows workspace that converts Japanese and
+Chinese manga pages into reviewable English PNGs. It combines OCR, translation,
+artwork reconstruction, typesetting, manual correction, review, and export
+without overwriting source images.
 
 ## At a glance
 
 | | |
 | --- | --- |
-| Version | 0.6.0, active development |
+| Current version | **0.8.0 — Unified Translation Pipeline** |
+| Current status | **Finished, under polishing** |
+| Previous milestone | **0.7.0 — HydraMangaAi** |
+| Previous status | **Under development** |
 | Platform | Windows 10/11, 64-bit |
-| Price | No purchase flow is included in this repository |
 | Input | JPG, JPEG, PNG, WEBP, TIFF, BMP |
-| Source text | Japanese, Chinese, and preserved Latin-script text |
-| Output language | English |
-| Export | PNG |
-| Processing | Local after required models are downloaded |
-| Installation | Windows setup EXE distribution; source installation also supported |
+| Source text | Japanese, Chinese, preserved Latin script |
+| Output | English PNG |
+| Local engines | MarianMT; optional Local Qwen GGUF |
+| Cloud engines | Opt-in Groq, Google Translate, Gemini, DeepSeek |
+| Processing model | Shared OCR, translation, request, cache, and render services |
+| Project safety | Autosaved, reversible, source images untouched |
 
-## Highlights
+## v0.8.0 — finished, under polishing
 
-- Import individual pages or an entire nested chapter folder.
-- Automatically compare OCR candidates and detect the page language.
-- Translate Japanese and Chinese dialogue locally to English.
-- Rebuild text areas and fit translated lettering in the original locations.
-- Review original and translated pages side by side as the queue runs.
-- Correct wording, typography, color, alignment, and placement per text block.
-- Draw a manual text box for missed or incorrectly grouped dialogue.
-- Remove unwanted automatic blocks and restore them later.
-- Reopen autosaved projects and export without touching source files.
+- One application-lifetime PaddleOCR worker for batch, manual, and review work.
+- SmartOCR quality budgets with uncertain text routed to Review.
+- Unified batch, selected-page, manual-region, and review request contracts.
+- One reusable translation manager and one serialized render queue.
+- Ordered chapter processing with page context and cache reuse.
+- Cooperative cancellation for queued and active-stage work.
+- Safe queued-render cancellation and manual-region rollback.
+- Exact manual text placement inside the user-drawn rectangle.
+- Original/translated canvases, filmstrip, block inspector, and issue queues.
+- Editable wording, fonts, size, color, alignment, position, and bubble type.
+- Non-destructive PNG export that preserves imported relative paths.
 
-## Before installing
+## v0.7.0 — HydraMangaAi under development
 
-The intended end-user distribution is a Windows setup EXE that installs the
-complete desktop application. The source workflow remains available to developers
-and advanced users. Initial model downloads require an internet connection and
-several gigabytes of free disk space. A GPU is optional; CPU processing is
-supported but slower.
+The v0.7.0 milestone introduced the optional private HydraMangaAi layer, which
+remains under development:
 
-Hydra does not currently include an automatic updater, cloud translation account,
-or multi-language output selector.
-Automatic results should be reviewed before publication.
+- Local correction-draft capture.
+- Explicit bubble and page approval.
+- Immutable training snapshots.
+- Dataset-readiness and promotion gates.
+- AI Center status and training controls.
+- Model version and rollback metadata.
 
-## After installing
+HydraMangaAi is optional. The finished v0.8.0 deterministic OCR, translation,
+and render pipeline remains fully operational when the private package is
+absent, disabled, or still waiting for approved training data.
 
-Launch Hydra, drop in manga images, and choose **Translate All Pending**. Review
-each page in the workspace, use **Add Text Box** for missed areas, apply any text
-or style corrections, and export the completed PNG files to a separate folder.
+## Typical workflow
 
-Projects and logs live under `%LOCALAPPDATA%\Hydra Manga TL`. The first job takes
-longer while OCR and translation models download; later jobs reuse the local cache.
+1. Import pages or a chapter folder.
+2. Run **Translate Selected** or **Translate All Pending**.
+3. Review completed pages and issue queues.
+4. Correct text or typography and rerender.
+5. Draw an **Add Text Box** rectangle for missed dialogue.
+6. Export completed pages to a separate folder.
 
-For complete installation and troubleshooting instructions, read [README.md](README.md).
-For implementation details and current limitations, read [project.md](project.md).
+Projects and logs live under `%LOCALAPPDATA%\Hydra Manga TL`. Initial model
+downloads require internet access; later jobs reuse local caches. A GPU is
+optional, and hosted engines require user-supplied credentials.
+
+## Validation
+
+The completed v0.8.0 checkpoint passes 140 automated tests plus real disposable
+Groq and Marian runtime smokes. The combined Marian smoke covers selected-page
+translation, manual exact-box rendering, failure rollback, a mixed-cache
+two-page batch, review queues, one translation-manager generation, and one
+unchanged OCR worker process.
+
+For installation and usage, read [README.md](README.md). For architecture and
+project contracts, read [project.md](project.md).

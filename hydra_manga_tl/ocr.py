@@ -417,7 +417,11 @@ class PaddleOCREngine:
         self, image_path: Path, rect: list[int], *, preferred_language: str | None = None,
         add_context: bool = False, rtl_context: bool = False,
     ) -> OCRResult:
-        """Retry OCR on an upscaled crop and return polygons in page coordinates."""
+        """Run one deterministic focused pass on a 2x color crop.
+
+        Uncertain output is routed to Review instead of multiplying a region
+        into color, grayscale, and original native Paddle predictions.
+        """
         with Image.open(image_path) as opened:
             image = opened.convert("RGB")
         x1, y1, x2, y2 = [int(value) for value in rect]
@@ -433,25 +437,15 @@ class PaddleOCREngine:
             x2, y2 = min(image.width, x2 + right_pad), min(image.height, y2 + bottom_pad)
         crop = image.crop((x1, y1, x2, y2))
         languages = [preferred_language] if preferred_language in self._languages else self._languages
-        candidates: list[tuple[float, int, str, int, list[TextRegion]]] = []
         with tempfile.TemporaryDirectory(prefix="hydra-ocr-retry-") as temporary:
             folder = Path(temporary)
             color_2x = crop.resize((crop.width * 2, crop.height * 2), Image.Resampling.LANCZOS)
-            gray_2x = ImageOps.autocontrast(color_2x.convert("L"))
-            gray_3x = ImageOps.autocontrast(crop.resize((crop.width * 3, crop.height * 3), Image.Resampling.LANCZOS).convert("L"))
-            variants = [("color2", color_2x, 2, 0), ("gray2", gray_2x, 2, 1), ("gray3", gray_3x, 3, 2), ("original", crop, 1, 1)]
-            for name, variant, scale, priority in variants:
-                variant_path = folder / f"{name}.png"
-                variant.save(variant_path)
-                for model_language in languages:
-                    predictions = list(self._engine(model_language).predict(str(variant_path)))
-                    raw_regions = self._regions(predictions[0].json) if predictions else []
-                    regions = self._remap_regions(raw_regions, scale, (x1, y1))
-                    # Prefer the color retry when candidates are effectively tied;
-                    # grayscale sometimes turns kana strokes into plausible but wrong glyphs.
-                    score = self._candidate_score(regions, model_language) - priority * 0.015
-                    candidates.append((score, -priority, model_language, scale, regions))
-        _, _, model_language, _, regions = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+            variant_path = folder / "color2.png"
+            color_2x.save(variant_path)
+            model_language = languages[0]
+            predictions = list(self._engine(model_language).predict(str(variant_path)))
+            raw_regions = self._regions(predictions[0].json) if predictions else []
+            regions = self._remap_regions(raw_regions, 2, (x1, y1))
         combined_text = "\n".join(region.text for region in regions)
         evidence = detect_language(combined_text)
         average = sum(region.confidence for region in regions) / len(regions) if regions else 0.0
@@ -459,4 +453,10 @@ class PaddleOCREngine:
             source=str(image_path.resolve()), model_language=model_language,
             language=evidence.language, language_confidence=evidence.confidence,
             average_ocr_confidence=average, regions=regions, language_scripts=evidence.scripts,
+            metadata={
+                "selection_rect": [x1, y1, x2, y2],
+                "selection_scale": 2,
+                "selection_variant": "color2",
+                "prediction_count": 1,
+            },
         )

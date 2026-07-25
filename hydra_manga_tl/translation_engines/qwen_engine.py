@@ -140,8 +140,6 @@ def _add_nvidia_dll_directories() -> None:
 class QwenGGUFEngine:
     """Optional local Qwen GGUF engine backed by llama-cpp-python when available."""
 
-    engine_id = "qwen-gguf"
-
     def __init__(
         self,
         *,
@@ -158,6 +156,10 @@ class QwenGGUFEngine:
         self.runtime_config = _resolve_runtime_config(runtime_config)
         self._loaded = False
         self._llama = None
+
+    @property
+    def engine_id(self) -> str:
+        return f"qwen-gguf:{self.model_name}"
 
     def load(self) -> None:
         if self._loaded:

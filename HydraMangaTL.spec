@@ -1,11 +1,51 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import shutil
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 
 PROJECT_ROOT = Path(SPECPATH)
+SITE_PACKAGES = PROJECT_ROOT / ".venv" / "Lib" / "site-packages"
+PYSIDE_ROOT = SITE_PACKAGES / "PySide6"
+SHIBOKEN_ROOT = SITE_PACKAGES / "shiboken6"
+BUILD_SUPPORT = PROJECT_ROOT / "scripts" / "build_support"
+
+
+def ensure_qt_reported_path(name):
+    source = PYSIDE_ROOT / name
+    destination = SITE_PACKAGES / name
+    if not source.is_dir() or destination.exists():
+        return
+    try:
+        os.symlink(source, destination, target_is_directory=True)
+    except OSError:
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+
+
+for folder in (PYSIDE_ROOT, SHIBOKEN_ROOT):
+    if folder.is_dir():
+        normalized = str(folder.resolve())
+        try:
+            os.add_dll_directory(normalized)
+        except (AttributeError, OSError):
+            pass
+        os.environ["PATH"] = normalized + os.pathsep + os.environ.get("PATH", "")
+os.environ["HYDRA_BUILD_DLL_DIRS"] = os.pathsep.join(
+    str(folder.resolve()) for folder in (PYSIDE_ROOT, SHIBOKEN_ROOT) if folder.is_dir()
+)
+if BUILD_SUPPORT.is_dir():
+    os.environ["PYTHONPATH"] = str(BUILD_SUPPORT.resolve()) + (
+        os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""
+    )
+for qt_path_name in ("plugins", "qml", "translations"):
+    ensure_qt_reported_path(qt_path_name)
+
+APP_VERSION = "0.8.0"
+APP_STATUS = "finished - under polishing"
+LEGACY_MILESTONE = "0.7.0 - HydraMangaAi"
 
 # PaddleOCR and PaddleX discover inference pipelines and operators dynamically.
 # Collect their package data, native binaries, and submodules explicitly so the
@@ -13,6 +53,11 @@ PROJECT_ROOT = Path(SPECPATH)
 datas = [(str(PROJECT_ROOT / "assets"), "assets")]
 binaries = []
 hiddenimports = []
+
+for qt_plugin_name in ("platforms", "imageformats", "iconengines", "styles", "texttospeech", "tls"):
+    qt_plugin_path = PYSIDE_ROOT / "plugins" / qt_plugin_name
+    if qt_plugin_path.is_dir():
+        binaries.append((str(qt_plugin_path), f"PySide6/plugins/{qt_plugin_name}"))
 
 # Optional helper runtime for LaMa/iopaint title-background cleanup. Keep it
 # outside the main Python environment because iopaint pins Pillow 9.5.0 while

@@ -36,6 +36,14 @@ def _overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> float:
     return intersection / max(1, min(end_a - start_a, end_b - start_b))
 
 
+def _bubble_component(region: dict) -> str | None:
+    for key in ("bubble_component_id", "bubble_id", "component_id"):
+        value = region.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return None
+
+
 def _is_tiny_artifact(text: str, w: int, h: int) -> bool:
     """Patch 4: Filter ONLY when text is devoid of alphanumeric content AND is physically tiny."""
     clean_text = re.sub(r'[.,!?\"\'\(\)\[\]\{\}<>\-_~= ]', '', str(text))
@@ -248,13 +256,25 @@ def group_regions(regions: list[dict]) -> list[TextGroup]:
             typical_width = min(lx2 - lx1, rx2 - rx1)
             
             center_difference = abs(lx_center - rx_center)
-            # Manga vertical bubble grouping: relaxed thresholds for Japanese columns
-            # that are separated horizontally within the same speech bubble.
-            same_bubble = (
-                _overlap(ly1, ly2, ry1, ry2) >= 0.45
-                and horizontal_gap <= typical_width * 2
-                and center_difference < typical_width * 3
-            )
+            left_component = _bubble_component(regions[left])
+            right_component = _bubble_component(regions[right])
+            if left_component and right_component and left_component != right_component:
+                same_bubble = False
+            elif left_component and right_component and left_component == right_component:
+                same_bubble = (
+                    _overlap(ly1, ly2, ry1, ry2) >= 0.35
+                    and horizontal_gap <= typical_width * 2
+                    and center_difference < typical_width * 3
+                )
+            else:
+                # Without bubble/component evidence, keep vertical column grouping
+                # conservative so adjacent separate bubbles do not collapse into one
+                # translation unit before segmentation can inspect them.
+                same_bubble = (
+                    _overlap(ly1, ly2, ry1, ry2) >= 0.55
+                    and horizontal_gap <= typical_width * 0.9
+                    and center_difference <= typical_width * 1.65
+                )
             if same_bubble:
                 union(left, right)
 

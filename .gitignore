@@ -1,17 +1,111 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+*.secrets
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.kdbx
+credentials.json
+token.json
+secrets.json
+
+# Python environments and caches
 .venv/
+.venv-*/
+venv/
+env/
+ENV/
 __pycache__/
 *.py[cod]
-.env
-*.zip
-outputs/
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build, package, and installer artifacts
 /build/
 /dist/
-.paddlex/
-.huggingface/
+/release/
+/releases/
+*.spec.tmp
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.whl
+*.egg-info/
+
+# Local app output, projects, and user data
+/outputs/
+/output/
+/Translated_Manga/
+/projects/
+/workspace/
+/workspaces/
+*.hydra-project
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# Manga inputs, generated media, and private training data
+/samples/
+/sample*/
+/HydraMangaAi/
+/datasets/
+/training_data/
+/training-data/
+/approved_data/
+/review_queue/
+
+# Downloaded models and runtime dependency caches
 /models/
-/samples
-/outputs
-/tests
-.venv-inpaint/
-.pytest_cache/
-runtime
+/runtime/
+/.paddlex/
+/.huggingface/
+/.cache/
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.bin
+
+# Logs and temporary files
+*.log
+*.err
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*.pid
+
+# Editor, OS, and local tool state
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Keep only the public stability smoke test from local/private test scratch.
+/tests/*
+!/tests/test_v08_stability.py
+
+# Release track notes
+# v0.8.0 -> finished, under polishing
+# v0.7.0 -> HydraMangaAi, under development

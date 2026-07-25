@@ -11,8 +11,11 @@ from uuid import uuid4
 from .editor_project import RegionEdit
 
 
-PROJECT_VERSION = 5
-STAGES = {"queued", "partial", "analyzing", "ocr", "translating", "localizing", "reconstructing", "ready", "review", "failed", "cancelled"}
+PROJECT_VERSION = 6
+STAGES = {
+    "pending", "queued", "partial", "preprocessing", "analyzing", "OCR", "ocr", "translating",
+    "localizing", "rendering", "reconstructing", "review", "done", "ready", "failed", "cancelled",
+}
 
 
 @dataclass
@@ -50,6 +53,8 @@ class ImageRecord:
     edits: dict[str, RegionEdit] = field(default_factory=dict)
     manual_regions: list[ManualRegion] = field(default_factory=list)
     suppressed_auto_group_indices: list[int] = field(default_factory=list)
+    ai_subject_ids: dict[str, str] = field(default_factory=dict)
+    approved_ai_subject_ids: list[str] = field(default_factory=list)
 
     @property
     def source(self) -> Path:
