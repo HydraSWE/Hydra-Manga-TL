@@ -9,20 +9,20 @@ review decisions, and rendered output in a versioned project.
 
 ## Current version
 
-**Hydra Manga TL v0.8.0** is finished and currently under polishing. The
+**Hydra Manga TL v0.8.0-alpha** is finished and currently under polishing. The
 previous **v0.7.0** milestone introduced HydraMangaAi and remains under
 development as the optional private bridge layer.
 
 | Version | Status | Milestone |
 | --- | --- | --- |
-| **v0.8.0** | Finished, under polishing | Unified translation pipeline, persistent OCR runtime, shared translation and render services, bounded SmartOCR retries, cancellation, cache normalization, and resilient manual rerendering |
+| **v0.8.0-alpha** | Finished, under polishing | Unified translation pipeline, persistent OCR runtime, shared translation and render services, bounded SmartOCR retries, cancellation, cache normalization, and resilient manual rerendering |
 | **v0.7.0** | Under development | **HydraMangaAi**: private correction capture, approval queues, training-data gates, model promotion metadata, and AI Center integration |
 | **v0.6.0** | Completed foundation | Unified desktop workspace, selected-page translation, manual text boxes, editing, review, speech, and export |
 
 English is currently the output language. Japanese and Chinese source text are
 supported, while detected Latin-script content can be preserved.
 
-## What v0.8.0 provides
+## What v0.8.0-alpha provides
 
 - Imports JPG, JPEG, PNG, WEBP, TIFF, and BMP files or recursive folders.
 - Runs OCR through one application-lifetime PaddleOCR worker.
