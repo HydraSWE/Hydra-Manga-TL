@@ -15,7 +15,7 @@
 credentials.json
 token.json
 secrets.json
-
+.agents/
 # Python environments and caches
 .venv/
 .venv-*/
@@ -104,8 +104,6 @@ desktop.ini
 
 # Keep only the public stability smoke test from local/private test scratch.
 /tests/*
-!/tests/test_v08_stability.py
-
-# Release track notes
-# v0.8.0 -> finished, under polishing
-# v0.7.0 -> HydraMangaAi, under development
+!/tests/test_v09_stability.py
+!/tests/test_parallel_scheduler.py
+!/tests/test_translation_memory_v1.py

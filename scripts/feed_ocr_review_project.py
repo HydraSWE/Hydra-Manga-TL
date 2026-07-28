@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hydra_manga_tl.ocr_review import create_ocr_review_project
+from hydra_manga_tl.ocr.review import create_ocr_review_project
 
 
 def main() -> int:

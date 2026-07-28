@@ -6,6 +6,11 @@ from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 
+try:
+    from importlib.metadata import PackageNotFoundError
+except ImportError:
+    from importlib_metadata import PackageNotFoundError
+
 
 PROJECT_ROOT = Path(SPECPATH)
 SITE_PACKAGES = PROJECT_ROOT / ".venv" / "Lib" / "site-packages"
@@ -43,9 +48,8 @@ if BUILD_SUPPORT.is_dir():
 for qt_path_name in ("plugins", "qml", "translations"):
     ensure_qt_reported_path(qt_path_name)
 
-APP_VERSION = "0.8.0"
-APP_STATUS = "finished - under polishing"
-LEGACY_MILESTONE = "0.7.0 - HydraMangaAi"
+APP_VERSION = "0.9.0"
+APP_STATUS = "current development"
 
 # PaddleOCR and PaddleX discover inference pipelines and operators dynamically.
 # Collect their package data, native binaries, and submodules explicitly so the
@@ -76,7 +80,19 @@ for package in ("paddle", "paddleocr", "paddlex"):
 
 # Japanese speech converts ambiguous Kanji to kana before handing text to the
 # Windows voice. Collect the native tokenizer and its offline small dictionary.
-for package in ("sudachipy", "sudachidict_small"):
+#
+# Local Qwen loads llama_cpp through importlib at runtime and depends on native
+# CUDA wheels being discoverable from the frozen _internal tree.
+for package in (
+    "sudachipy",
+    "sudachidict_small",
+    "llama_cpp",
+    "nvidia",
+    "sentencepiece",
+    "sacremoses",
+    "tokenizers",
+    "safetensors",
+):
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += package_datas
     binaries += package_binaries
@@ -104,11 +120,21 @@ for distribution in (
     "shapely",
     "torch",
     "transformers",
+    "sentencepiece",
+    "sacremoses",
+    "tokenizers",
+    "safetensors",
+    "llama-cpp-python",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cublas-cu12",
     "keyring",
     "SudachiPy",
     "SudachiDict-small",
 ):
-    datas += copy_metadata(distribution)
+    try:
+        datas += copy_metadata(distribution)
+    except PackageNotFoundError:
+        print(f"Optional metadata not found; skipping {distribution}")
 
 
 a = Analysis(
@@ -120,7 +146,12 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        "torchvision",
+        "torchvision._C",
+        "iopaint",
+        "gradio",
+    ],
     noarchive=False,
     optimize=1,
 )

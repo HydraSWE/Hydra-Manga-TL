@@ -14,6 +14,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import os
 import cv2
 import numpy as np
 from PIL import Image
@@ -208,6 +209,25 @@ def draw_vertical_words(
     }
 
 
+def _sanitized_subprocess_env() -> dict[str, str]:
+    """Return a copy of os.environ with parent PyInstaller runtime overrides removed."""
+    env = os.environ.copy()
+    if getattr(sys, "frozen", False):
+        internal = Path(sys.executable).parent / "_internal"
+        if internal.is_dir():
+            internal_resolved = internal.resolve()
+            paths = env.get("PATH", "").split(os.pathsep)
+            cleaned_paths = [
+                p for p in paths
+                if p and Path(p).resolve() != internal_resolved
+            ]
+            env["PATH"] = os.pathsep.join(cleaned_paths)
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
+        env.pop("_MEIPASS2", None)
+    return env
+
+
 def run_iopaint(image: Path, mask: Path, output_dir: Path, model: str, device: str, python_executable: str) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     command = [
@@ -218,7 +238,8 @@ def run_iopaint(image: Path, mask: Path, output_dir: Path, model: str, device: s
         "--mask", str(mask),
         "--output", str(output_dir),
     ]
-    completed = subprocess.run(command, check=False)
+    env = _sanitized_subprocess_env()
+    completed = subprocess.run(command, check=False, env=env)
     candidates = sorted(output_dir.glob("*.png"))
     if not candidates:
         completed.check_returncode()

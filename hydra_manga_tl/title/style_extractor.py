@@ -15,6 +15,7 @@ from .style_profile import (
     GradientProfile,
     OutlineProfile,
     ShadowProfile,
+    StrokeProfile,
     TitleStyleProfile,
     TypographyProfile,
 )
@@ -38,8 +39,19 @@ def _edge_and_core(mask: Image.Image, box: list[int]) -> tuple[np.ndarray, np.nd
     return edge, core
 
 
+def _ring(mask: Image.Image, box: list[int], dilation: int) -> np.ndarray:
+    x1, y1, x2, y2 = box
+    selected = _mask_array(mask)
+    expanded = cv2.dilate(np.uint8(selected) * 255, np.ones((dilation, dilation), np.uint8), iterations=1) > 0
+    ring = expanded & ~selected
+    return ring[y1:y2, x1:x2]
+
+
 def extract_fill(image: Image.Image, mask: Image.Image, title: TitleObject) -> FillProfile:
-    pixels = masked_pixels(image, mask, title.box)
+    x1, y1, x2, y2 = title.box
+    _, core = _edge_and_core(mask, title.box)
+    crop = np.asarray(image.crop((x1, y1, x2, y2)).convert("RGB"))
+    pixels = crop[core] if crop.size and core.any() else masked_pixels(image, mask, title.box)
     if pixels.size == 0:
         return FillProfile()
     luminance = pixels @ np.asarray([0.2126, 0.7152, 0.0722])
@@ -77,13 +89,46 @@ def extract_outline(image: Image.Image, mask: Image.Image, title: TitleObject) -
     return OutlineProfile(color=color, width=round(width, 2), colors=[color] if color else [])
 
 
+def extract_stroke(image: Image.Image, mask: Image.Image, title: TitleObject) -> StrokeProfile:
+    x1, y1, x2, y2 = title.box
+    pad = 8
+    sx1, sy1 = max(0, x1 - pad), max(0, y1 - pad)
+    sx2, sy2 = min(image.size[0], x2 + pad), min(image.size[1], y2 + pad)
+    crop = np.asarray(image.crop((sx1, sy1, sx2, sy2)).convert("RGB"))
+    selected = _mask_array(mask)
+    expanded = cv2.dilate(np.uint8(selected) * 255, np.ones((7, 7), np.uint8), iterations=1) > 0
+    ring = (expanded & ~selected)[sy1:sy2, sx1:sx2]
+    if crop.size == 0 or not ring.any():
+        return StrokeProfile()
+    ring_pixels = crop[ring]
+    luma = ring_pixels @ np.asarray([0.2126, 0.7152, 0.0722])
+    dark = ring_pixels[luma <= np.percentile(luma, 35)]
+    color = dominant_color(dark if len(dark) else ring_pixels)
+    width = max(1.0, min(10.0, math.sqrt(float(np.count_nonzero(ring))) / 20.0))
+    return StrokeProfile(color=color, width=round(width, 2), opacity=1.0, colors=[color] if color else [])
+
+
 def extract_shadow(image: Image.Image, mask: Image.Image, title: TitleObject) -> ShadowProfile:
-    pixels = masked_pixels(image, mask, title.box)
-    if pixels.size == 0:
+    x1, y1, x2, y2 = title.box
+    source = np.asarray(image.convert("RGB"))
+    selected = _mask_array(mask)
+    expanded = cv2.dilate(np.uint8(selected) * 255, np.ones((11, 11), np.uint8), iterations=1) > 0
+    ring = expanded & ~selected
+    if not ring.any():
         return ShadowProfile()
-    luminance = pixels @ np.asarray([0.2126, 0.7152, 0.0722])
-    dark = pixels[luminance <= np.percentile(luminance, 12)]
-    return ShadowProfile(color=dominant_color(dark) if len(dark) else None)
+    region_ring = ring[max(0, y1 - 12):y2 + 12, max(0, x1 - 12):x2 + 12]
+    region_pixels = source[max(0, y1 - 12):y2 + 12, max(0, x1 - 12):x2 + 12][region_ring]
+    if region_pixels.size == 0:
+        return ShadowProfile()
+    luminance = region_pixels @ np.asarray([0.2126, 0.7152, 0.0722])
+    dark = region_pixels[luminance <= np.percentile(luminance, 18)]
+    color = dominant_color(dark) if len(dark) else None
+    ys, xs = np.where(region_ring)
+    if len(xs):
+        offset = (int(round(float(np.mean(xs)) - region_ring.shape[1] / 2.0)), int(round(float(np.mean(ys)) - region_ring.shape[0] / 2.0)))
+    else:
+        offset = (2, 2)
+    return ShadowProfile(color=color, offset=offset, blur=1.5 if color else None, opacity=0.65 if color else None)
 
 
 def extract_glow(image: Image.Image, mask: Image.Image, title: TitleObject) -> GlowProfile:
@@ -107,7 +152,7 @@ def extract_gradient(image: Image.Image, mask: Image.Image, title: TitleObject) 
         return GradientProfile(kind="solid")
     colors = [color for color in (dominant_color(pixels), average_color(pixels)) if color]
     spread = float(np.mean(np.std(pixels.astype(np.float32), axis=0)))
-    return GradientProfile(kind="linear" if spread >= 35.0 else "solid", colors=colors)
+    return GradientProfile(kind="linear" if spread >= 35.0 else "solid", colors=colors, angle=90.0 if spread >= 35.0 else None)
 
 
 def analyze_typography(title: TitleObject) -> TypographyProfile:
@@ -117,9 +162,21 @@ def analyze_typography(title: TitleObject) -> TypographyProfile:
     height = max(1, title.box[3] - title.box[1])
     if height > width * 1.5:
         categories.append("condensed")
+    if width > height * 2.2:
+        categories.append("sans")
     if text.isupper():
         categories.append("bold")
-    return TypographyProfile(family_hint="comic" if categories else None, weight="bold" if "bold" in categories else None, categories=categories)
+    if any(char in text for char in "!?~"):
+        categories.append("comic")
+    classification = categories[0] if categories else "sans"
+    return TypographyProfile(
+        family_hint="comic" if "comic" in categories else classification,
+        weight="bold" if "bold" in categories else None,
+        tracking=0.0,
+        line_spacing=1.0,
+        classification=classification,
+        categories=categories,
+    )
 
 
 def estimate_rotation(title: TitleObject) -> float | None:
@@ -133,15 +190,33 @@ def estimate_rotation(title: TitleObject) -> float | None:
 
 
 def extract_title_style(image: Image.Image, mask: Image.Image, title: TitleObject) -> TitleStyleProfile:
+    fill = extract_fill(image, mask, title)
+    outline = extract_outline(image, mask, title)
+    stroke = extract_stroke(image, mask, title)
+    shadow = extract_shadow(image, mask, title)
+    glow = extract_glow(image, mask, title)
+    gradient = extract_gradient(image, mask, title)
     return TitleStyleProfile(
-        fill=extract_fill(image, mask, title),
-        outline=extract_outline(image, mask, title),
-        shadow=extract_shadow(image, mask, title),
-        glow=extract_glow(image, mask, title),
-        gradient=extract_gradient(image, mask, title),
+        version=2,
+        fill=fill,
+        outline=outline,
+        stroke=stroke,
+        shadow=shadow,
+        glow=glow,
+        gradient=gradient,
         typography=analyze_typography(title),
         rotation=estimate_rotation(title),
         opacity=1.0,
+        alignment=title.render_settings.alignment,
+        spacing=1.0,
         blend_mode="normal",
-        metadata={"extractor": "hstr-v1"},
+        confidence={
+            "fill": 0.9 if fill.dominant_color else 0.0,
+            "outline": 0.85 if outline.color else 0.0,
+            "stroke": 0.65 if stroke.color else 0.0,
+            "shadow": 0.55 if shadow.color else 0.0,
+            "glow": 0.55 if glow.color else 0.0,
+            "gradient": 0.7 if gradient.kind == "linear" else 0.4,
+        },
+        metadata={"extractor": "hstr-v2"},
     )

@@ -7,6 +7,16 @@ import multiprocessing
 import sys
 from pathlib import Path
 
+import builtins
+
+_real_import = builtins.__import__
+
+def debug_import(name, *args, **kwargs):
+    if name.startswith("torchvision"):
+        print(f"IMPORTING: {name}")
+    return _real_import(name, *args, **kwargs)
+
+builtins.__import__ = debug_import
 
 def _apply_qwen_runtime_defaults() -> None:
     """Make the local Qwen GGUF runtime default to the same settings as the CLI example."""
@@ -49,10 +59,16 @@ _apply_qwen_runtime_defaults()
 _activate_project_runtime()
 multiprocessing.freeze_support()
 
-from hydra_manga_tl.application import MangaApplication
-
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--phase3-render":
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        from hydra_manga_tl.phase.phase3 import main as phase3_main
+
+        return phase3_main()
+
+    from hydra_manga_tl.core.application import MangaApplication
+
     startup_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else None
     try:
         return MangaApplication(startup_path=startup_path).run()

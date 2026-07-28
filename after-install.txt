@@ -1,19 +1,24 @@
-Hydra Manga TL v0.8.0 has been installed successfully.
+Hydra Manga TL v0.9.0 has been installed successfully.
 
 After installation:
 1. Launch Hydra Manga TL from the Start Menu or Desktop.
 2. Import manga images or a folder.
-3. Select Translate All Pending.
-4. Review and correct the translated pages.
-5. Export the completed PNG images.
+3. Use the startup warmup screen while Hydra prepares the workspace.
+4. Select Translate All Pending or Translate Selected.
+5. Review and correct the translated pages.
+6. Collapse the filmstrip when you want more canvas space.
+7. Export the completed PNG images.
 
 Release notes:
-- v0.8.0 is the finished pipeline checkpoint and is currently under polishing.
-- v0.7.0 was the HydraMangaAi milestone and remains available as the legacy bridge layer.
+- v0.9.0 is the current development line for startup polish, workspace layout, identity, Region Tool, layout editing, and text normalization.
+- The unified OCR, translation, render, cache, cancellation, and manual-rerender pipeline is included in v0.9.0.
+- HydraMangaAi remains available only as an optional private bridge layer.
 
-The first translation may take longer while OCR and translation models download.
+The first translation may take longer while OCR and translation models download or warm up.
 
-Projects and logs are stored under:
+Projects and logs default to:
 %LOCALAPPDATA%\Hydra Manga TL
+
+You can change the data folder from Settings.
 
 Uninstalling the application does not automatically delete your saved projects.

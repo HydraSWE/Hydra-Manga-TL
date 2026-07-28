@@ -22,26 +22,26 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hydra_manga_tl.ocr_runtime import (  # noqa: E402
+from hydra_manga_tl.ocr.runtime import (  # noqa: E402
     get_ocr_runtime_metrics,
     shutdown_ocr_runtime,
     start_ocr_runtime,
 )
-from hydra_manga_tl.project import ImageRecord, MangaProject  # noqa: E402
-from hydra_manga_tl.render_queue import (  # noqa: E402
+from hydra_manga_tl.project.model import ImageRecord, MangaProject  # noqa: E402
+from hydra_manga_tl.phase.render_queue import (  # noqa: E402
     RENDER_QUEUE,
     shutdown_render_queue,
 )
-from hydra_manga_tl.settings import SETTINGS  # noqa: E402
-from hydra_manga_tl.state import APP_STATE  # noqa: E402
-from hydra_manga_tl.translation_queue import shutdown_translation_queue  # noqa: E402
-from hydra_manga_tl.translation_requests import RenderRequest  # noqa: E402
-from hydra_manga_tl.translation_runtime import (  # noqa: E402
+from hydra_manga_tl.core.settings import SETTINGS  # noqa: E402
+from hydra_manga_tl.core.state import APP_STATE  # noqa: E402
+from hydra_manga_tl.translation.queue import shutdown_translation_queue  # noqa: E402
+from hydra_manga_tl.translation.requests import RenderRequest  # noqa: E402
+from hydra_manga_tl.translation.runtime import (  # noqa: E402
     TRANSLATION_RUNTIME,
     shutdown_translation_runtime,
 )
-from hydra_manga_tl.workspace import WorkspaceManager  # noqa: E402
-from hydra_manga_tl.paths import AppPaths  # noqa: E402
+from hydra_manga_tl.project.workspace import WorkspaceManager  # noqa: E402
+from hydra_manga_tl.core.paths import AppPaths  # noqa: E402
 from PySide6.QtCore import QCoreApplication, QTimer  # noqa: E402
 from PIL import Image  # noqa: E402
 

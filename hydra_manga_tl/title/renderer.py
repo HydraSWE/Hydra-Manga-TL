@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from .models import RenderedTitleLayer, TitleObject
+from .models import RenderedTitleLayer, TitleComposition, TitleObject
 from .style_profile import Color, TitleStyleProfile
 
 DEFAULT_FONT = Path(r"C:\Windows\Fonts\arialbd.ttf")
@@ -14,12 +14,38 @@ DEFAULT_FONT = Path(r"C:\Windows\Fonts\arialbd.ttf")
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     if DEFAULT_FONT.is_file():
-        return ImageFont.truetype(str(DEFAULT_FONT), size)
+        try:
+            return ImageFont.truetype(str(DEFAULT_FONT), size, layout_engine=ImageFont.Layout.BASIC)
+        except AttributeError:
+            return ImageFont.truetype(str(DEFAULT_FONT), size)
     return ImageFont.load_default()
 
 
 def _text_box(draw: ImageDraw.ImageDraw, text: str, font, stroke_width: int = 0) -> tuple[int, int, int, int]:
-    return draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    """Return stable approximate text bounds for title fitting.
+
+    Pillow/FreeType can access-violate on Windows while measuring some long
+    decorative title strings. The title renderer only needs relative bounds for
+    fitting and centering, so use a deterministic approximation and leave actual
+    glyph drawing to Pillow.
+    """
+    del draw
+    size = int(getattr(font, "size", 12) or 12)
+    width_units = 0.0
+    for char in str(text):
+        if char.isspace():
+            width_units += 0.34
+        elif char in "MW@#%&":
+            width_units += 0.92
+        elif char in "ilI.,'`|!":
+            width_units += 0.32
+        elif ord(char) > 127:
+            width_units += 0.95
+        else:
+            width_units += 0.62
+    width = int(round(width_units * size)) + stroke_width * 2
+    height = int(round(size * 1.16)) + stroke_width * 2
+    return (-stroke_width, -stroke_width, width, height)
 
 
 def _wrap_words(text: str, draw: ImageDraw.ImageDraw, font, width: int, stroke_width: int) -> list[str]:
@@ -76,8 +102,44 @@ def _profile_outline(profile: TitleStyleProfile) -> tuple[Color | None, int]:
     return profile.outline.color, max(0, width)
 
 
+def _profile_stroke(profile: TitleStyleProfile) -> tuple[Color | None, int]:
+    if not profile.stroke:
+        return None, 0
+    width = int(round(profile.stroke.width or 0))
+    return profile.stroke.color, max(0, width)
+
+
+def _clamp_effects(
+    profile: TitleStyleProfile,
+    font_size: int,
+    box_size: tuple[int, int],
+    outline_width: int,
+    stroke_width: int,
+) -> tuple[int, int, float | None, tuple[int, int] | None]:
+    max_outline = max(1, min(4, font_size // 10))
+    max_stroke = max(0, min(3, font_size // 14))
+    safe_outline = min(outline_width, max_outline)
+    safe_stroke = min(stroke_width, max_stroke)
+    glow_radius = None
+    if profile.glow and profile.glow.radius:
+        glow_radius = min(float(profile.glow.radius), max(1.0, font_size / 18.0), 3.0)
+    shadow_offset = None
+    if profile.shadow and profile.shadow.offset:
+        limit_x = max(2, box_size[0] // 18)
+        limit_y = max(2, box_size[1] // 18)
+        shadow_offset = (
+            max(-limit_x, min(limit_x, int(profile.shadow.offset[0]))),
+            max(-limit_y, min(limit_y, int(profile.shadow.offset[1]))),
+        )
+    return safe_outline, safe_stroke, glow_radius, shadow_offset
+
+
 def _opacity(value: float | None) -> int:
     return max(0, min(255, int(255 * (1.0 if value is None else value))))
+
+
+def _with_opacity(color: Color, opacity: float | None) -> tuple[int, int, int, int]:
+    return (*color, _opacity(opacity))
 
 
 def _draw_text_layer(
@@ -111,10 +173,58 @@ def _draw_text_layer(
         else:
             x = max(0, (width - line_w) // 2) - bounds[0]
         x += offset[0]
-        draw.text((x, y), line, font=font, fill=(*fill, _opacity(profile.opacity)), stroke_width=stroke_width, stroke_fill=stroke_fill)
+        draw.text((x, y), line, font=font, fill=_with_opacity(fill, profile.opacity), stroke_width=stroke_width, stroke_fill=stroke_fill)
         positions.append([x1 + int(x), y1 + int(y)])
         y += line_height
     return positions
+
+
+def _draw_text_mask(
+    size: tuple[int, int],
+    title: TitleObject,
+    lines: list[str],
+    font_size: int,
+    line_height: int,
+    stroke_width: int = 0,
+) -> Image.Image:
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    font = _font(font_size)
+    width = size[0]
+    height = size[1]
+    total_h = line_height * len(lines)
+    y = max(0, (height - total_h) // 2)
+    for line in lines:
+        bounds = _text_box(draw, line, font, stroke_width)
+        line_w = bounds[2] - bounds[0]
+        if title.render_settings.alignment == "left":
+            x = -bounds[0]
+        elif title.render_settings.alignment == "right":
+            x = width - line_w - bounds[0]
+        else:
+            x = max(0, (width - line_w) // 2) - bounds[0]
+        draw.text((x, y), line, font=font, fill=255, stroke_width=stroke_width, stroke_fill=255)
+        y += line_height
+    return mask
+
+
+def _gradient_fill(size: tuple[int, int], profile: TitleStyleProfile, fallback: Color) -> Image.Image:
+    colors = profile.gradient.colors if profile.gradient else []
+    if not profile.gradient or profile.gradient.kind != "linear" or len(colors) < 2:
+        return Image.new("RGBA", size, _with_opacity(fallback, profile.opacity))
+    first, second = colors[0], colors[-1]
+    width, height = size
+    angle = float(profile.gradient.angle or 90.0)
+    vertical = abs(angle) % 180 >= 45 and abs(angle) % 180 <= 135
+    gradient = Image.new("RGBA", size, (0, 0, 0, 0))
+    pixels = gradient.load()
+    span = max(1, height - 1 if vertical else width - 1)
+    for y in range(height):
+        for x in range(width):
+            t = (y if vertical else x) / span
+            color = tuple(int(first[index] + (second[index] - first[index]) * t) for index in range(3))
+            pixels[x, y] = (*color, _opacity(profile.opacity))
+    return gradient
 
 
 def render_title(base_image: Image.Image, title: TitleObject, profile: TitleStyleProfile) -> RenderedTitleLayer:
@@ -123,6 +233,7 @@ def render_title(base_image: Image.Image, title: TitleObject, profile: TitleStyl
     height = max(1, y2 - y1)
     fill = _profile_fill(profile)
     outline_fill, outline_width = _profile_outline(profile)
+    stroke_fill, stroke_width = _profile_stroke(profile)
     lines, font_size, line_height, overflow = _fit_text(
         title.translated_text,
         title.box,
@@ -131,48 +242,54 @@ def render_title(base_image: Image.Image, title: TitleObject, profile: TitleStyl
         profile.typography.tracking if profile.typography else None,
         outline_width,
     )
+    outline_width, stroke_width, glow_radius, shadow_offset = _clamp_effects(
+        profile,
+        font_size,
+        (width, height),
+        outline_width,
+        stroke_width,
+    )
     layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     positions: list[list[int]] = []
 
-    if profile.glow and profile.glow.color and profile.glow.radius:
+    if profile.glow and profile.glow.color and glow_radius:
         glow_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        _draw_text_layer(glow_layer, title, profile, lines, font_size, line_height, fill=profile.glow.color, stroke_width=max(1, outline_width))
-        layer.alpha_composite(glow_layer.filter(ImageFilter.GaussianBlur(radius=float(profile.glow.radius))))
+        glow_profile = TitleStyleProfile.from_dict({**profile.to_dict(), "opacity": profile.glow.opacity})
+        _draw_text_layer(glow_layer, title, glow_profile, lines, font_size, line_height, fill=profile.glow.color, stroke_width=max(1, outline_width + stroke_width))
+        layer.alpha_composite(glow_layer.filter(ImageFilter.GaussianBlur(radius=glow_radius)))
 
-    if profile.shadow and profile.shadow.color and profile.shadow.offset:
+    if profile.shadow and profile.shadow.color and shadow_offset:
         shadow_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        shadow_profile = TitleStyleProfile.from_dict({**profile.to_dict(), "opacity": profile.shadow.opacity})
         _draw_text_layer(
             shadow_layer,
             title,
-            profile,
+            shadow_profile,
             lines,
             font_size,
             line_height,
             fill=profile.shadow.color,
-            stroke_width=max(0, outline_width),
-            offset=profile.shadow.offset,
+            stroke_width=max(0, outline_width + stroke_width),
+            offset=shadow_offset,
         )
         if profile.shadow.blur:
             shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=float(profile.shadow.blur)))
         layer.alpha_composite(shadow_layer)
+
+    if stroke_fill and stroke_width:
+        stroke_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        _draw_text_layer(stroke_layer, title, profile, lines, font_size, line_height, fill=stroke_fill, stroke_width=stroke_width + outline_width)
+        layer.alpha_composite(stroke_layer)
 
     if outline_fill and outline_width:
         outline_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         _draw_text_layer(outline_layer, title, profile, lines, font_size, line_height, fill=outline_fill, stroke_width=outline_width)
         layer.alpha_composite(outline_layer)
 
-    fill_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    positions = _draw_text_layer(
-        fill_layer,
-        title,
-        profile,
-        lines,
-        font_size,
-        line_height,
-        fill=fill,
-        stroke_fill=outline_fill,
-        stroke_width=outline_width,
-    )
+    fill_layer = _gradient_fill((width, height), profile, fill)
+    fill_mask = _draw_text_mask((width, height), title, lines, font_size, line_height)
+    fill_layer.putalpha(fill_mask.point(lambda value: min(value, _opacity(profile.opacity))))
+    positions = _draw_text_layer(Image.new("RGBA", (width, height), (0, 0, 0, 0)), title, profile, lines, font_size, line_height, fill=fill)
     layer.alpha_composite(fill_layer)
 
     if title.render_settings.allow_rotation and profile.rotation:
@@ -190,3 +307,23 @@ def render_title(base_image: Image.Image, title: TitleObject, profile: TitleStyl
         positions=positions,
         profile=profile,
     )
+
+
+def render_title_composition(base_image: Image.Image, composition: TitleComposition) -> tuple[Image.Image, list[dict]]:
+    output = base_image
+    reports: list[dict] = []
+    for layer in sorted(composition.layers, key=lambda item: item.hierarchy_rank, reverse=True):
+        if not str(layer.translated_text).strip():
+            continue
+        title = layer.to_title_object(composition.id)
+        rendered = render_title(output, title, layer.style_profile)
+        x1, y1, _, _ = rendered.box
+        composited = output.convert("RGBA")
+        composited.alpha_composite(rendered.image.convert("RGBA"), (int(x1), int(y1)))
+        output = composited.convert(output.mode) if output.mode != "RGBA" else composited
+        report = rendered.report()
+        report["layer_id"] = layer.id
+        report["role"] = layer.role
+        report["hierarchy_rank"] = layer.hierarchy_rank
+        reports.append(report)
+    return output, reports

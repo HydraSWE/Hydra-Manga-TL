@@ -11,6 +11,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from hydra_manga_tl.core.paths import PATHS
+
 from .style_profile import TitleStyleProfile
 
 
@@ -86,7 +88,7 @@ def title_fingerprint(title_or_payload: Any) -> str:
 
 
 def _cache_path(project_id: str, fingerprint: str, cache_root: Path | None = None) -> Path:
-    root = cache_root or Path.home() / "AppData" / "Local" / "Hydra Manga TL" / "title_style_cache"
+    root = cache_root or PATHS.title_style_cache
     safe_project = "".join(char if char.isalnum() or char in "-_" else "_" for char in str(project_id)) or "global"
     return root / safe_project / f"{fingerprint[:32]}.json"
 

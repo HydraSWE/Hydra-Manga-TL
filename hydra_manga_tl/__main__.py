@@ -1,6 +1,6 @@
 import os
 
-from .application import MangaApplication
+from hydra_manga_tl.core.application import MangaApplication
 
 for key, value in {
     "QWEN_N_CTX": "2048",

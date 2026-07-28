@@ -1,15 +1,17 @@
-Welcome to Hydra Manga TL 0.8.0
+Welcome to Hydra Manga TL 0.9.0
 
-Hydra Manga TL translates Japanese and Chinese manga pages into English using local OCR and translation models.
+Hydra Manga TL translates Japanese and Chinese manga pages into English using local OCR, translation, reconstruction, and review tools.
 
 Release track:
-- v0.8.0 is finished and currently under polishing.
-- v0.7.0 introduced the HydraMangaAi milestone and remains the legacy bridge layer.
+- v0.9.0 is the current development line with a branded startup warmup, collapsible filmstrip, pinned Hydra identity tile, Region Tool upgrades, layout editing, and shared text normalization.
+- The unified OCR, translation, render, cache, cancellation, and manual-rerender pipeline is included in v0.9.0.
+- HydraMangaAi remains an optional private bridge layer when installed separately.
 
 Important:
 - Windows 10 or Windows 11 64-bit is required.
 - Several gigabytes of free disk space are recommended.
-- An internet connection is required during the first translation so the AI models can be downloaded.
+- An internet connection may be required during the first local translation so model files can be downloaded.
+- Cloud translation engines are opt-in and use user-supplied credentials.
 - Original manga images are never modified.
 - Automatic translations should be reviewed before publication.
 
