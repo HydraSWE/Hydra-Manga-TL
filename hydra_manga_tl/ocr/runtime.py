@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import os
 import tempfile
 import threading
 import time
@@ -14,12 +15,23 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+from hydra_manga_tl.core.fonts import find_font_file
 from hydra_manga_tl.ocr.core import PaddleOCREngine
 from hydra_manga_tl.ocr.worker import run_ocr_worker
 
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_WARMUP_LANGUAGES = ("japan",)
+DEFAULT_WORKER_STARTUP_TIMEOUT = 420.0
+BACKGROUND_WARMUP_OBSERVE_TIMEOUT = 15.0
+OCR_WORKER_ENVIRONMENT = {
+    "FLAGS_use_mkldnn": "0",
+    "KMP_DUPLICATE_LIB_OK": "TRUE",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+}
 
 _ENGINES: dict[tuple[str, ...], PaddleOCREngine] = {}
 _WARMUP_THREADS: list[threading.Thread] = []
@@ -73,7 +85,7 @@ class OCRWorkerClient:
         memory_limit_mb: int = 2048,
         recycle_pages: int = 25,
         request_timeout: float = 900.0,
-        startup_timeout: float = 120.0,
+        startup_timeout: float = DEFAULT_WORKER_STARTUP_TIMEOUT,
     ) -> None:
         self.languages = _language_key(languages) or DEFAULT_WARMUP_LANGUAGES
         self.memory_limit_mb = max(0, int(memory_limit_mb))
@@ -119,7 +131,16 @@ class OCRWorkerClient:
             name="HydraOCRWorker",
             daemon=True,
         )
-        process.start()
+        previous_environment = {key: os.environ.get(key) for key in OCR_WORKER_ENVIRONMENT}
+        os.environ.update(OCR_WORKER_ENVIRONMENT)
+        try:
+            process.start()
+        finally:
+            for key, value in previous_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         child_connection.close()
         self._connection = parent_connection
         self._process = process
@@ -146,32 +167,37 @@ class OCRWorkerClient:
                 continue
             return response
 
-    def _wait_until_ready(self, timeout: float | None = None) -> None:
+    def _wait_until_ready(self, timeout: float | None = None, *, restart_on_timeout: bool = True) -> None:
         if self.state == OCRRuntimeState.READY:
             return
         deadline = time.perf_counter() + (self.startup_timeout if timeout is None else timeout)
         while self.state not in {OCRRuntimeState.READY, OCRRuntimeState.FAILED, OCRRuntimeState.STOPPED}:
             remaining = max(0.0, deadline - time.perf_counter())
             if remaining <= 0:
-                self._restart()
-                raise OCRWorkerCrashed("OCR worker warm-up timed out and was restarted")
+                if restart_on_timeout:
+                    self._restart()
+                    raise OCRWorkerCrashed("OCR worker warm-up timed out and was restarted")
+                raise OCRWorkerCrashed("OCR worker is still warming up")
             if not self._connection.poll(min(remaining, 0.25)):
                 if not self.alive:
-                    self._restart()
+                    if restart_on_timeout:
+                        self._restart()
                     raise OCRWorkerCrashed("OCR worker exited during warm-up")
                 continue
             try:
                 response = self._connection.recv()
             except (EOFError, BrokenPipeError, OSError) as error:
                 crash = self._crash_summary(error)
-                self._restart()
+                if restart_on_timeout:
+                    self._restart()
                 raise OCRWorkerCrashed(f"OCR worker exited during warm-up: {crash}") from error
             self._record_response(response)
             if response.get("event") != "state":
                 if not response.get("ok", True):
                     error = str(response.get("error") or "OCR worker failed during warm-up")
                     self._set_state(OCRRuntimeState.FAILED)
-                    self._restart()
+                    if restart_on_timeout:
+                        self._restart()
                     raise OCRWorkerCrashed(_worker_error_message(error))
                 return
         if self.state != OCRRuntimeState.READY:
@@ -238,18 +264,26 @@ class OCRWorkerClient:
     def analyze_selection(self, request: dict) -> dict:
         return self.request("analyze_selection", request)
 
-    def ping(self, timeout: float = 10.0) -> bool:
+    def ping(self, timeout: float = 10.0, *, restart_on_timeout: bool = True) -> bool:
         with self._lock:
             if not self.alive:
                 self._start(restart=self._process is not None)
             try:
-                self._wait_until_ready(timeout)
+                self._wait_until_ready(timeout, restart_on_timeout=restart_on_timeout)
                 self._connection.send({"command": "ping"})
                 response = self._receive_until_response(timeout)
             except (EOFError, BrokenPipeError, OSError):
                 self._restart()
                 return False
+            except OCRWorkerError:
+                if restart_on_timeout:
+                    raise
+                return False
             return bool(response.get("ok"))
+
+    def restart(self) -> None:
+        with self._lock:
+            self._restart()
 
     def _restart(self) -> None:
         self._set_state(OCRRuntimeState.RESTARTING)
@@ -277,6 +311,8 @@ class OCRWorkerClient:
         process, connection = self._process, self._connection
         self._process = None
         self._connection = None
+        if force and process is not None and process.is_alive():
+            process.terminate()
         if connection is not None:
             if not force and process is not None and process.is_alive():
                 try:
@@ -290,8 +326,29 @@ class OCRWorkerClient:
         if process is not None:
             process.join(2.0)
             if process.is_alive():
-                process.terminate()
-                process.join(2.0)
+                if not force:
+                    process.terminate()
+                    process.join(2.0)
+            if process.is_alive():
+                LOGGER.warning(
+                    "OCR worker pid=%s survived terminate; escalating shutdown",
+                    getattr(process, "pid", None),
+                )
+                kill = getattr(process, "kill", None)
+                if callable(kill):
+                    kill()
+                    process.join(1.0)
+            if process.is_alive():
+                LOGGER.error(
+                    "OCR worker pid=%s is still alive after shutdown escalation",
+                    getattr(process, "pid", None),
+                )
+            else:
+                LOGGER.info(
+                    "OCR worker stopped pid=%s exitcode=%s",
+                    getattr(process, "pid", None),
+                    getattr(process, "exitcode", None),
+                )
         self._set_state(OCRRuntimeState.STOPPED)
 
 
@@ -337,10 +394,13 @@ class OCRRuntimeManager:
     def _warmup_client(self) -> None:
         try:
             client = self.client()
-            if client.ping(timeout=client.startup_timeout):
+            if client.ping(
+                timeout=min(BACKGROUND_WARMUP_OBSERVE_TIMEOUT, client.startup_timeout),
+                restart_on_timeout=False,
+            ):
                 LOGGER.info("OCR worker warmup finished in %.2fs", client.warmup_time)
             else:
-                LOGGER.warning("OCR worker warmup did not finish; it will retry on first OCR request")
+                LOGGER.info("OCR worker is still warming up; first OCR request will wait for it")
         except OCRWorkerError:
             LOGGER.exception("OCR worker warmup failed; it will retry on first OCR request")
 
@@ -453,6 +513,7 @@ def get_ocr_engine_for_language(language: str, fallback_languages: tuple[str, ..
 def start_ocr_warmup(languages: tuple[str, ...] | list[str] = DEFAULT_WARMUP_LANGUAGES) -> None:
     key = _language_key(languages)
     with _LOCK:
+        _WARMUP_THREADS[:] = [thread for thread in _WARMUP_THREADS if thread.is_alive()]
         if key in _ENGINES:
             return
         if any(thread.is_alive() and getattr(thread, "_hydra_ocr_key", None) == key for thread in _WARMUP_THREADS):
@@ -480,6 +541,7 @@ def shutdown_ocr_warmup(timeout: float = 1.0) -> None:
         thread.join(max(0.0, deadline - time.perf_counter()))
     with _LOCK:
         _ENGINES.clear()
+        _WARMUP_THREADS[:] = [thread for thread in _WARMUP_THREADS if thread.is_alive()]
     PaddleOCREngine.clear_shared_engines()
 
 
@@ -507,12 +569,9 @@ def _write_warmup_image(path: Path) -> None:
 
 
 def _warmup_font(size: int):
-    for candidate in [
-        Path(r"C:\Windows\Fonts\YuGothM.ttc"),
-        Path(r"C:\Windows\Fonts\msgothic.ttc"),
-        Path(r"C:\Windows\Fonts\meiryo.ttc"),
-    ]:
-        if candidate.exists():
+    for family in ("Yu Gothic", "MS Gothic", "Meiryo"):
+        candidate = find_font_file(family)
+        if candidate is not None:
             try:
                 return ImageFont.truetype(str(candidate), size)
             except OSError:

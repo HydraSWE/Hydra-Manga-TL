@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 import threading
 from typing import Any, Callable
@@ -52,14 +53,15 @@ class TranslationQueue(QObject):
     failed = Signal(str, object)
     busy_changed = Signal(bool)
 
-    def __init__(self) -> None:
+    def __init__(self, *, terminal_state_history_limit: int = 2048) -> None:
         super().__init__()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="HydraTranslationQueue")
         self._lock = threading.RLock()
         self._tokens: dict[str, CancellationToken] = {}
         self._futures: dict[str, Future] = {}
         self._request_groups: dict[str, tuple[str, ...]] = {}
-        self._states: dict[str, TranslationRequestStatus] = {}
+        self._states: OrderedDict[str, TranslationRequestStatus] = OrderedDict()
+        self._terminal_state_history_limit = max(1, int(terminal_state_history_limit))
         self._closed = False
 
     @property
@@ -218,7 +220,7 @@ class TranslationQueue(QObject):
     def _finish(self, request: TranslationRequest, future: Future) -> None:
         try:
             result = future.result()
-        except (RequestCancelled, BaseException) as error:
+        except BaseException as error:
             token = self._tokens.get(request.request_id)
             if isinstance(error, RequestCancelled) or (token is not None and token.requested):
                 self._set_state(request.request_id, TranslationRequestStatus.CANCELLED, "Cancelled")
@@ -240,6 +242,7 @@ class TranslationQueue(QObject):
                 self._tokens.pop(request.request_id, None)
                 self._futures.pop(request.request_id, None)
                 self._request_groups.pop(request.request_id, None)
+                self._prune_terminal_states_locked()
                 now_idle = not self._futures
             if now_idle:
                 self.busy_changed.emit(False)
@@ -294,6 +297,7 @@ class TranslationQueue(QObject):
                     self._tokens.pop(request_id, None)
                     self._futures.pop(request_id, None)
                     self._request_groups.pop(request_id, None)
+                self._prune_terminal_states_locked()
                 now_idle = not self._futures
             if now_idle:
                 self.busy_changed.emit(False)
@@ -306,7 +310,22 @@ class TranslationQueue(QObject):
     ) -> None:
         with self._lock:
             self._states[request_id] = status
+            self._states.move_to_end(request_id)
         self.state_changed.emit(request_id, status.value, message)
+
+    def _prune_terminal_states_locked(self) -> None:
+        terminal = {
+            TranslationRequestStatus.DONE,
+            TranslationRequestStatus.FAILED,
+            TranslationRequestStatus.CANCELLED,
+        }
+        completed = [
+            request_id
+            for request_id, status in self._states.items()
+            if request_id not in self._futures and status in terminal
+        ]
+        for request_id in completed[:-self._terminal_state_history_limit]:
+            self._states.pop(request_id, None)
 
     def shutdown(self, *, wait: bool = True) -> None:
         with self._lock:

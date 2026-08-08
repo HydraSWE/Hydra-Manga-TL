@@ -46,12 +46,15 @@ htmlcov/
 *.tgz
 *.whl
 *.egg-info/
+/hydra_manga_tl_doc
+/error_analysis_and_improvements.md
 
 # Local app output, projects, and user data
 /outputs/
 /output/
 /Translated_Manga/
 /projects/
+/project.json
 /workspace/
 /workspaces/
 *.hydra-project
@@ -104,6 +107,14 @@ desktop.ini
 
 # Keep only the public stability smoke test from local/private test scratch.
 /tests/*
-!/tests/test_v09_stability.py
+!/tests/test_v1_stability.py
 !/tests/test_parallel_scheduler.py
 !/tests/test_translation_memory_v1.py
+!/tests/test_pipeline_state_manager.py
+!/tests/test_intelligent_cleanup_geometry.py
+
+# AI and Project Documentation
+AGENTS.md
+ARCHITECTURE.md
+DEVELOPMENT.md
+UI_GUIDELINES.md

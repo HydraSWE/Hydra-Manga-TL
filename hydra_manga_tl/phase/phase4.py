@@ -15,8 +15,11 @@ from PySide6.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QToolBar, QVBoxLayout, QWidget,
 )
 
+from hydra_manga_tl.core.fonts import find_font_file
+from hydra_manga_tl.core.user_errors import import_error, project_open_error
 from hydra_manga_tl.project.editor import EditorProject, RegionEdit
 from hydra_manga_tl.phase.phase3 import run as render_phase3
+from hydra_manga_tl.project.artifacts import rendered_filename, target_slug
 
 
 class ImagePane(QScrollArea):
@@ -46,7 +49,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self, initial_folder: Path | None = None):
         super().__init__()
-        QFontDatabase.addApplicationFont(r"C:\Windows\Fonts\segoeui.ttf")
+        application_font = find_font_file("Segoe UI")
+        if application_font is not None:
+            QFontDatabase.addApplicationFont(str(application_font))
         self.setWindowTitle("Hydra Manga TL — Translation Editor")
         self.setStyleSheet("QWidget { font-family: 'Segoe UI'; font-size: 10pt; }")
         self.resize(1400, 850)
@@ -139,7 +144,7 @@ class MainWindow(QMainWindow):
                 if not Path(document.result_path).is_file():
                     raise FileNotFoundError(document.result_path)
         except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
-            QMessageBox.warning(self, "Cannot open project", str(error))
+            QMessageBox.warning(self, "Cannot open project", project_open_error(error))
             return
         self.project = project
         self.project_path = path.resolve()
@@ -155,7 +160,7 @@ class MainWindow(QMainWindow):
         try:
             self.project = EditorProject.from_phase2(folder)
         except ValueError as error:
-            QMessageBox.warning(self, "Cannot open folder", str(error))
+            QMessageBox.warning(self, "Cannot open folder", import_error(error))
             return
         self.project_path = Path("outputs/phase4/project.json").resolve()
         self.documents.clear()
@@ -172,7 +177,10 @@ class MainWindow(QMainWindow):
         self.project.selected_document = row
         payload = self.project.effective_payload(row)
         self.original_pane.show_image(Path(payload["source"]))
-        rendered = self.render_dir / f"{Path(payload['source']).stem}_translated_en.png"
+        rendered = self.render_dir / rendered_filename(
+            Path(payload["source"]),
+            str(payload.get("target_language", "en")),
+        )
         if not rendered.exists():
             fallback = Path("outputs/phase3") / rendered.name
             rendered = fallback if fallback.exists() else rendered
@@ -229,7 +237,10 @@ class MainWindow(QMainWindow):
         working.mkdir(parents=True, exist_ok=True)
         payload = self.project.effective_payload(index)
         source = Path(payload["source"])
-        path = working / f"{source.stem}_translated_en.json"
+        path = working / (
+            f"{source.stem}_translated_"
+            f"{target_slug(str(payload.get('target_language', 'en')))}.json"
+        )
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
 

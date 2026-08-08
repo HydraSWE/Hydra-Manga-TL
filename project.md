@@ -1,27 +1,33 @@
-# Hydra Manga TL — v0.9.0 Project Guide
+# Hydra Manga TL — v1 Project Guide
 
 ## Project summary
 
 Hydra Manga TL is a non-destructive Windows desktop pipeline for OCR,
-Japanese/Chinese-to-English manga translation, artwork reconstruction,
-typesetting, review, manual correction, and PNG export.
+Japanese/Chinese manga translation, artwork reconstruction, typesetting,
+review, manual correction, and multi-format export.
 
-The v0.9.0 development line is the current runtime and documentation target.
+The v1 release line is the current runtime and documentation target.
 Batch, selected-page, manual-region, and review work share application-lifetime
 OCR and translation services, one serialized render queue, normalized progress
 states, cooperative cancellation, stable cache contracts, startup warmup,
 responsive filmstrip controls, identity presentation, region-tool upgrades,
-layout editing, shared text normalization, and the new domain package layout.
+layout editing, shared text normalization, strict stage-level resume,
+target-isolated artifacts, provider-safe Smart Translation, large-project
+responsiveness, generalized editor history, diagnostics, and the domain package
+layout. The current UI layer also includes the refreshed Project Home,
+searchable recent-project library, workspace chrome cleanup, and staged loading
+surfaces.
 
-Status: v0.9.0 is the current development line. v0.8.0-alpha remains the
-completed unified-pipeline baseline, and v0.7.0 remains the HydraMangaAi bridge
-milestone.
+Status: v1 is the current release line. v0.9.0 remains the completed
+workspace/package foundation, v0.8.0-alpha remains the unified-pipeline
+baseline, and v0.7.0 remains the HydraMangaAi bridge milestone.
 
 ## Release history
 
 | Version | Status | Scope |
 | --- | --- | --- |
-| **v0.9.0 — Startup, Region, Layout, Identity, and Package Layout** | Current development | Branded startup warmup, core-ready handoff, per-project collapsible filmstrip, pinned identity thumbnail and preview, rectangle/polygon Region Tool, translated-text layout editing, global text normalization, lazy startup imports, persistent OCR worker, SmartOCR retry budgets, typed requests, one translation manager, one render queue, grouped chapter execution, cancellation, normalized caches, exact manual bounds, rollback-safe rendering, and UI/OCR/translation/phase/project/core packages |
+| **v1 — Recoverability, Smart Translation, Large-Project Stability, Diagnostics, Multi-Target Output, and UI Refresh** | Current release | Manifest-v3 safe resume, centralized planning and validation foundation, verified OCR/translation/render reuse, automated schema migration and compatibility, provider-safe Fast worker limits, large-project workspace responsiveness, refreshed Project Home, searchable recent-project library, grouped workspace controls, loading-screen polish, generalized undo/redo, editable reading order, review filters, batch-selection polish, multi-target artifacts, PDF/CBZ/WebP export, diagnostics bundles, GPU/native-runtime details, configurable app-data storage, and the complete v0.9.0 foundation |
+| **v0.9.0 — Startup, Region, Layout, Identity, and Package Layout** | Completed foundation | Branded startup warmup, core-ready handoff, collapsible filmstrip, pinned identity tile, polygon Region Tool, text-layout editing, shared normalization, lazy imports, and UI/OCR/translation/phase/project/core packages |
 | **v0.8.0-alpha — Unified Pipeline** | Completed baseline | Persistent OCR worker, SmartOCR retry budgets, typed requests, one translation manager, one render queue, grouped chapter execution, cancellation, normalized caches, exact manual bounds, rollback-safe rendering |
 | **v0.7.0 — HydraMangaAi** | Optional/private bridge milestone | Optional private correction capture, explicit approval queues, training snapshots, readiness gates, promotion metadata, rollback records, and AI Center |
 | **v0.6.0 — Unified Workspace** | Completed foundation | Project Home, selected-page translation, manual regions, editor overrides, speech, review, autosave, and export |
@@ -30,7 +36,7 @@ milestone.
 ## Product invariants
 
 1. Source images are never overwritten.
-2. Manual English stays inside the selected `manual_rect`.
+2. Manual translated text stays inside the selected `manual_rect`.
 3. Failed or cancelled queued manual rendering restores project state.
 4. PaddleOCR belongs to one application-lifetime OCR runtime.
 5. Translation uses one configured manager at a time.
@@ -43,30 +49,38 @@ milestone.
     counts, ordering, translation queues, deletion, or export.
 11. Text layout adjustments are render-only until applied and do not mutate OCR
     source geometry.
+12. A manifest state alone never proves that a checkpoint is reusable; source,
+    input, output, application, and policy identities must validate.
+13. Deterministic Translation Memory lookup and legacy JSON cache keys remain
+    backward compatible.
+14. Every output target owns isolated translation, render, edit, timing, and
+    manifest state while OCR remains shared.
 
 ## Current scope
 
-| Area | v0.9.0 behavior |
+| Area | v1 behavior |
 | --- | --- |
 | Platform | Windows 10/11 desktop application using PySide6 |
-| Startup | Branded splash, staged progress, core-ready handoff, and background warmups |
+| Startup | Branded splash, staged progress, refreshed loading presentation, core-ready handoff, and background warmups |
 | Input | JPG, JPEG, PNG, WEBP, TIFF, BMP; individual files or recursive folders |
 | OCR | Shared PaddleOCR runtime with Japanese, Chinese, and Latin-script evidence |
 | OCR quality | Fast = 0 retries, Balanced = 1, Maximum = 3 |
 | Translation | MarianMT, optional Local Qwen GGUF, Groq, Google Translate, Gemini, DeepSeek |
+| Output targets | English, Spanish, French, German, Italian, Portuguese |
 | Requests | Batch, selected, manual, and review |
 | States | Queued, OCR, translating, rendering, done, failed, cancelled |
 | Rendering | One serialized queue for batch, manual, editor, and review work |
-| Review | OCR issue queue, translation issue queue, render review metadata |
-| Editing | Wording, replace/skip, font, size, color, alignment, offsets, bubble type, and translated-text layout |
+| Review | OCR/translation queues plus untranslated, residual-script, overflow, missing-glyph, low-OCR, and provider-fallback filters |
+| Editing | Wording, replace/skip, font, size, color, alignment, offsets, bubble type, text layout, reading order, and bounded undo/redo |
 | Recovery | Rectangle/polygon manual regions, automatic-block suppression/restoration, rollback |
-| Workspace UI | Collapsible per-project filmstrip plus pinned Hydra identity preview tile |
-| Persistence | Versioned `project.json` plus filmstrip visibility, per-page artifacts, and global caches |
-| Export | English PNG files preserving imported relative paths |
+| Workspace UI | Refreshed Project Home, searchable recent-project library, grouped workspace controls, canvas headers, status labels, collapsible filmstrip, pinned identity tile, keyboard batch growth, Select Pending, and Clear Selection |
+| Persistence | Versioned `project.json`, target-isolated state, manifest-v3 stage contracts, global caches, and automated schema migrations with ZIP backups |
+| Diagnostics | Redacted support bundle, fatal logs, timings, GPU/VRAM/native backend details |
+| Export | Target-aware PNG/JPEG/WebP folders, ZIP/CBZ archives, and PDF |
 
-English is the current output language. Automatic output remains reviewable and
-editable because decorative lettering, unusual artwork, and ambiguous source
-text may require human judgment.
+Automatic output remains reviewable and editable because decorative lettering,
+unusual artwork, ambiguous source text, and provider language-pair limitations
+may require human judgment.
 
 ## Unified request flow
 
@@ -102,7 +116,8 @@ Manual requests OCR only the selected crop and retain exact user geometry.
 | `core/application.py` | Qt bootstrap, lazy imports, startup coordination, branding, logging, warm-up, and orderly shutdown |
 | `core/startup.py` | Splash screen, startup progress signals, warnings, completion, and fatal-error presentation |
 | `core/assets.py` | Single packaged/source asset-root lookup path |
-| `ui/` | Project Home, workspace, canvases, collapsible filmstrip, identity tile, editor, review navigation, unified Cancel |
+| `core/diagnostics.py` / `core/gpu.py` | Fatal logging, redacted support bundles, hardware/VRAM and native-backend diagnostics |
+| `ui/` | Project Home, recent-project library, workspace, canvases, collapsible filmstrip, identity tile, editor, review navigation, loading surfaces, unified Cancel |
 | `project/workspace.py` | Project orchestration, manual transactions, rollback, recent projects, export |
 | `project/model.py` | Versioned project and image schema, including per-project filmstrip visibility |
 | `translation/requests.py` | Typed translation and render request contracts |
@@ -110,10 +125,12 @@ Manual requests OCR only the selected crop and retain exact user geometry.
 | `translation/runtime.py` | Application-lifetime translation manager and configuration reuse |
 | `phase/render_queue.py` | Serialized rendering, queued cancellation, completion/failure correlation |
 | `phase/pipeline.py` | Reusable OCR, dialogue, translation, payload, render, and chapter stages |
+| `phase/job_manifest.py` | Manifest-v3 stage contracts, artifact fingerprints, invalidation, errors, and stale recovery |
 | `ocr/runtime.py` / `ocr/worker.py` | App-lifetime subprocess lifecycle and telemetry |
 | `ocr/service.py` | Shared page and selection OCR entry points |
 | `ocr/manager.py` | Retry budgets, candidate scoring, uncertainty and Review policy |
 | `translation/cache_store.py` | Shared stable keys for page and selection caches |
+| `translation/memory/` / `translation/phrase_memory/` | Deterministic exact memory and approved reusable phrase suggestions |
 | `phase/context_engine.py` | Chapter context and prior-page memory |
 | `translation/engines/` | Marian, Qwen GGUF, and opt-in remote page engines |
 | `phase/renderer.py` / `phase/phase3.py` | Masking, cleanup, text fitting, exact manual placement, reports |
@@ -174,7 +191,7 @@ repeated strings.
 The renderer treats `manual_rect` as authoritative through
 `manual_exact_bounds`.
 
-The v0.9.0 Region Tool stores polygon-capable source geometry while retaining
+The Region Tool stores polygon-capable source geometry while retaining
 `manual_rect` compatibility for existing project data and exact-box rendering.
 Rectangle remains the default drawing mode, and source geometry stays separate
 from render-only text layout.
@@ -203,6 +220,18 @@ Exit action. OCR and selected local-model warmups may continue after the main
 window appears; failures are nonfatal, reported through the status bar, and
 retried lazily on first use through the existing runtimes.
 
+## Project Home and workspace UI
+
+Project Home presents import actions, recent projects, and the searchable
+recent-project library without changing project data contracts. The compact
+landing list shows the latest entries, while `View All` opens the larger
+searchable grid for older recent projects.
+
+The workspace refresh is chrome-only: grouped command areas, icon-assisted
+buttons, canvas headers, status labels, and cleaner filmstrip and inspector
+styling. These visual changes do not add a separate sidebar, change translation
+flow, or alter project schema.
+
 ## Cancellation and shutdown
 
 - A queued translation request is removed before execution.
@@ -229,6 +258,17 @@ retain:
   direction, status, and review reasons.
 - Per-project `filmstrip_visible`, defaulting to `true` for older projects.
 - HydraMangaAi subject and approval identifiers when the private layer is used.
+- Per-target translation, rendering, editor, and manual-region state.
+- Optional manual reading order while preserving automatic layout order.
+
+Shared OCR/preprocessing artifacts remain at project scope. Target-specific
+translation JSON, renders, timings, intelligent-page output, and
+`chapter_job_manifest.json` live under `artifacts/targets/<target>/`.
+
+Manifest version 3 records named source, input, and output artifact paths,
+sizes, and SHA-256 digests; application/settings identities; translation
+provider/model identity; completion timestamps; and stage errors. Older
+manifests remain readable but cannot independently authorize checkpoint reuse.
 
 The pinned Hydra identity tile is a control in the workspace only. It is not
 serialized as an image record and never participates in ordering, selection
@@ -245,6 +285,12 @@ The data folder can be changed from Settings.
 Separate OCR, page-translation, and manual-selection cache files are retained
 for migration safety while sharing normalized cache-key helpers.
 
+Projects opened from older schemas (e.g., schema 7 to 8) trigger a safe migration
+flow. The system prompts the user, creates an automatic ZIP backup of the project
+directory, applies deterministic schema transformations, and rolls back to the
+backup if migration or subsequent loading fails. Future schemas are gracefully
+rejected to prevent data loss.
+
 ## HydraMangaAi optional bridge
 
 HydraMangaAi is an optional private package connected through `core/ai_bridge.py`.
@@ -252,7 +298,7 @@ It was introduced in the v0.7.0 milestone and captures correction drafts, but
 requires explicit approval before data enters training snapshots. This layer
 remains under development as the bridge from approved review data to future
 task-specific models. Readiness is task-specific and data-gated; candidate
-models must pass promotion rules before they can become active. The v0.9.0
+models must pass promotion rules before they can become active. The v1
 OCR/translation/render pipeline remains authoritative.
 
 Removing HydraMangaAi leaves the translation product operational.
@@ -285,7 +331,7 @@ native OCR worker startup, shared runtime serialization, queue cancellation,
 shutdown, Qt control-state checks, exact manual bounds, render rollback
 coverage, and disposable Groq/Marian runtime smokes.
 
-The v0.9.0 validation plan includes:
+The v1 validation plan includes:
 
 - Native Paddle worker startup and response.
 - Shared-runtime manager reuse and serialization tests.
@@ -300,7 +346,7 @@ The v0.9.0 validation plan includes:
 
 The runtime smoke never modifies its supplied source project or source images.
 
-Additional v0.9.0-focused validation covers:
+Additional v1-focused validation covers:
 
 - Splash visibility before heavy imports and hidden main-window construction.
 - Ordered, monotonic startup progress and nonfatal warmup warnings.
@@ -313,6 +359,14 @@ Additional v0.9.0-focused validation covers:
 - Collapse/expand behavior while thumbnails or translation work continue.
 - Full-size and 72x78 identity-thumbnail readability.
 - Domain package import paths for UI, OCR, translation, phase, project, and core.
+- Manifest-v3 contract serialization, legacy-manifest safety, source/input/output
+  corruption detection, policy invalidation, and stage error recording.
+- Translation-only checkpoint reuse followed by render/review reconstruction.
+- Multi-target project/editor/artifact isolation and target-aware export names.
+- Filmstrip keyboard batch growth, toggle/range behavior, stable-ID selection,
+  reading-order persistence/reset, and generalized editor history.
+- PDF page ordering, WebP/ZIP/CBZ export, diagnostics redaction, and GPU/native
+  runtime status.
 
 ## Development commands
 
@@ -344,11 +398,14 @@ Build/package only as an explicitly authorized release action:
 ## Current limitations
 
 - Windows is the documented and tested desktop target.
-- English is the only output language.
+- Output targets are English, Spanish, French, German, Italian, and Portuguese;
+  individual providers and local models may support only a subset of pairs.
 - Automatic results may require review or correction.
 - Decorative text and complex artwork may use fallback cleanup.
 - Model packages and caches require substantial disk space.
 - Local Qwen depends on compatible native hardware/runtime support.
 - Automatic application updates are not implemented.
+- v1 ships as a complete offline installer. Selectable Cloud/Core, Qwen,
+  and Marian web-downloaded runtime components are deferred.
 - Human visual acceptance, packaged-build verification, and remaining polish are
-  release steps separate from the current v0.9.0 development implementation.
+  release steps separate from the current v1 implementation.

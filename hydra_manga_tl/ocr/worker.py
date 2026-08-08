@@ -4,10 +4,23 @@ from __future__ import annotations
 
 from multiprocessing.connection import Connection
 from pathlib import Path
+import os
 import tempfile
 import time
 import traceback
 from typing import Any
+
+
+def _configure_native_ocr_environment() -> None:
+    os.environ.setdefault("FLAGS_use_mkldnn", "0")
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+
+_configure_native_ocr_environment()
 
 from PIL import Image, ImageDraw
 
@@ -90,6 +103,7 @@ def run_ocr_worker(connection: Connection, warmup_languages: tuple[str, ...] = (
                         list(request["rect"]),
                         preferred_language=request.get("preferred_language"),
                         quality=request.get("quality", "Balanced"),
+                        strict=bool(request.get("strict", False)),
                     )
                 else:
                     managed = manager.analyze_page(

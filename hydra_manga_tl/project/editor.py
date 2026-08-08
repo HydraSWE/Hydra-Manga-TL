@@ -27,6 +27,7 @@ class RegionEdit:
     layout_y: int | None = None
     layout_width: int | None = None
     layout_height: int | None = None
+    layout_angle: float | None = None
     style_profile: dict | None = None
 
 
@@ -91,6 +92,7 @@ class EditorProject:
                     "y": edit.layout_y,
                     "width": edit.layout_width,
                     "height": edit.layout_height,
+                    "angle": edit.layout_angle or 0.0,
                 }
             if edit.style_profile is not None:
                 group["style_profile"] = dict(edit.style_profile)

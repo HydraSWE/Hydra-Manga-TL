@@ -16,6 +16,8 @@ class TextGroup:
     text: str
     bbox: list[int]
     direction: str
+    source_member_texts: list[str] | None = None
+    confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,7 @@ class GroupClassification:
     kind: str
     confidence: float
     reasons: list[str]
+
 
 
 def _box(region: dict) -> tuple[int, int, int, int]:
@@ -57,10 +60,10 @@ def is_noise(text: str) -> bool:
     """Filter short numeric-only text or text ending with prolonged sound mark (ー)."""
     stripped = text.strip()
     compact = re.sub(r"\s+", "", stripped)
-    
+
     if len(stripped) <= 2 and any(c.isdigit() for c in stripped):
         return True
-        
+
     if len(stripped) <= 4 and stripped.endswith("ー") and any(c.isdigit() for c in stripped.replace("ー", "")):
         return True
 
@@ -70,7 +73,7 @@ def is_noise(text: str) -> bool:
 
     if len(compact) <= 3 and compact.isascii() and any(c.isalpha() for c in compact):
         return True
-        
+
     return False
 
 
@@ -100,6 +103,61 @@ def _is_decorative_symbol(char: str) -> bool:
         or 0x2600 <= codepoint <= 0x27BF
         or 0xFE00 <= codepoint <= 0xFE0F
     )
+
+
+def is_decorative_mark_text(text: object) -> bool:
+    compact = _compact_text(str(text or ""))
+    if not compact:
+        return False
+    stripped = compact.strip(".,!?！？。…・ッっー~〜-")
+    if not stripped:
+        return False
+    return all(_is_decorative_symbol(char) for char in stripped)
+
+
+def _normalize_region_polygon(value: object) -> list[list[int]]:
+    polygon: list[list[int]] = []
+    if not isinstance(value, (list, tuple)):
+        return polygon
+    for point in value:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        try:
+            polygon.append([int(point[0]), int(point[1])])
+        except (TypeError, ValueError):
+            continue
+    return polygon
+
+
+def _region_bbox(polygon: list[list[int]]) -> list[int]:
+    xs = [point[0] for point in polygon]
+    ys = [point[1] for point in polygon]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def decorative_symbols_from_regions(regions: list[dict]) -> list[dict]:
+    symbols: list[dict] = []
+    for index, region in enumerate(regions, 1):
+        if not isinstance(region, dict) or not is_decorative_mark_text(region.get("text", "")):
+            continue
+        polygon = _normalize_region_polygon(region.get("polygon", []))
+        if not polygon:
+            continue
+        symbols.append({
+            "id": f"symbol:{index}",
+            "kind": "decorative_symbol",
+            "text": str(region.get("text", "")),
+            "confidence": float(region.get("confidence", 0.0) or 0.0),
+            "polygon": polygon,
+            "bbox": _region_bbox(polygon),
+            "render_policy": "redraw_semantic",
+            "source": "ocr",
+        })
+    return symbols
+
+
+def preserved_marks_from_regions(regions: list[dict]) -> list[dict]:
+    return []
 
 
 def _looks_like_logo_or_sticker(compact: str, width: int, height: int, counts: dict[str, int], confidence: float) -> bool:
@@ -179,12 +237,12 @@ def _build_reading_graph(groups: list[TextGroup]) -> list[TextGroup]:
     """Patch 3: Dynamic tier-based reading order graph."""
     if not groups:
         return []
-        
+
     # Calculate a dynamic tier height based on the median text group height
     heights = [g.bbox[3] - g.bbox[1] for g in groups]
     median_h = sorted(heights)[len(heights) // 2]
     tier_height = max(20, median_h * 1.25)
-    
+
     return sorted(groups, key=lambda g: (g.bbox[1] // tier_height, -g.bbox[2]))
 
 
@@ -245,16 +303,16 @@ def group_regions(regions: list[dict]) -> list[TextGroup]:
             continue
         lx1, ly1, lx2, ly2 = boxes[left]
         lx_center = (lx1 + lx2) / 2
-        
+
         for right in valid_indices[idx + 1:]:
             if not vertical[right]:
                 continue
             rx1, ry1, rx2, ry2 = boxes[right]
             rx_center = (rx1 + rx2) / 2
-            
+
             horizontal_gap = max(0, max(lx1, rx1) - min(lx2, rx2))
             typical_width = min(lx2 - lx1, rx2 - rx1)
-            
+
             center_difference = abs(lx_center - rx_center)
             left_component = _bubble_component(regions[left])
             right_component = _bubble_component(regions[right])
@@ -299,8 +357,43 @@ def group_regions(regions: list[dict]) -> list[TextGroup]:
             bbox=[x1, y1, x2, y2],
             direction="vertical-rtl" if is_vertical else "horizontal-ltr",
         ))
-        
+
     return _build_reading_graph(groups)
+
+
+def _order_manual_regions(regions: list[dict], boxes: list[tuple[int, int, int, int]], is_vertical: bool) -> list[int]:
+    if not is_vertical or len(regions) <= 1:
+        return sorted(
+            range(len(regions)),
+            key=(lambda index: (-boxes[index][0], boxes[index][1])) if is_vertical else (lambda index: (boxes[index][1], boxes[index][0])),
+        )
+
+    avg_width = max(1.0, sum((box[2] - box[0]) for box in boxes) / len(boxes))
+    indices = list(range(len(regions)))
+    indices.sort(key=lambda idx: -((boxes[idx][0] + boxes[idx][2]) / 2.0))
+
+    columns: list[list[int]] = []
+    for idx in indices:
+        cx = (boxes[idx][0] + boxes[idx][2]) / 2.0
+        placed = False
+        for col in columns:
+            col_cxs = [(boxes[i][0] + boxes[i][2]) / 2.0 for i in col]
+            col_avg_cx = sum(col_cxs) / len(col_cxs)
+            if abs(cx - col_avg_cx) <= max(12.0, avg_width * 0.35):
+                col.append(idx)
+                placed = True
+                break
+        if not placed:
+            columns.append([idx])
+
+    columns.sort(key=lambda col: -sum((boxes[i][0] + boxes[i][2]) / 2.0 for i in col) / len(col))
+
+    ordered: list[int] = []
+    for col in columns:
+        col.sort(key=lambda idx: boxes[idx][1])
+        ordered.extend(col)
+
+    return ordered
 
 
 def compose_manual_region(regions: list[dict]) -> TextGroup:
@@ -319,20 +412,24 @@ def compose_manual_region(regions: list[dict]) -> TextGroup:
             if ("\u3040" <= c <= "\u30ff") or ("\u3400" <= c <= "\u9fff")
         )
 
-        if h > w * 1.35 and jp >= 2:
+        if (h > w * 1.2 or (h > w * 0.8 and len(regions) > 1)) and jp >= 1:
             vertical_count += 1
 
-    is_vertical = vertical_count > len(regions) / 2
-    ordered = sorted(
-        range(len(regions)),
-        key=(lambda index: (-boxes[index][0], boxes[index][1])) if is_vertical else (lambda index: (boxes[index][1], boxes[index][0])),
-    )
+    is_vertical = vertical_count > len(regions) / 3 if regions else False
+    ordered = _order_manual_regions(regions, boxes, is_vertical)
+
+    member_texts = [str(regions[index].get("text", "")) for index in ordered]
+    confidences = [float(regions[index].get("confidence", 1.0) or 1.0) for index in ordered]
+    avg_confidence = sum(confidences) / max(1, len(confidences))
+
     return TextGroup(
         member_indices=[index + 1 for index in ordered],
-        text=clean_ocr_text("".join(str(regions[index]["text"]) for index in ordered)),
+        text=clean_ocr_text("".join(member_texts)),
         bbox=[
             min(box[0] for box in boxes), min(box[1] for box in boxes),
             max(box[2] for box in boxes), max(box[3] for box in boxes),
         ],
         direction="vertical-rtl" if is_vertical else "horizontal-ltr",
+        source_member_texts=member_texts,
+        confidence=avg_confidence,
     )

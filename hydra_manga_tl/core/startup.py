@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QObject, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -52,30 +52,43 @@ class StartupSplash(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setFixedSize(660, 430)
         
-        # Kept original colors and theme intact. 
-        # Refined height and border-radius slightly for a sleeker progress bar.
         self.setStyleSheet(
             """
             QWidget#StartupSplash {
-                background: #080d17;
-                border: 1px solid #1c63b7;
+                background: #0d1117;
+                border: 1px solid #2a3648;
                 border-radius: 18px;
             }
             QLabel { color: #eaf5ff; }
-            QLabel#SplashMuted { color: #8192a8; }
-            QLabel#SplashStatus { color: #79cfff; font-size: 14px; font-weight: bold; }
+            QLabel#SplashMuted { color: #8f9bad; }
+            QLabel#SplashStatus { color: #f0f5ff; font-size: 14px; font-weight: 650; }
+            QLabel#SplashPercent { color: #9ec2ff; font-size: 13px; font-weight: 650; }
+            QFrame#StartupLoadingPanel {
+                background: #121923;
+                border: 1px solid #2a3648;
+                border-radius: 10px;
+            }
             QProgressBar {
-                background: #111b2a; border: 1px solid #244463;
-                border-radius: 6px; height: 10px; text-align: center;
+                background: #171d27;
+                border: 1px solid #263141;
+                border-radius: 5px;
+                height: 10px;
+                text-align: center;
             }
             QProgressBar::chunk {
-                border-radius: 5px;
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #176bd1, stop:1 #42d8ff);
+                border-radius: 4px;
+                background: #3478ed;
             }
             QPushButton {
-                color: white; background: #176bd1; border: 0;
-                border-radius: 6px; padding: 8px 20px;
+                color: white;
+                background: #202a38;
+                border: 1px solid #303d50;
+                border-radius: 6px;
+                padding: 8px 20px;
+            }
+            QPushButton:hover {
+                background: #29364a;
+                border-color: #4b6382;
             }
             """
         )
@@ -109,8 +122,10 @@ class StartupSplash(QWidget):
         # Spacer to push loading UI to the bottom
         layout.addStretch(1)
 
-        # --- Bottom Section: Enhanced Loading UI ---
-        loading_layout = QVBoxLayout()
+        loading_panel = QFrame()
+        loading_panel.setObjectName("StartupLoadingPanel")
+        loading_layout = QVBoxLayout(loading_panel)
+        loading_layout.setContentsMargins(14, 12, 14, 12)
         loading_layout.setSpacing(8)
 
         # Header: Status (Left) and Percentage (Right)
@@ -119,7 +134,7 @@ class StartupSplash(QWidget):
         self.status.setObjectName("SplashStatus")
         
         self.percentage_label = QLabel("0%")
-        self.percentage_label.setObjectName("SplashStatus")
+        self.percentage_label.setObjectName("SplashPercent")
         self.percentage_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         
         status_header_layout.addWidget(self.status)
@@ -141,11 +156,19 @@ class StartupSplash(QWidget):
         self.history.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         loading_layout.addWidget(self.history)
 
-        layout.addLayout(loading_layout)
+        layout.addWidget(loading_panel)
 
         # --- Error / Exit Section ---
         bottom_actions = QHBoxLayout()
         bottom_actions.addStretch()
+        self.copy_button = QPushButton("Copy details")
+        self.copy_button.hide()
+        self.copy_button.clicked.connect(self._copy_fatal_details)
+        bottom_actions.addWidget(self.copy_button)
+        self.logs_button = QPushButton("Open logs")
+        self.logs_button.hide()
+        self.logs_button.clicked.connect(self._open_logs)
+        bottom_actions.addWidget(self.logs_button)
         self.exit_button = QPushButton("Exit")
         self.exit_button.hide()
         self.exit_button.clicked.connect(QApplication.quit)
@@ -153,6 +176,18 @@ class StartupSplash(QWidget):
         layout.addLayout(bottom_actions)
         
         self._completed_labels: list[str] = []
+        self._fatal_details = ""
+        self._logs_path: Path | None = None
+
+    def set_diagnostics_path(self, logs_path: Path) -> None:
+        self._logs_path = Path(logs_path)
+
+    def _copy_fatal_details(self) -> None:
+        QApplication.clipboard().setText(self._fatal_details)
+
+    def _open_logs(self) -> None:
+        if self._logs_path is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._logs_path)))
 
     def show_centered(self) -> None:
         screen = QApplication.primaryScreen()
@@ -178,9 +213,12 @@ class StartupSplash(QWidget):
         self.history.setText(message)
 
     def show_fatal_error(self, message: str) -> None:
+        self._fatal_details = str(message)
         self.progress.hide()
         self.percentage_label.hide()
         self.status.setText("Hydra could not start")
         self.history.setText(message)
+        self.copy_button.show()
+        self.logs_button.setVisible(self._logs_path is not None)
         self.exit_button.show()
         self.show_centered()

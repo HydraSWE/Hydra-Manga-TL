@@ -6,10 +6,11 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from hydra_manga_tl.core.fonts import default_font_file
 from .models import RenderedTitleLayer, TitleComposition, TitleObject
 from .style_profile import Color, TitleStyleProfile
 
-DEFAULT_FONT = Path(r"C:\Windows\Fonts\arialbd.ttf")
+DEFAULT_FONT = default_font_file(bold=True)
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:

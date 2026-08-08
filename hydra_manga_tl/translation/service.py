@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from hashlib import sha256
 import html
 import json
@@ -24,7 +26,6 @@ MODEL_BY_PAIR = {
 }
 
 EXACT_TRANSLATIONS = {
-    ("Japanese", "en", "大和"): "Yamato",
     ("Japanese", "en", "オレが食いたいんだ全部オレによこせー"): "I want to eat it. Give it all to me!",
 }
 
@@ -378,6 +379,37 @@ def translated_region_dict(region: TranslatedRegion) -> dict:
     return asdict(region)
 
 
+class TranslationHTTPError(RuntimeError):
+    def __init__(
+        self,
+        status: int,
+        detail: str,
+        *,
+        retry_after: float | None = None,
+    ) -> None:
+        self.status = int(status)
+        self.detail = str(detail)
+        self.retry_after = retry_after
+        super().__init__(
+            f"Translation service returned HTTP {self.status}: {self.detail}"
+        )
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+
+
 def _post_json(url: str, body: dict, *, headers: dict[str, str] | None = None, timeout: int = 45) -> dict:
     request_headers = {"Content-Type": "application/json", "User-Agent": "Hydra-Manga-TL/0.6"}
     request_headers.update(headers or {})
@@ -387,7 +419,16 @@ def _post_json(url: str, body: dict, *, headers: dict[str, str] | None = None, t
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"Translation service returned HTTP {error.code}: {detail}") from error
+        retry_after = (
+            error.headers.get("Retry-After")
+            if error.headers is not None
+            else None
+        )
+        raise TranslationHTTPError(
+            error.code,
+            detail,
+            retry_after=_retry_after_seconds(retry_after),
+        ) from error
 
 
 def _localization_prompt(

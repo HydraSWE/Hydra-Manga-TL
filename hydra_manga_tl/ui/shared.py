@@ -9,8 +9,17 @@ from PySide6.QtCore import QPointF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPolygonF, QPixmap
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QComboBox, QToolButton, QVBoxLayout, QWidget
 
+from hydra_manga_tl.core.assets import find_asset
 
-TARGET_LANGUAGE_NAMES = {"en": "English"}
+
+TARGET_LANGUAGE_NAMES = {
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Portuguese",
+}
 FILMSTRIP_CARD_SIZE = QSize(88, 104)
 FILMSTRIP_PREVIEW_SIZE = QSize(72, 78)
 
@@ -112,6 +121,11 @@ def _landing_icon(kind: str, size: int) -> QPixmap:
     return pixmap
 
 
+def lucide_icon(name: str) -> QIcon:
+    path = find_asset("icons", "lucide", f"{name}.svg")
+    return QIcon(str(path)) if path is not None else QIcon()
+
+
 def _speaker_icon(color: str = "#69a0ff", size: int = 18) -> QIcon:
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -134,3 +148,14 @@ def _speaker_icon(color: str = "#69a0ff", size: int = 18) -> QIcon:
     painter.drawArc(int(size * 0.50), int(size * 0.18), int(size * 0.44), int(size * 0.64), -45 * 16, 90 * 16)
     painter.end()
     return QIcon(pixmap)
+
+
+def confirm(parent: QWidget | None, title: str, text: str) -> bool:
+    from PySide6.QtWidgets import QMessageBox
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setIcon(QMessageBox.Icon.NoIcon)
+    box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    return box.exec() == QMessageBox.StandardButton.Yes

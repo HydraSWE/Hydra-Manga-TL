@@ -3,54 +3,85 @@
 ![Hydra Manga TL logo](assets/logos/mainlogo.png)
 
 Hydra Manga TL is a local-first Windows desktop application for translating,
-reconstructing, reviewing, and exporting manga pages as editable English PNGs.
+reconstructing, reviewing, and exporting manga pages as editable translated
+images and comic-ready documents.
 It keeps source images untouched and stores OCR, translations, manual regions,
 review decisions, and rendered output in a versioned project.
 
 ## Current version
 
-**Hydra Manga TL v0.9.0** is the current development line. It includes the
-unified OCR/translation/render pipeline plus startup polish, responsive
-workspace controls, manual region upgrades, layout editing, package
-reorganization, and brand identity improvements. HydraMangaAi remains an
-optional private bridge layer when the separate package is present.
+**Hydra Manga TL v1** is the current release line. It extends the
+unified OCR/translation/render pipeline with verified stage-level resume,
+provider-safe Smart Translation, large-project responsiveness, multi-target
+output, generalized editor undo/redo, reading-order controls, expanded export
+formats, runtime diagnostics, polished batch selection, a refreshed Project
+Home, a searchable recent-project library, and a cleaner workspace UI.
+HydraMangaAi remains an optional private bridge layer when the separate package
+is present.
 
 | Version | Status | Milestone |
 | --- | --- | --- |
-| **v0.9.0** | Current development | Branded startup warmup, collapsible filmstrip, pinned identity tile, rectangle/polygon Region Tool, interactive translated-text layout editing, global text normalization, startup-safe lazy imports, domain package layout, unified request pipeline, persistent OCR runtime, shared translation/render services, cancellation, cache normalization, and resilient manual rerendering |
+| **v1** | Current release | Manifest-v3 pipeline resume, centralized planning foundation, verified OCR/translation/render reuse, automatic schema migration and backward compatibility, provider-safe Smart Translation, large-project workspace responsiveness, refreshed Project Home and workspace UI, searchable recent-project library, multi-target artifacts, PDF/CBZ/WebP export, generalized undo/redo, editable reading order, filmstrip batch-selection polish, diagnostics bundles, detailed GPU/native status, configurable app-data storage, and the complete v0.9.0 workspace/pipeline foundation |
+| **v0.9.0** | Completed foundation | Branded startup warmup, collapsible filmstrip, pinned identity tile, rectangle/polygon Region Tool, interactive translated-text layout editing, global text normalization, domain package layout, unified request pipeline, and persistent OCR/render services |
 | **v0.8.0-alpha** | Completed baseline | Unified translation pipeline, persistent OCR runtime, shared translation and render services, bounded SmartOCR retries, cancellation, cache normalization, and resilient manual rerendering |
 | **v0.7.0** | Optional/private bridge milestone | **HydraMangaAi**: private correction capture, approval queues, training-data gates, model promotion metadata, and AI Center integration |
 | **v0.6.0** | Completed foundation | Unified desktop workspace, selected-page translation, manual text boxes, editing, review, speech, and export |
 
-English is currently the output language. Japanese and Chinese source text are
-supported, while detected Latin-script content can be preserved.
+English, Spanish, French, German, Italian, and Portuguese are available output
+targets. Japanese and Chinese source text are supported, while detected
+Latin-script content can be preserved. Provider/model language-pair support
+still applies.
 
-## What v0.9.0 adds
+## What v1 Adds
 
-- Shows a branded Hydra startup warmup screen before heavy UI, OCR,
-  translation, and renderer imports finish.
-- Reports ordered startup phases for settings, assets, local provider
-  validation, renderer setup, workspace restore, and background warmups.
-- Keeps OCR and selected local translation warmups nonfatal after the
-  core-ready handoff, with status-bar warnings and lazy retry on first use.
-- Keeps Qwen/cloud startup isolated from Marian warmup; cloud provider checks
-  remain local and make no network requests.
-- Adds a collapsible Filmstrip section whose expanded state is saved per
-  project and restored when projects are reopened or switched.
-- Pins a Hydra identity tile before Page 1 in the filmstrip without adding it
-  to image IDs, page counts, drag/drop, translation queues, deletion, or
-  export.
-- Opens a scalable identity preview dialog when the identity tile is clicked.
-- Upgrades `assets/thumbnail/hydra.png` into a high-contrast Hydra identity
-  thumbnail that remains recognizable at the filmstrip preview size.
-- Extends manual regions with rectangle and polygon source geometry while
-  preserving compatibility with `manual_rect`.
-- Adds interactive translated-text layout adjustment on the current canvas
-  without changing OCR/source geometry until rerender.
-- Normalizes escaped Unicode, curly punctuation, odd spaces, zero-width
-  characters, and repeated punctuation through shared text boundaries.
+- Extends the existing chapter manifest to version 3 with source, input, and
+  output SHA-256 digests; application/settings identity; provider/model
+  identity; completion timestamps; and per-stage errors.
+- Reuses OCR, translation, or completed rendering only when the corresponding
+  source, artifacts, and policy fingerprints still match. A verified
+  translation can be reused while only rendering and review are rebuilt.
+- Preserves deterministic Translation Memory and legacy JSON cache contracts;
+  source-region geometry remains metadata rather than a Translation Memory
+  lookup key.
+- Adds target-isolated translation, rendering, editing, manifest, timing, and
+  export state for English, Spanish, French, German, Italian, and Portuguese.
+- Adds centralized pipeline planning and validation foundations so resume,
+  invalidation, and stage reuse decisions stay in one pipeline authority.
+- Adds provider-safe Fast worker concurrency for Smart Translation. User worker
+  requests are honored within selected-provider limits, including conservative
+  Groq and local-model caps.
+- Improves large-project responsiveness with async project opening, deferred
+  restore, chunked filmstrip building, batched thumbnail loading, and targeted
+  progress refreshes.
+- Adds bounded editor undo/redo for text/style edits, manual-region changes,
+  polygon redraw, automatic-region suppression/restoration, layout movement,
+  project style, and approval state.
+- Adds editable numbered reading order, reset to automatic order, typography
+  fit preview, and review filters for untranslated text, residual source
+  script, overflow, missing glyphs, low OCR confidence, and provider fallback.
+- Polishes filmstrip keyboard batching: `Ctrl+Left/Right` grows the batch,
+  `Ctrl+Space` toggles the current page, and selection survives refresh/reorder.
+- Adds PDF export alongside PNG/JPEG/WebP folders and ZIP/CBZ archives, with
+  target-aware output names.
+- Adds redacted diagnostics bundles, fatal exception logging, and detailed
+  NVIDIA device, driver, compute capability, VRAM, utilization, Torch,
+  llama.cpp, Paddle, dependency, and load-test status.
+- Makes the Hydra application-data root configurable while preserving external
+  projects and exports during recent-project cleanup.
+- Refreshes Project Home with clearer import actions, polished recent-project
+  cards, and a compact landing view that keeps the latest projects visible.
+- Adds a searchable recent-project library through `View All`, while keeping
+  the landing page limited to the most recent entries.
+- Refreshes the workspace chrome with grouped controls, icon-assisted actions,
+  canvas headers, status labels, and cleaner filmstrip and inspector styling.
+- Polishes startup and project import loading surfaces with clearer staged
+  progress feedback.
+- Adds an automated project compatibility and migration system. Safely rejects
+  future-schema projects, prompts users before upgrading old schemas,
+  automatically creates ZIP backups before migrating, and restores the original
+  project if migration fails or encounters corruption.
 
-## Core pipeline included in v0.9.0
+## Core Pipeline Included In v1
 
 - Imports JPG, JPEG, PNG, WEBP, TIFF, and BMP files or recursive folders.
 - Runs OCR through one application-lifetime PaddleOCR worker.
@@ -75,16 +106,21 @@ supported, while detected Latin-script content can be preserved.
   before rendering begins.
 - Shows original and translated pages side by side with selectable overlays.
 - Supports text, font, size, color, alignment, placement, and bubble-type edits.
+- Supports target switching without overwriting another target's artifacts or
+  editor state.
 - Removes automatic blocks and restores them later.
 - Provides OCR and translation review queues.
-- Autosaves projects and exports PNG files without modifying source images.
+- Autosaves projects and exports folders, PDF, ZIP, or CBZ without modifying
+  source images.
 
 ## Historical baseline: v0.8.0-alpha
 
 v0.8.0-alpha was the completed unified-pipeline checkpoint that established the
 current OCR, translation, render, cache, cancellation, and manual-rerender
-architecture. v0.9.0 keeps that pipeline as part of the active app while adding
-startup, workspace, Region Tool, layout, identity, and package-layout work.
+architecture. v1 keeps that pipeline and the v0.9.0 workspace foundation
+active while adding recoverability, editor workflow, diagnostics, multi-target
+state, provider-safe scheduling, large-project responsiveness, and expanded
+export work.
 
 For a compact product listing, see [catalog.md](catalog.md). For architecture,
 data contracts, and contributor guidance, see [project.md](project.md).
@@ -140,15 +176,17 @@ The equivalent module command is:
 ## Normal workflow
 
 1. Drop manga files or a folder onto Project Home, or select **Import Manga**.
-2. Select pages and choose **Translate Selected**, or choose
+2. Reopen recent work from the landing cards, or use **View All** to search
+   the recent-project library.
+3. Select pages and choose **Translate Selected**, or choose
    **Translate All Pending**.
-3. Review completed pages while later queued work continues.
-4. Correct OCR, translation, or typography in the inspector and select
+4. Review completed pages while later queued work continues.
+5. Correct OCR, translation, or typography in the inspector and select
    **Apply & Rerender**.
-5. For missed text, select **Add Text Box** and draw one rectangle on the
+6. For missed text, select **Add Text Box** and draw one rectangle on the
    original page.
-6. Use **Next OCR Issue** and **Next Review Issue** to inspect uncertain blocks.
-7. Select **Export** and choose a separate destination folder.
+7. Use **Next OCR Issue** and **Next Review Issue** to inspect uncertain blocks.
+8. Select **Export** and choose a separate destination folder.
 
 The unified Cancel action covers batch work, manual OCR/translation, and manual
 renders that are still waiting in the render queue. A render already in progress
@@ -211,7 +249,7 @@ model metadata. Runtime data defaults to:
 D:\HydraMangaAiData
 ```
 
-The v0.9.0 OCR/translation/render pipeline remains authoritative. HydraMangaAi
+The v1 OCR/translation/render pipeline remains authoritative. HydraMangaAi
 only becomes active for a task after a candidate has sufficient approved data
 and passes its promotion gate. Removing the private package disables learning
 without disabling manga translation.
@@ -253,11 +291,21 @@ Run the complete test suite:
 .\.venv\Scripts\python -m unittest discover -s tests -v
 ```
 
-The v0.9.0 test plan covers native OCR worker startup, queue cancellation,
+Run tests from the repository root, not from inside the `tests` folder. Python
+module names use dots and omit `.py`:
+
+```powershell
+.\.venv\Scripts\python -m unittest tests.test_parallel_scheduler
+.\.venv\Scripts\python -m unittest tests.test_parallel_scheduler.ParallelPageSchedulerTests
+.\.venv\Scripts\python -m unittest tests.test_parallel_scheduler.ParallelPageSchedulerTests.test_worker_tiers_and_override
+```
+
+The v1 test plan covers native OCR worker startup, queue cancellation,
 shutdown, Qt control states, exact manual bounds, render rollback, startup
-progress, application import laziness, project migration, per-project filmstrip
-persistence, identity-tile exclusion from page order, manual region geometry,
-layout editing, package import paths, and global text normalization.
+progress, project migration, filmstrip selection/persistence, manual source
+geometry, editor history, reading order, multi-target isolation, target-aware
+exports, manifest-v3 digest/policy invalidation, translation-only rerender,
+diagnostics redaction, and GPU/native status.
 
 Full-suite status can vary while the branch is dirty; validate the current
 checkout before packaging a release.
@@ -291,6 +339,17 @@ LaMa helper. After a successful build, `build\pip-temp`,
 space. Keep `.venv`, `.venv-inpaint`, `runtime\inpaint`, and
 `dist\Hydra Manga TL` unless you intentionally want the next build to download
 and recreate them.
+
+## Windows installer
+
+The current v1 Inno Setup release is a complete offline installer. It
+contains the full PyInstaller one-folder distribution, including local and
+cloud translation support, so users do not download runtime components during
+setup.
+
+A smaller web/bootstrap installer with independently selectable Cloud/Core,
+Qwen Local, and Marian Local downloads is planned for a later release. It is
+not part of v1.
 
 ## Troubleshooting
 

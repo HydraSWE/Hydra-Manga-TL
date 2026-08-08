@@ -9,12 +9,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtGui import QFontDatabase, QIcon
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication
 
 from hydra_manga_tl import __version__
 from hydra_manga_tl.core.assets import asset_roots, find_asset
+from hydra_manga_tl.core.fonts import find_font_file
 from hydra_manga_tl.core.paths import PATHS
+from hydra_manga_tl.core.state import APP_STATE
 from hydra_manga_tl.core.startup import StartupCoordinator, StartupSplash
 
 if TYPE_CHECKING:
@@ -43,11 +45,59 @@ class MangaApplication:
         self.startup.warning.connect(self.splash.show_warning)
         self.startup.warning.connect(self._record_startup_warning)
         self.startup.fatal_error.connect(self.splash.show_fatal_error)
+        self._background_dialog = None
+        APP_STATE.busy_changed.connect(self._on_busy_changed)
         self.splash.show_centered()
+
+    def _on_busy_changed(self, busy: bool) -> None:
+        if busy:
+            from hydra_manga_tl.ui.dialogs import BackgroundWorkDialog
+
+            if not self._background_dialog:
+                self._background_dialog = BackgroundWorkDialog(self.main_window)
+                self._background_dialog.finished.connect(self._on_background_dialog_closed)
+            self._background_dialog.closed_by_user = False
+            self._background_dialog.show()
+            QApplication.restoreOverrideCursor()
+        else:
+            if self._background_dialog and not self._background_dialog.closed_by_user:
+                self._background_dialog.close()
+            QApplication.restoreOverrideCursor()
+
+    def _on_background_dialog_closed(self) -> None:
+        if APP_STATE.busy and getattr(self._background_dialog, "closed_by_user", False):
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
     def _record_startup_warning(self, message: str) -> None:
         if message and message not in self._startup_warnings:
             self._startup_warnings.append(message)
+
+    def _deferred_open_startup_path(self, window: "MainWindow") -> None:
+        if self.startup_path is None:
+            return
+        window.open_startup_path(self.startup_path)
+
+    def _compatible_recent_project(self, workspace) -> Path | None:
+        from hydra_manga_tl.project.compatibility import InvalidProjectError
+
+        for project_file in workspace.recent_projects():
+            try:
+                metadata = workspace.project_metadata(project_file)
+            except (InvalidProjectError, OSError, ValueError) as error:
+                self._record_startup_warning(
+                    f"Recent project could not be restored: {error}"
+                )
+                continue
+            if metadata.migration_required:
+                self._record_startup_warning(
+                    f"{metadata.name} needs a project upgrade before it can open."
+                )
+                continue
+            if metadata.status in {"incompatible", "unsupported", "invalid"}:
+                self._record_startup_warning(metadata.message)
+                continue
+            return project_file
+        return None
 
     @staticmethod
     def _configure_windows_identity() -> None:
@@ -61,7 +111,9 @@ class MangaApplication:
         self.qt_app.setApplicationName("Hydra Manga TL")
         self.qt_app.setApplicationVersion(__version__)
         self.qt_app.setOrganizationName("Hydra")
-        QFontDatabase.addApplicationFont(r"C:\Windows\Fonts\segoeui.ttf")
+        application_font = find_font_file("Segoe UI")
+        if application_font is not None:
+            QFontDatabase.addApplicationFont(str(application_font))
         self._brand_icon_path = self._brand_icon_file()
         self.qt_app.setWindowIcon(self._load_brand_icon())
 
@@ -151,6 +203,10 @@ class MangaApplication:
             handlers=[logging.FileHandler(PATHS.logs / "app.log", encoding="utf-8"), logging.StreamHandler()],
             force=True,
         )
+        from hydra_manga_tl.core.diagnostics import install_exception_logging
+
+        install_exception_logging(PATHS.logs)
+        self.splash.set_diagnostics_path(PATHS.logs)
         logging.getLogger(__name__).info("Starting Hydra Manga TL %s", __version__)
 
         self.startup.advance("appearance", "Initializing theme, fonts, and assets…", 22)
@@ -223,13 +279,15 @@ class MangaApplication:
             self.initialize()
             self.startup.advance("ui", "Building workspace interface…", 62)
             window = self.create_main_window()
+            from hydra_manga_tl.core.notifications import NOTIFICATION_SERVICE
+            NOTIFICATION_SERVICE.initialize()
             self.startup.advance("workspace", "Restoring workspace…", 78)
             from hydra_manga_tl.project.workspace import WORKSPACE
 
-            if self.startup_path is not None:
-                window.open_startup_path(self.startup_path)
-            elif WORKSPACE.recent_projects():
-                window.open_project(WORKSPACE.recent_projects()[0])
+            recent_project = (
+                None if self.startup_path is not None
+                else self._compatible_recent_project(WORKSPACE)
+            )
             self.startup.advance("warmup", "Starting OCR and translation warmup…", 90)
             self.start_background_warmup()
             self._connect_shutdown(WORKSPACE)
@@ -243,10 +301,16 @@ class MangaApplication:
         window.show()
         QTimer.singleShot(0, lambda: self._apply_window_icon(window))
         QTimer.singleShot(80, self.splash.close)
+        from hydra_manga_tl.core.updater import UPDATER
+        QTimer.singleShot(1200, UPDATER.check_startup)
         status = "Workspace ready • OCR and local model warmup may continue in the background"
         if self._startup_warnings:
             status += " • " + self._startup_warnings[-1]
         window.statusBar().showMessage(status, 10000)
+        if self.startup_path is not None:
+            QTimer.singleShot(140, lambda: self._deferred_open_startup_path(window))
+        elif recent_project is not None:
+            QTimer.singleShot(140, lambda path=recent_project: window.open_project(path))
         return self.qt_app.exec()
 
     def _connect_shutdown(self, workspace) -> None:

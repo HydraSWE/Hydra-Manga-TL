@@ -35,7 +35,7 @@ class TranslationCacheStore:
         quality: str,
     ) -> str:
         return _json_hash({
-            "kind": "manual-selection-ocr-v2-single-pass",
+            "kind": "manual-selection-ocr-v3-padded-pass",
             "source_sha256": cls.file_digest(source),
             "rect": [int(value) for value in rect],
             "preferred_language": str(preferred_language),
@@ -50,6 +50,7 @@ class TranslationCacheStore:
     ) -> str:
         engine = str(config.get("translation_engine", "qwen") or "qwen").strip().lower()
         provider_models = dict(config.get("provider_models", {}) or {})
+        provider_base_urls = dict(config.get("provider_base_urls", {}) or {})
         return _json_hash({
             "kind": "page-translation-v1",
             "source_language": page.source_language,
@@ -59,6 +60,7 @@ class TranslationCacheStore:
             "glossary": config.get("glossary", {}),
             "engine": engine,
             "provider_model": provider_models.get(engine, ""),
+            "provider_base_url": provider_base_urls.get(engine, ""),
             "qwen_model": (
                 config.get("qwen_model_path") or config.get("qwen_model") or config.get("qwen_model_name", "")
                 if engine == "qwen"

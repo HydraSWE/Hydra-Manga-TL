@@ -42,3 +42,23 @@ class TranslationEngine(Protocol):
 
     def unload(self) -> None: ...
 
+
+def prepare_dialogue_item(item: dict) -> dict:
+    """Format dialogue block for prompt injection, including available metadata."""
+    payload = {
+        "id": str(item.get("id", "")),
+        "text": str(item.get("text", "")).strip(),
+    }
+    for field in (
+        "source_direction",
+        "confidence",
+        "region_type",
+        "reading_order",
+        "ocr_review_reasons",
+        "source_member_texts",
+        "decorative_symbols",
+        "preserved_marks",
+    ):
+        if field in item and item[field] is not None and item[field] != "":
+            payload[field] = item[field]
+    return payload

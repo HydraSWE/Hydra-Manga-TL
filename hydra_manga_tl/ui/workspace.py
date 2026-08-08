@@ -1,13 +1,15 @@
 """Main translation workspace screen."""
 
+
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QRectF, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
-from PySide6.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGraphicsView, QGridLayout, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QStyle, QTabWidget, QSizePolicy, QTextEdit, QToolButton, QVBoxLayout, QWidget, QKeySequenceEdit, QLineEdit
+from PySide6.QtCore import QModelIndex, QRectF, QSize, Qt, QThread, QTimer, Signal, QObject, Slot
+from PySide6.QtGui import QAction,QCursor, QColor, QFont, QFontMetrics, QIcon, QIntValidator, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsView, QGridLayout, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QTabWidget, QSizePolicy, QTextEdit, QToolButton, QVBoxLayout, QWidget, QKeySequenceEdit, QLineEdit
 
 from hydra_manga_tl.core.assets import find_asset
 from hydra_manga_tl.project.editor import RegionEdit
@@ -18,16 +20,73 @@ from hydra_manga_tl.core.region_types import normalize_region_type
 from hydra_manga_tl.core.settings import SETTINGS
 from hydra_manga_tl.core.speech import SpeechService
 from hydra_manga_tl.core.state import APP_STATE
+from hydra_manga_tl.core.user_errors import export_error, hydra_ai_error, pipeline_error, render_error, workspace_action_error
 from hydra_manga_tl.ui.canvas import CanvasView
-from hydra_manga_tl.ui.dialogs import AiCenterDialog, ExportOptionsDialog, GlossaryDialog, IdentityPreviewDialog, SettingsDialog, WorkingDialog
+from hydra_manga_tl.ui.dialogs import AiCenterDialog, BackgroundWorkDialog, ExportOptionsDialog, GlossaryDialog, IdentityPreviewDialog, PhraseMemoryManagerDialog, SettingsDialog, WorkingDialog
 from hydra_manga_tl.ui.filmstrip import ReorderableFilmstrip
-from hydra_manga_tl.ui.shared import CollapsibleSection, FILMSTRIP_CARD_SIZE, FILMSTRIP_PREVIEW_SIZE, TARGET_LANGUAGE_NAMES, _language_badge, _page_label, _speaker_icon
+from hydra_manga_tl.ui.shared import CollapsibleSection, FILMSTRIP_CARD_SIZE, FILMSTRIP_PREVIEW_SIZE, TARGET_LANGUAGE_NAMES, _language_badge, _page_label, _speaker_icon, lucide_icon, confirm
 from hydra_manga_tl.project.workspace import WORKSPACE
 from hydra_manga_tl.core.ai_bridge import HYDRA_AI
 
 
+TRANSLATE_ELIGIBLE_STATUSES = {"pending", "queued", "failed", "cancelled"}
+
+
+class ExportWorker(QObject):
+    progress = Signal(int, int)
+    finished = Signal(str, object)
+    failed = Signal(str)
+
+    def __init__(self, output_type: str, destination: Path, *, image_format: str = "png", archive_format: str = "zip", parent=None) -> None:
+        super().__init__(parent)
+        self.output_type = output_type
+        self.destination = destination
+        self.image_format = image_format
+        self.archive_format = archive_format
+
+    def run(self) -> None:
+        try:
+            def report_progress(current: int, total: int) -> None:
+                self.progress.emit(current, total)
+
+            if self.output_type == "folder":
+                res = WORKSPACE.export(
+                    self.destination,
+                    image_format=self.image_format,
+                    progress_callback=report_progress,
+                )
+            elif self.output_type == "pdf":
+                from hydra_manga_tl.project.export import export_pdf
+                res = export_pdf(
+                    WORKSPACE.current,
+                    self.destination,
+                    progress_callback=report_progress,
+                )
+                APP_STATE.set_export(str(res.resolve()), 1)
+                WORKSPACE.record_export(
+                    export_type="pdf",
+                    path=res,
+                    count=len(WORKSPACE.current.images) if WORKSPACE.current else 0,
+                    mode="translated",
+                    image_format="pdf",
+                )
+            else:
+                res = WORKSPACE.export_archive(
+                    self.destination,
+                    image_format=self.image_format,
+                    archive_format=self.archive_format,
+                    progress_callback=report_progress,
+                )
+            self.finished.emit(self.output_type, res)
+        except Exception as error:
+            self.failed.emit(export_error(error))
+
+
 class WorkspaceScreen(QWidget):
     close_requested = Signal()
+    _ART_APPEARANCE_TYPES = {"title", "sfx", "sign", "credit"}
+    _HEADER_COMPACT_ENTER_WIDTH = 1340
+    _HEADER_COMPACT_EXIT_WIDTH = 1440
 
     _PROGRESS_RANGES = {
         "preprocessing": (0.0, 5.0),
@@ -39,6 +98,103 @@ class WorkspaceScreen(QWidget):
         "reconstructing": (50.0, 98.0),
         "review": (90.0, 98.0),
     }
+
+    def _register_responsive_action(self, button: QWidget) -> None:
+        text = button.text() if hasattr(button, "text") else ""
+        if text:
+            button.setProperty("fullText", text)
+            auto_tooltip = not button.toolTip()
+            button.setProperty("responsiveAutoTooltip", auto_tooltip)
+            if auto_tooltip:
+                button.setToolTip(text)
+            if not button.accessibleName():
+                button.setAccessibleName(text)
+        if hasattr(button, "setIconSize"):
+            button.setIconSize(QSize(16, 16))
+        button.setMinimumWidth(0)
+        policy = button.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Policy.Preferred)
+        button.setSizePolicy(policy)
+        self._responsive_action_buttons.append(button)
+        if text:
+            self._set_responsive_button_text(button, text)
+
+    def _set_responsive_button_text(self, button: QWidget, text: str) -> None:
+        button.setProperty("fullText", text)
+        if text and button.property("responsiveAutoTooltip"):
+            button.setToolTip(text)
+        elif text and not button.toolTip():
+            button.setToolTip(text)
+        if text and not button.accessibleName():
+            button.setAccessibleName(text)
+        if isinstance(button, QToolButton):
+            button.setText(text)
+            button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonIconOnly
+                if self._header_compact
+                else Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+            )
+        elif isinstance(button, QPushButton):
+            button.setText("" if self._header_compact else text)
+
+    def _set_header_compact(self, compact: bool) -> None:
+        if compact == self._header_compact:
+            return
+        self._header_compact = compact
+        for label in self._responsive_field_labels:
+            label.setVisible(not compact)
+            policy = label.sizePolicy()
+            policy.setHorizontalPolicy(
+                QSizePolicy.Policy.Ignored if compact else QSizePolicy.Policy.Preferred
+            )
+            label.setSizePolicy(policy)
+        for button in self._responsive_action_buttons:
+            wide_width = int(button.property("responsiveWideWidth") or 156)
+            wide_min_width = int(button.property("responsiveMinWidth") or 36)
+            scope = str(button.property("responsiveScope") or "header")
+            if scope == "toolstrip":
+                compact_width = int(button.property("responsiveCompactWidth") or 38)
+                button.setMaximumWidth(compact_width if compact else wide_width)
+                button.setMinimumWidth(38 if compact else wide_min_width)
+            else:
+                button.setMaximumWidth(46 if compact else wide_width)
+                button.setMinimumWidth(36 if compact else wide_min_width)
+            policy = button.sizePolicy()
+            if scope == "toolstrip" and compact:
+                policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+            else:
+                policy.setHorizontalPolicy(
+                    QSizePolicy.Policy.Ignored if compact else QSizePolicy.Policy.Expanding
+                )
+            button.setSizePolicy(policy)
+            text = str(button.property("fullText") or "")
+            if text:
+                self._set_responsive_button_text(button, text)
+
+    def _update_header_responsive_mode(self) -> None:
+        width = self.width()
+        near_effective_minimum = width <= self.minimumSizeHint().width() + 24
+        if width >= self._HEADER_COMPACT_EXIT_WIDTH:
+            self._set_header_compact(False)
+        elif width < self._HEADER_COMPACT_ENTER_WIDTH or near_effective_minimum:
+            self._set_header_compact(True)
+
+    @staticmethod
+    def _compact_project_title(title: str, *, max_parts: int = 2, max_chars: int = 24) -> str:
+        cleaned = title.strip()
+        if not cleaned:
+            return "Project"
+        parts = [
+            part
+            for part in re.split(r"[\s_\-–—|:;,.()\[\]{}]+", cleaned)
+            if part
+        ]
+        if not parts:
+            return cleaned[:max_chars].rstrip()
+        compact = " ".join(parts[:max_parts])
+        if len(compact) > max_chars:
+            compact = compact[:max_chars].rstrip()
+        return compact or "Project"
 
     def __init__(self) -> None:
         super().__init__()
@@ -72,12 +228,20 @@ class WorkspaceScreen(QWidget):
         self._editor_shortcuts: list[tuple[QShortcut, bool]] = []
         self._layout_undo: list[dict] = []
         self._layout_redo: list[dict] = []
+        self._filmstrip_undo: list[dict] = []
+        self._filmstrip_redo: list[dict] = []
         self._pending_text_layouts: dict[tuple[int, str], dict] = {}
-        self._ignore_next_open_page_selection = False
+        self._pending_manual_history: dict[int, dict] = {}
+        self._ignore_next_open_page_selection: int = 0  # countdown: absorbs N selection_changed signals after project open
         self._recent_manual_requests: dict[str, object] = {}
+        self._responsive_action_buttons: list[QWidget] = []
+        self._responsive_field_labels: list[QLabel] = []
+        self._header_compact = False
         self.speech = SpeechService(self)
         self.speech.unavailable.connect(lambda message: QMessageBox.information(self, "Original text voice", message))
         self._build()
+        # Start with compact metrics so Qt can still reach the narrow workspace width.
+        self._set_header_compact(True)
         self._configure_manual_shortcut()
         self._progress_timer = QTimer(self); self._progress_timer.setInterval(100)
         self._progress_timer.timeout.connect(self._advance_progress_animation)
@@ -87,7 +251,7 @@ class WorkspaceScreen(QWidget):
         APP_STATE.selection_changed.connect(self._on_selection)
         APP_STATE.pipeline_changed.connect(self._on_pipeline)
         APP_STATE.busy_changed.connect(self._on_busy)
-        WORKSPACE.image_updated.connect(lambda _: self.refresh(APP_STATE.project))
+        WORKSPACE.image_updated.connect(self._on_workspace_image_updated)
         WORKSPACE.manual_region_finished.connect(self._on_manual_region_finished)
         WORKSPACE.manual_region_failed.connect(self._on_manual_region_failed)
         WORKSPACE.manual_region_busy_changed.connect(self._on_manual_region_busy)
@@ -98,7 +262,29 @@ class WorkspaceScreen(QWidget):
     def _build(self) -> None:
         root = QVBoxLayout(self); root.setContentsMargins(12, 10, 12, 8); root.setSpacing(8)
         header = QFrame(); header.setObjectName("Header")
-        row = QHBoxLayout(header)
+        row = QHBoxLayout(header); row.setContentsMargins(10, 8, 10, 8); row.setSpacing(8)
+        header_icon = lucide_icon("book-open")
+
+        def header_group(*widgets: QWidget) -> QFrame:
+            group = QFrame()
+            group.setObjectName("HeaderGroup")
+            layout = QHBoxLayout(group)
+            layout.setContentsMargins(7, 4, 7, 4)
+            layout.setSpacing(6)
+            for item in widgets:
+                layout.addWidget(item)
+            return group
+
+        def field_label(text: str) -> QLabel:
+            label = QLabel(text)
+            label.setObjectName("ToolbarLabel")
+            label.setMinimumWidth(0)
+            policy = label.sizePolicy()
+            policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+            label.setSizePolicy(policy)
+            self._responsive_field_labels.append(label)
+            return label
+
         self.project_title = QLabel("Project"); self.project_title.setObjectName("Heading")
         self.count_label = QLabel("0 images"); self.count_label.setObjectName("Muted")
         self.source_combo = QComboBox()
@@ -118,9 +304,42 @@ class WorkspaceScreen(QWidget):
         settings = QPushButton("Settings"); settings.clicked.connect(self._open_settings)
         ai_center = QPushButton("AI Center"); ai_center.clicked.connect(lambda: AiCenterDialog(self).exec())
         glossary = QPushButton("Glossary"); glossary.clicked.connect(lambda: GlossaryDialog(self).exec())
-        for widget in (self.project_title, self.count_label): row.addWidget(widget)
-        row.addStretch()
-        for widget in (self.source_combo, self.target_combo, self.quality_combo, self.style_combo, self.selected_button, self.start_button, self.cancel_button, glossary, ai_center, settings, save, export, self.close_button): row.addWidget(widget)
+        self.project_title.setPixmap(header_icon.pixmap(QSize(18, 18)))
+        self.project_title.setText("  Project")
+        self.selected_button.setIcon(lucide_icon("send"))
+        self.start_button.setIcon(lucide_icon("play"))
+        self.cancel_button.setIcon(lucide_icon("square-x"))
+        save.setIcon(lucide_icon("save"))
+        export.setIcon(lucide_icon("download"))
+        settings.setIcon(lucide_icon("settings"))
+        ai_center.setIcon(lucide_icon("message-circle-warning"))
+        glossary.setIcon(lucide_icon("book-open"))
+        self.close_button.setIcon(lucide_icon("x"))
+        for button in (
+            self.selected_button,
+            self.start_button,
+            self.cancel_button,
+            glossary,
+            ai_center,
+            settings,
+            save,
+            export,
+            self.close_button,
+        ):
+            self._register_responsive_action(button)
+        self.selected_button.setProperty("responsiveWideWidth", 215)
+        self.selected_button.setProperty("responsiveMinWidth", 170)
+        self.start_button.setProperty("responsiveWideWidth", 210)
+        self.start_button.setProperty("responsiveMinWidth", 180)
+        self.cancel_button.setProperty("responsiveWideWidth", 120)
+        self.cancel_button.setProperty("responsiveMinWidth", 92)
+        translate_group = header_group(self.selected_button, self.start_button, self.cancel_button)
+        translate_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        row.addWidget(header_group(self.project_title, self.count_label))
+        row.addWidget(header_group(field_label("Source"), self.source_combo, field_label("Target"), self.target_combo, field_label("Quality"), self.quality_combo, field_label("Style"), self.style_combo))
+        row.addWidget(translate_group, 1)
+        row.addWidget(header_group(glossary, ai_center, settings))
+        row.addWidget(header_group(save, export, self.close_button))
         root.addWidget(header)
 
         tools = QHBoxLayout()
@@ -128,11 +347,19 @@ class WorkspaceScreen(QWidget):
         next_button = QPushButton("›"); next_button.clicked.connect(lambda: self._move_image(1))
         fit = QPushButton("Fit"); fit.clicked.connect(self._fit_both)
         actual = QPushButton("100%"); actual.clicked.connect(self._actual_both)
-        self.next_ocr_issue = QPushButton("Next OCR Issue"); self.next_ocr_issue.clicked.connect(self._next_ocr_issue)
-        self.next_review_issue = QPushButton("Next Review Issue"); self.next_review_issue.clicked.connect(self._next_review_issue)
+        self.next_ocr_issue = QPushButton("Next OCR"); self.next_ocr_issue.clicked.connect(self._next_ocr_issue)
+        self.next_review_issue = QPushButton("Next Review"); self.next_review_issue.clicked.connect(self._next_review_issue)
+        self.next_ocr_issue.setToolTip("Next OCR Issue")
+        self.next_review_issue.setToolTip("Next Review Issue")
+        previous.setObjectName("ToolIconButton"); next_button.setObjectName("ToolIconButton")
+        fit.setIcon(lucide_icon("maximize"))
+        actual.setIcon(lucide_icon("scan-text"))
+        self.next_ocr_issue.setIcon(lucide_icon("scan-text"))
+        self.next_review_issue.setIcon(lucide_icon("message-circle-warning"))
         self.add_box = QToolButton()
         self.add_box.setObjectName("ToolbarButton")
         self.add_box.setText("Region Tool")
+        self.add_box.setIcon(lucide_icon("box"))
         self.add_box.setCheckable(True)
         self.add_box.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.add_box.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -147,7 +374,9 @@ class WorkspaceScreen(QWidget):
         self.add_box.clicked.connect(lambda: self._begin_manual_box(SETTINGS.manual_region_mode or "rectangle", kind="region"))
         self.title_reconstruction = QToolButton()
         self.title_reconstruction.setObjectName("ToolbarButton")
-        self.title_reconstruction.setText("Title Reconstruction")
+        self.title_reconstruction.setText("Title Recon")
+        self.title_reconstruction.setIcon(lucide_icon("type"))
+        self.title_reconstruction.setToolTip("Title Reconstruction")
         self.title_reconstruction.setCheckable(True)
         self.title_reconstruction.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.title_reconstruction.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -160,10 +389,97 @@ class WorkspaceScreen(QWidget):
         title_menu.addAction(self.polygon_title_action)
         self.title_reconstruction.setMenu(title_menu)
         self.title_reconstruction.clicked.connect(lambda: self._begin_manual_box(SETTINGS.manual_region_mode or "rectangle", kind="title"))
+        self.bubble_selector = QToolButton()
+        self.bubble_selector.setObjectName("ToolbarButton")
+        self.bubble_selector.setText("Bubble Selector")
+        self.bubble_selector.setIcon(lucide_icon("message-square"))
+        self.bubble_selector.setCheckable(True)
+        self.bubble_selector.setToolTip("Click or drag marquee box to select multiple text bubbles on original page")
+        self.bubble_selector.clicked.connect(self._toggle_bubble_selector)
         self.image_label = QLabel("No image")
         self.selection_label = QLabel("1 selected"); self.selection_label.setObjectName("Muted")
-        tools.addWidget(previous); tools.addWidget(next_button); tools.addWidget(self.image_label); tools.addWidget(self.selection_label); tools.addStretch(); tools.addWidget(self.next_ocr_issue); tools.addWidget(self.next_review_issue); tools.addWidget(self.add_box); tools.addWidget(self.title_reconstruction); tools.addWidget(fit); tools.addWidget(actual)
-        root.addLayout(tools)
+        self.select_pending_button = QPushButton("Select Pending")
+        self.select_pending_button.setObjectName("SecondaryButton")
+        self.select_pending_button.setIcon(lucide_icon("scan-text"))
+        self.select_pending_button.setToolTip("Select every page in the filmstrip that can be translated")
+        self.select_pending_button.clicked.connect(self._select_pending_images)
+        self.clear_selection_button = QPushButton("Clear")
+        self.clear_selection_button.setObjectName("SecondaryButton")
+        self.clear_selection_button.setIcon(lucide_icon("x"))
+        self.clear_selection_button.setToolTip("Clear filmstrip page selection batch and canvas text bubble selections")
+        self.clear_selection_button.clicked.connect(self._clear_all_selections)
+        for button in (
+            self.select_pending_button,
+            self.clear_selection_button,
+            self.next_ocr_issue,
+            self.next_review_issue,
+            self.bubble_selector,
+            self.add_box,
+            self.title_reconstruction,
+            fit,
+            actual,
+        ):
+            self._register_responsive_action(button)
+            button.setProperty("responsiveScope", "toolstrip")
+            button.setProperty("responsiveCompactWidth", 84)
+        self.select_pending_button.setProperty("responsiveWideWidth", 180)
+        self.select_pending_button.setProperty("responsiveMinWidth", 150)
+        self.clear_selection_button.setProperty("responsiveWideWidth", 125)
+        self.clear_selection_button.setProperty("responsiveMinWidth", 82)
+        self.next_ocr_issue.setProperty("responsiveWideWidth", 155)
+        self.next_ocr_issue.setProperty("responsiveMinWidth", 135)
+        self.next_review_issue.setProperty("responsiveWideWidth", 170)
+        self.next_review_issue.setProperty("responsiveMinWidth", 150)
+        self.bubble_selector.setProperty("responsiveWideWidth", 185)
+        self.bubble_selector.setProperty("responsiveMinWidth", 155)
+        self.add_box.setProperty("responsiveWideWidth", 160)
+        self.add_box.setProperty("responsiveMinWidth", 125)
+        self.title_reconstruction.setProperty("responsiveWideWidth", 185)
+        self.title_reconstruction.setProperty("responsiveMinWidth", 155)
+        fit.setProperty("responsiveWideWidth", 105)
+        fit.setProperty("responsiveMinWidth", 80)
+        actual.setProperty("responsiveWideWidth", 110)
+        actual.setProperty("responsiveMinWidth", 82)
+        tool_frame = QFrame(); tool_frame.setObjectName("ToolStrip")
+        tool_frame.setLayout(tools)
+        tool_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        tools.setContentsMargins(0, 0, 0, 0); tools.setSpacing(8)
+
+        nav_group = QFrame(); nav_group.setObjectName("ToolStripGroup")
+        nav_layout = QHBoxLayout(nav_group); nav_layout.setContentsMargins(8, 6, 8, 6); nav_layout.setSpacing(7)
+        nav_layout.addWidget(previous); nav_layout.addWidget(next_button)
+        nav_layout.addWidget(self.image_label); nav_layout.addWidget(self.selection_label)
+        nav_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+        action_group = QFrame(); action_group.setObjectName("ToolStripGroup")
+        action_layout = QHBoxLayout(action_group); action_layout.setContentsMargins(8, 6, 8, 6); action_layout.setSpacing(7)
+        action_layout.addWidget(self.select_pending_button, 1)
+        action_layout.addWidget(self.clear_selection_button, 1)
+        action_layout.addWidget(self.next_ocr_issue, 1)
+        action_layout.addWidget(self.next_review_issue, 1)
+        action_layout.addWidget(self.bubble_selector, 1)
+        action_layout.addWidget(self.add_box, 1)
+        action_layout.addWidget(self.title_reconstruction, 1)
+        action_layout.addWidget(fit, 1)
+        action_layout.addWidget(actual, 1)
+        action_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        tools.addWidget(nav_group)
+        tools.addWidget(action_group, 1)
+        tool_scroll = QScrollArea()
+        tool_scroll.setObjectName("ToolStripScroll")
+        tool_scroll.setWidget(tool_frame)
+        tool_scroll.setWidgetResizable(True)
+        tool_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        tool_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        tool_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tool_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        tool_scroll.setFixedHeight(
+            tool_frame.sizeHint().height()
+            + tool_scroll.horizontalScrollBar().sizeHint().height()
+            + 2
+        )
+        root.addWidget(tool_scroll)
 
         main = QSplitter(Qt.Orientation.Horizontal); self.main_splitter = main
         main.setChildrenCollapsible(False)
@@ -171,10 +487,15 @@ class WorkspaceScreen(QWidget):
         self.canvas_stack = QStackedWidget()
         canvases = QSplitter(Qt.Orientation.Horizontal)
         self.original = CanvasView("Original"); self.translated = CanvasView("Translated")
-        canvases.addWidget(self.original); canvases.addWidget(self.translated); canvases.setSizes([600, 600])
+        self.original_status = QLabel("Ready"); self.original_status.setObjectName("StatusPill")
+        self.translated_status = QLabel("Ready"); self.translated_status.setObjectName("StatusPill")
+        canvases.addWidget(self._canvas_panel("Original", self.original_status, self.original))
+        canvases.addWidget(self._canvas_panel("Translated", self.translated_status, self.translated))
+        canvases.setSizes([600, 600])
         self.page_canvases = canvases
         self.identity_preview = CanvasView("Hydra Identity")
         self.identity_preview.setObjectName("IdentityWorkspacePreview")
+        self.identity_status = QLabel("Preview"); self.identity_status.setObjectName("StatusPill")
         self.canvas_stack.addWidget(self.page_canvases)
         self.canvas_stack.addWidget(self.identity_preview)
         canvas_layout.addWidget(self.canvas_stack)
@@ -183,6 +504,40 @@ class WorkspaceScreen(QWidget):
         self.filmstrip_section.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.filmstrip_section.body.setMaximumHeight(132)
         self.filmstrip_section.expanded_changed.connect(self._filmstrip_expanded_changed)
+        jump_host = QWidget()
+        jump_layout = QHBoxLayout(jump_host)
+        jump_layout.setContentsMargins(0, 0, 0, 0)
+        jump_layout.setSpacing(5)
+        jump_label = QLabel("Jump")
+        jump_label.setObjectName("Muted")
+        self.filmstrip_jump = QLineEdit()
+        self.filmstrip_jump.setValidator(QIntValidator(1, 999999, self.filmstrip_jump))
+        self.filmstrip_jump.setPlaceholderText("Page")
+        self.filmstrip_jump.setToolTip("Jump to page number")
+        self.filmstrip_jump.setFixedWidth(54)
+        self.filmstrip_jump.setEnabled(False)
+        self.filmstrip_jump.returnPressed.connect(self._jump_to_filmstrip_page)
+        self.filmstrip_jump_button = QPushButton("Go")
+        self.filmstrip_jump_button.setFixedWidth(54)
+        self.filmstrip_jump_button.setToolTip("Jump to the entered page number")
+        self.filmstrip_jump_button.setEnabled(False)
+        self.filmstrip_jump_button.clicked.connect(self._jump_to_filmstrip_page)
+        jump_layout.addWidget(jump_label)
+        jump_layout.addWidget(self.filmstrip_jump)
+        jump_layout.addWidget(self.filmstrip_jump_button)
+        self.filmstrip_jump_host = jump_host
+        filmstrip_header = QWidget()
+        filmstrip_header_layout = QHBoxLayout(filmstrip_header)
+        filmstrip_header_layout.setContentsMargins(0, 0, 0, 0)
+        filmstrip_header_layout.setSpacing(6)
+        filmstrip_section_layout = self.filmstrip_section.layout()
+        filmstrip_section_layout.removeWidget(self.filmstrip_section.toggle)
+        self.filmstrip_section.toggle.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        filmstrip_header_layout.addWidget(self.filmstrip_section.toggle)
+        filmstrip_header_layout.addWidget(jump_host)
+        filmstrip_header_layout.addStretch(1)
+        self.filmstrip_header = filmstrip_header
+        filmstrip_section_layout.insertWidget(0, filmstrip_header)
         filmstrip_layout = QHBoxLayout(self.filmstrip_section.body)
         filmstrip_layout.setContentsMargins(5, 3, 5, 5)
         filmstrip_layout.setSpacing(6)
@@ -198,6 +553,8 @@ class WorkspaceScreen(QWidget):
         if self.identity_thumbnail_path is not None:
             self.identity_tile.setIcon(QIcon(str(self.identity_thumbnail_path)))
             self.identity_tile.clicked.connect(self._select_identity)
+            self.identity_tile.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.identity_tile.customContextMenuRequested.connect(self._identity_tile_menu)
         else:
             self.identity_tile.setEnabled(False)
             self.identity_tile.setToolTip("Hydra identity artwork is unavailable")
@@ -210,6 +567,7 @@ class WorkspaceScreen(QWidget):
         self.filmstrip.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.filmstrip.setIconSize(FILMSTRIP_PREVIEW_SIZE); self.filmstrip.setMaximumHeight(124); self.filmstrip.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.filmstrip.set_reorder_enabled(True); self.filmstrip.order_changed.connect(self._on_filmstrip_reordered)
+        self.filmstrip.add_pages_requested.connect(self._on_add_pages_clicked)
         self.filmstrip.reorder_hint.connect(lambda text: self.status.setText(text) if hasattr(self, "status") else None)
         self.filmstrip.currentRowChanged.connect(self._filmstrip_current_changed)
         self.filmstrip.itemSelectionChanged.connect(self._selection_changed)
@@ -220,7 +578,7 @@ class WorkspaceScreen(QWidget):
         main.addWidget(canvas_host)
         self.inspector = self._build_inspector(); main.addWidget(self.inspector)
         main.setStretchFactor(0, 1); main.setStretchFactor(1, 0)
-        self.inspector.setMinimumWidth(540); self.inspector.setMaximumWidth(760); main.setSizes([1200, 640])
+        self.inspector.setMinimumWidth(440); self.inspector.setMaximumWidth(760); main.setSizes([1200, 640])
         root.addWidget(main, 1)
         self.job_panel = QFrame(); self.job_panel.setObjectName("ProgressPanel")
         job_layout = QVBoxLayout(self.job_panel); job_layout.setContentsMargins(10, 5, 10, 5); job_layout.setSpacing(4)
@@ -243,6 +601,7 @@ class WorkspaceScreen(QWidget):
         root.addWidget(self.job_panel)
 
         self.original.region_selected.connect(self._select_block); self.translated.region_selected.connect(self._select_block)
+        self.original.batch_regions_selected.connect(self._batch_blocks_selected)
         self.translated.text_layout_changed.connect(self._text_layout_changed)
         self.original.manual_region_created.connect(self._manual_region_created)
         self.original.manual_region_message.connect(self.status.setText)
@@ -251,14 +610,55 @@ class WorkspaceScreen(QWidget):
         self._sync_scrollbars(self.original, self.translated); self._sync_scrollbars(self.translated, self.original)
         self._layout_undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
         self._layout_undo_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        self._layout_undo_shortcut.activated.connect(self._undo_text_layout)
+        self._layout_undo_shortcut.activated.connect(self._undo_workspace)
         self._layout_redo_shortcut = QShortcut(QKeySequence.StandardKey.Redo, self)
         self._layout_redo_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        self._layout_redo_shortcut.activated.connect(self._redo_text_layout)
+        self._layout_redo_shortcut.activated.connect(self._redo_workspace)
         self._configure_editor_shortcuts()
         app = QApplication.instance()
         if app is not None:
             app.focusChanged.connect(self._application_focus_changed)
+
+    def _canvas_panel(self, title: str, status_label: QLabel, canvas: CanvasView) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("CanvasPanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        header = QFrame()
+        header.setObjectName("CanvasPanelHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(10, 7, 10, 7)
+        header_layout.setSpacing(7)
+        title_label = QLabel(title)
+        title_label.setObjectName("CanvasPanelTitle")
+        header_layout.addWidget(title_label)
+        header_layout.addWidget(status_label)
+        header_layout.addStretch(1)
+        layout.addWidget(header)
+        layout.addWidget(canvas, 1)
+        return panel
+
+    @staticmethod
+    def _status_label_text(status: str) -> str:
+        value = (status or "ready").strip()
+        if not value:
+            return "Ready"
+        return value.replace("_", " ").title()
+
+    def _update_canvas_status(self, status: str) -> None:
+        text = self._status_label_text(status)
+        state = (status or "ready").strip().casefold() or "ready"
+        for label in (self.original_status, self.translated_status):
+            label.setText(text)
+            label.setProperty("statusState", state)
+            label.style().unpolish(label)
+            label.style().polish(label)
+        if hasattr(self, "identity_status"):
+            self.identity_status.setText(text)
+            self.identity_status.setProperty("statusState", state)
+            self.identity_status.style().unpolish(self.identity_status)
+            self.identity_status.style().polish(self.identity_status)
 
     def _application_focus_changed(self, _old, _new) -> None:
         self._update_editor_shortcuts()
@@ -302,6 +702,7 @@ class WorkspaceScreen(QWidget):
     def _configure_editor_shortcuts(self) -> None:
         self._register_editor_shortcut("R", lambda: self._begin_manual_box("rectangle"))
         self._register_editor_shortcut("P", lambda: self._begin_manual_box("polygon"))
+        self._register_editor_shortcut("Ctrl+B", self._toggle_bubble_selector_shortcut)
         self._register_editor_shortcut("Ctrl+Return", self._apply, allow_text_focus=True)
         self._register_editor_shortcut("Ctrl+Backspace", self._reset_edit)
         self._register_editor_shortcut("Alt+O", self._next_ocr_issue, allow_text_focus=True)
@@ -338,6 +739,10 @@ class WorkspaceScreen(QWidget):
         self._region_cycle_mode = self._next_region_mode(mode)
         self._begin_manual_box(mode, kind="title")
 
+    def _toggle_bubble_selector_shortcut(self) -> None:
+        self.bubble_selector.setChecked(not self.bubble_selector.isChecked())
+        self._toggle_bubble_selector()
+
     def _refresh_region_tool_style(self) -> None:
         for button in (self.add_box, getattr(self, "title_reconstruction", None)):
             if button is None:
@@ -348,41 +753,49 @@ class WorkspaceScreen(QWidget):
     def _set_region_tool_active(self, mode: str, kind: str = "region") -> None:
         label = "Polygon" if mode == "polygon" else "Rectangle"
         if kind == "title":
-            self.title_reconstruction.setText(f"Title {label}")
+            self._set_responsive_button_text(self.title_reconstruction, f"Title {label}")
             self.title_reconstruction.setChecked(True)
-            self.add_box.setText("Region Tool")
+            self._set_responsive_button_text(self.add_box, "Region Tool")
             self.add_box.setChecked(False)
         else:
-            self.add_box.setText(label)
+            self._set_responsive_button_text(self.add_box, label)
             self.add_box.setChecked(True)
-            self.title_reconstruction.setText("Title Reconstruction")
+            self._set_responsive_button_text(self.title_reconstruction, "Title Recon")
             self.title_reconstruction.setChecked(False)
         self._refresh_region_tool_style()
 
     def _reset_region_tool(self) -> None:
-        self.add_box.setText("Region Tool")
+        self._set_responsive_button_text(self.add_box, "Region Tool")
         self.add_box.setChecked(False)
-        self.title_reconstruction.setText("Title Reconstruction")
+        self._set_responsive_button_text(self.title_reconstruction, "Title Recon")
         self.title_reconstruction.setChecked(False)
+        if hasattr(self, "bubble_selector"):
+            self.bubble_selector.setChecked(False)
         self._refresh_region_tool_style()
 
     def _build_inspector(self) -> QFrame:
         frame = QFrame(); frame.setObjectName("Inspector"); layout = QVBoxLayout(frame)
+        frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.setContentsMargins(10, 8, 10, 8); layout.setSpacing(6)
         tabs = QTabWidget(); layout.addWidget(tabs)
         text_tab = QWidget(); text_layout = QVBoxLayout(text_tab)
         text_layout.setContentsMargins(8, 7, 8, 8); text_layout.setSpacing(7)
-        self.blocks = QListWidget(); self.blocks.setObjectName("TextBlocksList"); self.blocks.setWordWrap(True); self.blocks.setTextElideMode(Qt.TextElideMode.ElideRight); self.blocks.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.blocks.setMinimumHeight(140); self.blocks.setMaximumHeight(175); self.blocks.currentRowChanged.connect(self._select_block)
+        self.blocks = QListWidget(); self.blocks.setObjectName("TextBlocksList"); self.blocks.setWordWrap(True); self.blocks.setTextElideMode(Qt.TextElideMode.ElideRight); self.blocks.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.blocks.setMinimumHeight(140); self.blocks.setMaximumHeight(175); self.blocks.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection); self.blocks.currentRowChanged.connect(self._select_block); self.blocks.itemSelectionChanged.connect(self._text_blocks_selection_changed)
         text_layout.addWidget(self.blocks)
         editor_host = QWidget(); editor_layout = QVBoxLayout(editor_host)
+        editor_host.setMinimumWidth(0); editor_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         editor_layout.setContentsMargins(0, 0, 0, 0); editor_layout.setSpacing(7)
         form_host = QWidget(); form = QFormLayout(form_host); form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form_host.setMinimumWidth(0); form_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         form.setContentsMargins(0, 0, 0, 0); form.setHorizontalSpacing(8); form.setVerticalSpacing(7)
+        translation_field_min_width = 120
         self.original_text = QTextEdit(); self.original_text.setReadOnly(False); self.original_text.setFixedHeight(50)
         self.original_text.setToolTip("Correct OCR source text here; approval is separate from Apply & Rerender")
-        self.original_text.setMinimumWidth(0); self.original_text.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        original_host = QWidget(); original_host.setMinimumWidth(0); original_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.original_text.setMinimumWidth(translation_field_min_width)
+        self.original_text.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        original_host = QWidget(); original_host.setMinimumWidth(0)
+        original_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         original_row = QHBoxLayout(original_host); original_row.setContentsMargins(0, 0, 0, 0); original_row.setSpacing(6)
         self.speak_original = QToolButton(); self.speak_original.setObjectName("SpeechButton"); self.speak_original.setIcon(_speaker_icon())
         self.speak_original.setIconSize(QSize(18, 18))
@@ -391,11 +804,15 @@ class WorkspaceScreen(QWidget):
         self.speak_original.setEnabled(False); self.speak_original.clicked.connect(self._speak_original)
         original_row.addWidget(self.original_text, 1); original_row.addWidget(self.speak_original)
         self.translation = QTextEdit(); self.translation.setFixedHeight(50)
-        self.translation.setMinimumWidth(0); self.translation.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.translation.setMinimumWidth(translation_field_min_width)
+        self.translation.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.confidence = QLabel("—"); self.confidence.setObjectName("Muted")
+        self.confidence.setMinimumWidth(0)
+        self.confidence.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.confidence_bar = QProgressBar(); self.confidence_bar.setRange(0, 1000); self.confidence_bar.setTextVisible(False); self.confidence_bar.setFixedHeight(8)
         confidence_host = QWidget(); confidence_row = QHBoxLayout(confidence_host); confidence_row.setContentsMargins(0, 0, 0, 0); confidence_row.setSpacing(8)
-        confidence_row.addWidget(self.confidence, 0); confidence_row.addWidget(self.confidence_bar, 1)
+        confidence_host.setMinimumWidth(0); confidence_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        confidence_row.addWidget(self.confidence, 1); confidence_row.addWidget(self.confidence_bar, 1)
         self.replace = QCheckBox("Replace source text"); self.replace.setChecked(True)
         self.font = QComboBox()
         font_options = [
@@ -411,19 +828,44 @@ class WorkspaceScreen(QWidget):
         self.alignment.setCurrentIndex(self.alignment.findData("center"))
         self.bubble_type = QComboBox()
         self._sync_bubble_type_options("dialogue")
+        self.bubble_type.currentIndexChanged.connect(self._refresh_appearance_for_selected_type)
         self.color = QPushButton("#111111"); self.color.clicked.connect(self._choose_color)
+        self.gradient_enabled = QCheckBox("Use gradient fill"); self.gradient_enabled.toggled.connect(self._update_gradient_controls_enabled)
+        self.gradient_start = QPushButton("#111111"); self.gradient_start.clicked.connect(self._choose_gradient_start)
+        self.gradient_end = QPushButton("#ffffff"); self.gradient_end.clicked.connect(self._choose_gradient_end)
+        self.gradient_angle = QSpinBox(); self.gradient_angle.setRange(0, 180); self.gradient_angle.setSuffix(" deg"); self.gradient_angle.setSingleStep(15)
         self.offset_x = QSpinBox(); self.offset_x.setRange(-500, 500); self.offset_x.setSuffix(" px")
         self.offset_y = QSpinBox(); self.offset_y.setRange(-500, 500); self.offset_y.setSuffix(" px")
-        self.offset_x.setSingleStep(5); self.offset_y.setSingleStep(5)
+        self.offset_angle = QDoubleSpinBox(); self.offset_angle.setRange(-180.0, 180.0); self.offset_angle.setSuffix(" °"); self.offset_angle.setDecimals(1)
+        self.offset_x.setSingleStep(5); self.offset_y.setSingleStep(5); self.offset_angle.setSingleStep(1.0)
         self.offset_x.setButtonSymbols(QSpinBox.ButtonSymbols.UpDownArrows)
         self.offset_y.setButtonSymbols(QSpinBox.ButtonSymbols.UpDownArrows)
+        self.offset_angle.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.UpDownArrows)
+        for widget in (
+            original_host, confidence_host,
+            self.font, self.font_size, self.alignment, self.bubble_type,
+            self.color, self.gradient_enabled, self.gradient_start,
+            self.gradient_end, self.gradient_angle, self.offset_x, self.offset_y, self.offset_angle,
+        ):
+            self._make_inspector_field_responsive(widget)
+        self._make_inspector_field_responsive(self.translation, translation_field_min_width)
         for label, widget in (("Original", original_host), ("Translation", self.translation), ("Confidence", confidence_host)): form.addRow(label, widget)
         form.addRow(self.replace)
         editor_layout.addWidget(self._build_static_inspector_section("1. Translation", form_host))
         editor_layout.addWidget(self._build_inspector_section("2. Region", (("Region type", self.bubble_type), ("Alignment", self.alignment)), expanded=True))
         editor_layout.addWidget(self._build_inspector_section("3. Typography", (("Font", self.font), ("Size", self.font_size)), expanded=False))
-        editor_layout.addWidget(self._build_inspector_section("4. Transform", (("X", self.offset_x), ("Y", self.offset_y)), expanded=False))
-        editor_layout.addWidget(self._build_inspector_section("5. Appearance", (("Color", self.color),), expanded=False))
+        editor_layout.addWidget(self._build_inspector_section("4. Transform", (("X", self.offset_x), ("Y", self.offset_y), ("Rotation", self.offset_angle)), expanded=False))
+        editor_layout.addWidget(self._build_inspector_section(
+            "5. Appearance",
+            (
+                ("Color", self.color),
+                ("Gradient", self.gradient_enabled),
+                ("Start", self.gradient_start),
+                ("End", self.gradient_end),
+                ("Angle", self.gradient_angle),
+            ),
+            expanded=False,
+        ))
         editor_layout.addStretch()
         form_scroll = QScrollArea(); form_scroll.setWidgetResizable(True); form_scroll.setFrameShape(QFrame.Shape.NoFrame)
         form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); form_scroll.setWidget(editor_host)
@@ -451,6 +893,8 @@ class WorkspaceScreen(QWidget):
         text_layout.addWidget(footer)
         tabs.addTab(text_tab, "Text Blocks")
         self._update_font_preview(self.font.currentText()); self._update_color_swatch("#111111")
+        self._update_gradient_start_swatch("#111111"); self._update_gradient_end_swatch("#ffffff")
+        self._update_gradient_controls_enabled(False)
         info_tab = QWidget(); info_layout = QFormLayout(info_tab)
         self.info_path = QLabel("—"); self.info_path.setWordWrap(True); self.info_language = QLabel("—"); self.info_status = QLabel("—")
         info_layout.addRow("Source", self.info_path); info_layout.addRow("Language", self.info_language); info_layout.addRow("Status", self.info_status); tabs.addTab(info_tab, "Image Info")
@@ -459,6 +903,8 @@ class WorkspaceScreen(QWidget):
     def _build_static_inspector_section(self, title: str, content: QWidget) -> QFrame:
         section = QFrame(self)
         section.setObjectName("InspectorSection")
+        section.setMinimumWidth(0)
+        section.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(section)
         layout.setContentsMargins(10, 7, 10, 8)
         layout.setSpacing(6)
@@ -468,14 +914,26 @@ class WorkspaceScreen(QWidget):
         layout.addWidget(content)
         return section
 
+    @staticmethod
+    def _make_inspector_field_responsive(widget: QWidget, minimum_width: int = 0) -> None:
+        widget.setMinimumWidth(minimum_width)
+        policy = widget.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+        widget.setSizePolicy(policy)
+
     def _build_inspector_section(self, title: str, rows: tuple[tuple[str, QWidget], ...], *, expanded: bool = False) -> CollapsibleSection:
         section = CollapsibleSection(title, expanded, self)
+        section.setMinimumWidth(0)
+        section.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        section.body.setMinimumWidth(0)
+        section.body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         form = QFormLayout(section.body)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         form.setContentsMargins(10, 2, 10, 9)
         form.setHorizontalSpacing(8); form.setVerticalSpacing(7)
         for label, widget in rows:
+            self._make_inspector_field_responsive(widget)
             form.addRow(label, widget)
         return section
 
@@ -483,14 +941,138 @@ class WorkspaceScreen(QWidget):
         current_type = "title" if current_type == "title" else normalize_region_type(current_type or "dialogue")
         self.bubble_type.blockSignals(True)
         self.bubble_type.clear()
-        options = [("Dialogue", "dialogue"), ("SFX", "sfx"), ("Sign", "sign"), ("Credit", "credit")]
-        if current_type == "title":
-            options.insert(1, ("Title", "title"))
+        options = [
+            ("Dialogue", "dialogue"),
+            ("Title", "title"),
+            ("SFX", "sfx"),
+            ("Sign", "sign"),
+            ("Credit", "credit"),
+        ]
         for label, value in options:
             self.bubble_type.addItem(label, value)
         index = self.bubble_type.findData(current_type)
         self.bubble_type.setCurrentIndex(max(0, index))
         self.bubble_type.blockSignals(False)
+
+    def _current_region_type(self) -> str:
+        return normalize_region_type(self.bubble_type.currentData() or "dialogue")
+
+    def _current_region_uses_art_appearance(self) -> bool:
+        return self._current_region_type() in self._ART_APPEARANCE_TYPES
+
+    def _refresh_appearance_for_selected_type(self) -> None:
+        self._update_gradient_controls_enabled(self.gradient_enabled.isChecked())
+
+    @staticmethod
+    def _rgb_to_hex(value: object) -> str | None:
+        if isinstance(value, str):
+            color = QColor(value)
+            return color.name() if color.isValid() else None
+        if not isinstance(value, (list, tuple)) or len(value) < 3:
+            return None
+        try:
+            red, green, blue = (max(0, min(255, int(round(float(item))))) for item in value[:3])
+        except (TypeError, ValueError):
+            return None
+        return f"#{red:02x}{green:02x}{blue:02x}"
+
+    @staticmethod
+    def _hex_to_rgb(value: str) -> list[int]:
+        color = QColor(value)
+        if not color.isValid():
+            color = QColor("#111111")
+        return [color.red(), color.green(), color.blue()]
+
+    @classmethod
+    def _first_source_color(cls, group: dict) -> str | None:
+        colors = group.get("source_text_colors")
+        if not isinstance(colors, list):
+            return None
+        for color in colors:
+            hex_color = cls._rgb_to_hex(color)
+            if hex_color:
+                return hex_color
+        return None
+
+    @classmethod
+    def _profile_fill_color(cls, profile: dict | None) -> str | None:
+        if not isinstance(profile, dict):
+            return None
+        fill = profile.get("fill")
+        if not isinstance(fill, dict):
+            return None
+        return cls._rgb_to_hex(fill.get("dominant_color") or fill.get("average_color"))
+
+    @classmethod
+    def _profile_gradient_colors(cls, profile: dict | None) -> tuple[str, str, int] | None:
+        if not isinstance(profile, dict):
+            return None
+        gradient = profile.get("gradient")
+        if not isinstance(gradient, dict) or gradient.get("kind") != "linear":
+            return None
+        colors = gradient.get("colors")
+        if not isinstance(colors, list) or len(colors) < 2:
+            return None
+        start = cls._rgb_to_hex(colors[0])
+        end = cls._rgb_to_hex(colors[1])
+        if not start or not end:
+            return None
+        try:
+            angle = int(round(float(gradient.get("angle", 90))))
+        except (TypeError, ValueError):
+            angle = 90
+        return start, end, max(0, min(180, angle))
+
+    def _load_appearance_controls(self, group: dict, edit: RegionEdit) -> None:
+        profile = edit.style_profile if isinstance(edit.style_profile, dict) else group.get("style_profile")
+        color = (
+            self._profile_fill_color(profile)
+            or self._first_source_color(group)
+            or self._rgb_to_hex(edit.color)
+            or "#111111"
+        )
+        self._update_color_swatch(color)
+        gradient = self._profile_gradient_colors(profile)
+        if gradient is not None:
+            start, end, angle = gradient
+        else:
+            start, end, angle = color, "#ffffff", 90
+        self._update_gradient_start_swatch(start)
+        self._update_gradient_end_swatch(end)
+        self.gradient_angle.setValue(angle)
+        self.gradient_enabled.blockSignals(True)
+        self.gradient_enabled.setChecked(gradient is not None and self._current_region_uses_art_appearance())
+        self.gradient_enabled.blockSignals(False)
+        self._update_gradient_controls_enabled(self.gradient_enabled.isChecked())
+
+    def _style_profile_from_appearance(self, group: dict, existing: RegionEdit) -> dict | None:
+        if not self._current_region_uses_art_appearance():
+            return None
+        source = existing.style_profile if isinstance(existing.style_profile, dict) else group.get("style_profile")
+        profile = dict(source) if isinstance(source, dict) else {}
+        fill = dict(profile.get("fill")) if isinstance(profile.get("fill"), dict) else {}
+        fill_color = self._hex_to_rgb(self.color.text())
+        fill.update({
+            "dominant_color": fill_color,
+            "average_color": fill_color,
+            "colors": [fill_color],
+        })
+        try:
+            profile["version"] = max(2, int(profile.get("version", 2) or 2))
+        except (TypeError, ValueError):
+            profile["version"] = 2
+        profile["fill"] = fill
+        if self.gradient_enabled.isChecked():
+            start = self._hex_to_rgb(self.gradient_start.text())
+            end = self._hex_to_rgb(self.gradient_end.text())
+            profile["gradient"] = {
+                "kind": "linear",
+                "colors": [start, end],
+                "angle": float(self.gradient_angle.value()),
+            }
+        else:
+            profile["gradient"] = None
+        return profile
 
     def _build_offset_control(self, spinbox: QSpinBox, negative_label: str, positive_label: str) -> QWidget:
         host = QWidget()
@@ -503,6 +1085,8 @@ class WorkspaceScreen(QWidget):
         return host
 
     def _filmstrip_expanded_changed(self, expanded: bool) -> None:
+        if hasattr(self, "filmstrip_jump_host"):
+            self.filmstrip_jump_host.setVisible(expanded)
         project = WORKSPACE.current
         if self._filmstrip_collapse_mode() == "always_collapsed":
             return
@@ -514,7 +1098,9 @@ class WorkspaceScreen(QWidget):
     @staticmethod
     def _filmstrip_collapse_mode() -> str:
         mode = getattr(SETTINGS, "filmstrip_collapse_mode", "current") or "current"
-        return "always_collapsed" if mode == "always_collapsed" else "current"
+        if mode in {"always_collapsed", "always_expanded"}:
+            return mode
+        return "current"
 
     def _apply_filmstrip_collapse_preference(self, project, project_id: str) -> None:
         mode = self._filmstrip_collapse_mode()
@@ -523,8 +1109,16 @@ class WorkspaceScreen(QWidget):
         if mode == "always_collapsed":
             if project_changed or mode_changed:
                 self.filmstrip_section.set_expanded(False)
+                self.filmstrip_jump_host.setVisible(False)
+        elif mode == "always_expanded":
+            if project_changed or mode_changed:
+                self.filmstrip_section.set_expanded(True)
+                self.filmstrip_jump_host.setVisible(True)
         else:
-            self.filmstrip_section.set_expanded(bool(getattr(project, "filmstrip_visible", True)))
+            # "current" — respect the per-project filmstrip_visible flag
+            expanded = bool(getattr(project, "filmstrip_visible", True))
+            self.filmstrip_section.set_expanded(expanded)
+            self.filmstrip_jump_host.setVisible(expanded)
         self._filmstrip_policy_project_id = project_id
         self._filmstrip_policy_mode = mode
 
@@ -535,8 +1129,24 @@ class WorkspaceScreen(QWidget):
         if self.filmstrip.currentRow() >= 0:
             self.filmstrip.setFocus()
 
+    def _identity_tile_menu(self, position) -> None:
+        if self.identity_thumbnail_path is None:
+            return
+        menu = QMenu(self)
+        set_thumbnail = menu.addAction("Set as Recent Thumbnail")
+        set_thumbnail.setIcon(lucide_icon("image-plus"))
+        set_thumbnail.setEnabled(WORKSPACE.current is not None and not APP_STATE.busy)
+        set_thumbnail.triggered.connect(self._set_identity_recent_thumbnail)
+        menu.exec(self.identity_tile.mapToGlobal(position))
+
     def refresh(self, project, *, force_filmstrip_rebuild: bool = False) -> None:
         if project is None:
+            self._layout_undo.clear()
+            self._layout_redo.clear()
+            self._filmstrip_undo.clear()
+            self._filmstrip_redo.clear()
+            self._pending_text_layouts.clear()
+            self._pending_manual_history.clear()
             self._reset_project_view_state()
             return
         self._project_title_full = project.name; self.project_title.setToolTip(project.name); self._update_project_title()
@@ -545,7 +1155,9 @@ class WorkspaceScreen(QWidget):
         self.filmstrip_section.toggle.setText(
             f"Filmstrip • {page_count} page{'s' if page_count != 1 else ''}"
         )
-        self.start_button.setEnabled(not APP_STATE.busy and any(image.status in {"pending", "queued", "partial", "failed", "cancelled"} for image in project.images))
+        self.filmstrip_jump.setEnabled(page_count > 0)
+        self.filmstrip_jump_button.setEnabled(page_count > 0)
+        self.start_button.setEnabled(not APP_STATE.busy and any(image.status in TRANSLATE_ELIGIBLE_STATUSES for image in project.images))
         self.quality_combo.setCurrentText(project.quality)
         self.style_combo.setCurrentText(project.text_style)
         source_index = self.source_combo.findData(project.source_language); self.source_combo.setCurrentIndex(max(0, source_index))
@@ -553,17 +1165,30 @@ class WorkspaceScreen(QWidget):
             max(0, min(APP_STATE.selected_image, len(project.images) - 1))
             if project.images and APP_STATE.selected_image >= 0 else -1
         )
+        self._sync_filmstrip_jump(current, page_count)
         image_ids = [self._image_id(image) for image in project.images]
         project_id = str(getattr(project, "id", project.name))
         self._apply_filmstrip_collapse_preference(project, project_id)
         live_items = self._current_filmstrip_items()
         project_changed = project_id != self._filmstrip_project_id
+        if project_changed:
+            self._layout_undo.clear()
+            self._layout_redo.clear()
+            self._filmstrip_undo.clear()
+            self._filmstrip_redo.clear()
+            self._pending_text_layouts.clear()
+            self._pending_manual_history.clear()
         show_identity_on_open = project_changed and self.identity_thumbnail_path is not None
+        identity_active = self._identity_workspace_active()
+        if identity_active:
+            current = -1
         filmstrip_current = -1 if show_identity_on_open else current
         if force_filmstrip_rebuild or project_changed or image_ids != list(live_items):
             self._rebuild_filmstrip(project, project_id, image_ids, filmstrip_current)
             if show_identity_on_open:
                 self._select_identity()
+                # Identity view is now active; do NOT fall through to _load_image()
+                return
         else:
             self._filmstrip_items = live_items
             for image_index, image in enumerate(project.images):
@@ -572,6 +1197,15 @@ class WorkspaceScreen(QWidget):
                 self.filmstrip.setCurrentRow(current)
             elif current < 0:
                 self._clear_filmstrip_current()
+        if identity_active:
+            APP_STATE.selected_image = -1
+            APP_STATE.selected_block = -1
+            if getattr(project, "selected_image", -1) != -1:
+                project.selected_image = -1
+                WORKSPACE.save()
+            self._clear_filmstrip_current()
+            self._show_identity_workspace()
+            return
         selected_image = APP_STATE.selected_image
         if selected_image >= 0:
             selected_image = max(0, min(selected_image, len(project.images) - 1))
@@ -589,9 +1223,22 @@ class WorkspaceScreen(QWidget):
         self.filmstrip.clearSelection()
         self.filmstrip.clear()
         self.filmstrip.blockSignals(False)
+        self.filmstrip_jump.clear()
+        self.filmstrip_jump.setEnabled(False)
+        self.filmstrip_jump_button.setEnabled(False)
         self._groups = []
         if hasattr(self, "canvas_stack"):
             self.canvas_stack.setCurrentWidget(self.page_canvases)
+        if hasattr(self, "original_status"):
+            self._update_canvas_status("ready")
+
+    def _identity_workspace_active(self) -> bool:
+        return (
+            self.identity_thumbnail_path is not None
+            and self.identity_tile.isChecked()
+            and self.filmstrip.currentRow() < 0
+            and self.canvas_stack.currentWidget() is self.identity_preview
+        )
 
     def _show_identity_tile_in_filmstrip(self) -> None:
         self.filmstrip.horizontalScrollBar().setValue(0)
@@ -608,7 +1255,10 @@ class WorkspaceScreen(QWidget):
         self._selection_changed()
         if APP_STATE.selected_image != -1 or APP_STATE.selected_block != -1:
             APP_STATE.select(-1, -1)
-        self._ignore_next_open_page_selection = True
+        # Absorb 2 incoming selection_changed signals:
+        # 1) set_project's own selection_changed.emit at end of set_project()
+        # 2) _set_current's APP_STATE.select(last_page) call after set_project returns
+        self._ignore_next_open_page_selection = 2
         self._show_identity_workspace()
         self._show_identity_tile_in_filmstrip()
 
@@ -623,6 +1273,7 @@ class WorkspaceScreen(QWidget):
         self.original.set_badge("Hydra Identity")
         self.translated.set_badge("Hydra Identity")
         self.identity_preview.set_badge("Hydra Identity")
+        self._update_canvas_status("Preview")
         self.canvas_stack.setCurrentWidget(self.identity_preview)
         self._groups = []
         self.speech.stop()
@@ -641,6 +1292,8 @@ class WorkspaceScreen(QWidget):
         self.original.set_content(None, [], -1)
         self.translated.set_content(None, [], -1)
         self.identity_preview.set_content(self.identity_thumbnail_path, [], -1)
+        # Defer fit so Qt has finalized canvas_stack geometry after setCurrentWidget
+        QTimer.singleShot(0, self.identity_preview.fit_image)
 
     def _clear_filmstrip_current(self) -> None:
         self.filmstrip.clearSelection()
@@ -668,9 +1321,21 @@ class WorkspaceScreen(QWidget):
             self.filmstrip.addItem(item); self._filmstrip_items[image_id] = item
             if Path(image.source_path).is_file():
                 thumbnail_inputs.append((image_id, image.source_path))
+
+        add_item = QListWidgetItem()
+        add_item.setData(Qt.ItemDataRole.UserRole, "__add_pages__")
+        add_item.setSizeHint(FILMSTRIP_CARD_SIZE)
+        add_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        add_item.setIcon(self.filmstrip.create_add_pages_icon())
+        add_item.setText("Add Pages")
+        add_item.setToolTip("Click to import additional manga pages or folders into this project")
+        add_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        self.filmstrip.addItem(add_item)
+
         self._filmstrip_project_id = project_id
         if current >= 0:
             self.filmstrip.setCurrentRow(current)
+            self.filmstrip.clearSelection()
         for image_id in selected_ids:
             if image_id in self._filmstrip_items:
                 self._filmstrip_items[image_id].setSelected(True)
@@ -682,15 +1347,54 @@ class WorkspaceScreen(QWidget):
         return {
             str(self.filmstrip.item(row).data(Qt.ItemDataRole.UserRole)): self.filmstrip.item(row)
             for row in range(self.filmstrip.count())
-            if self.filmstrip.item(row) is not None
+            if self.filmstrip.item(row) is not None and str(self.filmstrip.item(row).data(Qt.ItemDataRole.UserRole) or "") != "__add_pages__"
         }
+
+    def _on_add_pages_clicked(self) -> None:
+        if APP_STATE.busy:
+            QMessageBox.information(
+                self,
+                "Translation Active",
+                "Please wait for active translation tasks to finish before adding new pages."
+            )
+            return
+        menu = QMenu(self)
+        action_images = menu.addAction("Add Image File(s)...")
+        action_folder = menu.addAction("Add Image Folder...")
+        chosen = menu.exec(QCursor.pos())
+        from hydra_manga_tl.ui.landing import configured_manga_import_root
+        if chosen == action_images:
+            files, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Add manga images",
+                "",
+                "Images (*.jpg *.jpeg *.png *.webp *.tif *.tiff *.bmp)"
+            )
+            if files:
+                self._append_input_paths([Path(p) for p in files])
+        elif chosen == action_folder:
+            folder = QFileDialog.getExistingDirectory(
+                self,
+                "Add manga folder",
+                str(configured_manga_import_root()),
+                QFileDialog.Option.ShowDirsOnly,
+            )
+            if folder:
+                self._append_input_paths([Path(folder)])
+
+    def _append_input_paths(self, paths: list[Path]) -> None:
+        if not paths or WORKSPACE.current is None:
+            return
+        added = WORKSPACE.add_inputs(paths)
+        if added > 0:
+            self.status.setText(f"Added {added} page{'s' if added != 1 else ''} to project.")
 
     @staticmethod
     def _update_filmstrip_item(item: QListWidgetItem, image, image_index: int) -> None:
         item.setText(_page_label(image.source_path, image_index))
         item.setForeground(QColor({"ready":"#66d69a", "review":"#ffcc66", "failed":"#ff6b73", "ocr":"#69a0ff", "translating":"#69a0ff", "reconstructing":"#69a0ff"}.get(image.status, "#d7deea")))
         details = f"{Path(image.source_path).name}\n{image.source_path}\nStatus: {image.status}"
-        if image.error: details += f"\n{image.error}"
+        if image.error: details += f"\n{pipeline_error(image.error)}"
         item.setToolTip(details)
 
     def _start_thumbnail_loading(self, project_id: str, images: list[tuple[str, str]]) -> None:
@@ -703,6 +1407,9 @@ class WorkspaceScreen(QWidget):
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda job=job: self._thumbnail_finished(job))
         thread.start()
+
+    def _queue_thumbnail_loading(self, project_id: str, images: list[tuple[str, str]]) -> None:
+        self._start_thumbnail_loading(project_id, images)
 
     def _apply_thumbnail(self, project_id: str, image_id: str, image) -> None:
         if project_id != self._filmstrip_project_id:
@@ -749,13 +1456,54 @@ class WorkspaceScreen(QWidget):
 
     def _filmstrip_current_changed(self, row: int) -> None:
         if row >= 0:
-            self._ignore_next_open_page_selection = False
+            item = self.filmstrip.item(row)
+            image_id = str(item.data(Qt.ItemDataRole.UserRole) or "") if item is not None else ""
+            if image_id == "__add_pages__":
+                return
+            self._ignore_next_open_page_selection = 0
             self.identity_tile.setChecked(False)
             APP_STATE.select(row)
+
+    def _sync_filmstrip_jump(self, index: int, total: int | None = None) -> None:
+        if not hasattr(self, "filmstrip_jump"):
+            return
+        page_count = total
+        if page_count is None:
+            page_count = len(WORKSPACE.current.images) if WORKSPACE.current is not None else 0
+        enabled = page_count > 0
+        self.filmstrip_jump.setEnabled(enabled)
+        self.filmstrip_jump_button.setEnabled(enabled)
+        self.filmstrip_jump.setText(str(index + 1) if enabled and 0 <= index < page_count else "")
+
+    def _jump_to_filmstrip_page(self) -> None:
+        project = WORKSPACE.current
+        text = self.filmstrip_jump.text().strip()
+        if project is None or not project.images:
+            self.status.setText("No pages are available.")
+            return
+        if not text:
+            self.status.setText("Enter a page number to jump.")
+            return
+        try:
+            page_number = int(text)
+        except ValueError:
+            self.status.setText("Enter a valid page number.")
+            return
+        if not (1 <= page_number <= len(project.images)):
+            self.status.setText(f"Page {page_number} is not available.")
+            return
+        index = page_number - 1
+        self.identity_tile.setChecked(False)
+        APP_STATE.select(index, -1)
+        item = self.filmstrip.item(index)
+        if item is not None:
+            self.filmstrip.scrollToItem(item, QAbstractItemView.ScrollHint.EnsureVisible)
+        self.status.setText(f"Jumped to page {page_number}.")
 
     def _on_filmstrip_reordered(self, ordered_ids: list[str]) -> None:
         selected_ids = {
             str(item.data(Qt.ItemDataRole.UserRole)) for item in self.filmstrip.selectedItems()
+            if str(item.data(Qt.ItemDataRole.UserRole) or "") != "__add_pages__"
         } | set(getattr(self.filmstrip, "_last_moved_ids", set()))
         before_ids = [image.id for image in WORKSPACE.current.images] if WORKSPACE.current is not None else []
         moved_count = len(selected_ids) or 1
@@ -766,15 +1514,22 @@ class WorkspaceScreen(QWidget):
             image_id for index, image_id in enumerate(ordered_ids)
             if index >= len(before_ids) or before_ids[index] != image_id
         }
-        self._filmstrip_items = {
-            str(self.filmstrip.item(row).data(Qt.ItemDataRole.UserRole)): self.filmstrip.item(row)
-            for row in range(self.filmstrip.count())
-        }
+        self._filmstrip_items = self._current_filmstrip_items()
         if not WORKSPACE.reorder_images(ordered_ids):
             self._filmstrip_project_id = ""
             if WORKSPACE.current is not None:
                 self.refresh(WORKSPACE.current)
             return
+        if before_ids != ordered_ids:
+            self._filmstrip_undo.append({
+                "kind": "filmstrip_reorder",
+                "before": list(before_ids),
+                "after": list(ordered_ids),
+                "selected_ids": sorted(selected_ids),
+                "moved_count": moved_count,
+            })
+            del self._filmstrip_undo[:-200]
+            self._filmstrip_redo.clear()
         if WORKSPACE.current is not None:
             self.refresh(WORKSPACE.current, force_filmstrip_rebuild=True)
         self.filmstrip.blockSignals(True); self.filmstrip.clearSelection()
@@ -794,6 +1549,72 @@ class WorkspaceScreen(QWidget):
             )
             self.status.setText(message)
             QTimer.singleShot(2500, lambda text=message: self.status.setText("Ready") if self.status.text() == text else None)
+
+    def _focus_in_filmstrip(self) -> bool:
+        focus = QApplication.focusWidget()
+        return focus is self.filmstrip or (
+            focus is not None and self.filmstrip.isAncestorOf(focus)
+        )
+
+    def _apply_filmstrip_history_command(self, command: dict, state_key: str) -> bool:
+        if command.get("kind") != "filmstrip_reorder" or WORKSPACE.current is None:
+            return False
+        ordered_ids = [str(image_id) for image_id in command.get(state_key, [])]
+        current_ids = [image.id for image in WORKSPACE.current.images]
+        if set(ordered_ids) != set(current_ids) or len(ordered_ids) != len(current_ids):
+            self.status.setText("Filmstrip history no longer matches this project")
+            return False
+        if ordered_ids == current_ids:
+            return True
+        if not WORKSPACE.reorder_images(ordered_ids):
+            self.status.setText("Could not restore filmstrip order")
+            return False
+        self.refresh(WORKSPACE.current, force_filmstrip_rebuild=True)
+        selected_ids = {
+            str(image_id)
+            for image_id in command.get("selected_ids", [])
+            if str(image_id) in self._filmstrip_items
+        }
+        self.filmstrip.blockSignals(True)
+        self.filmstrip.clearSelection()
+        first_selected = None
+        for image_id in ordered_ids:
+            item = self._filmstrip_items.get(image_id)
+            if item is None:
+                continue
+            if image_id in selected_ids:
+                item.setSelected(True)
+                first_selected = first_selected or item
+        if first_selected is not None:
+            self.filmstrip.setCurrentItem(first_selected)
+            self.filmstrip.scrollToItem(first_selected, QAbstractItemView.ScrollHint.PositionAtCenter)
+        self.filmstrip.blockSignals(False)
+        self._selection_changed()
+        self._flash_filmstrip_items(selected_ids)
+        action = "Undid" if state_key == "before" else "Redid"
+        count = int(command.get("moved_count", len(selected_ids) or 1) or 1)
+        self.status.setText(f"{action} filmstrip reorder ({count} page{'s' if count != 1 else ''})")
+        return True
+
+    def _undo_workspace(self) -> None:
+        if self._focus_in_filmstrip():
+            if not self._filmstrip_undo:
+                return
+            command = self._filmstrip_undo.pop()
+            if self._apply_filmstrip_history_command(command, "before"):
+                self._filmstrip_redo.append(command)
+            return
+        self._undo_text_layout()
+
+    def _redo_workspace(self) -> None:
+        if self._focus_in_filmstrip():
+            if not self._filmstrip_redo:
+                return
+            command = self._filmstrip_redo.pop()
+            if self._apply_filmstrip_history_command(command, "after"):
+                self._filmstrip_undo.append(command)
+            return
+        self._redo_text_layout()
 
     def _flash_filmstrip_items(self, image_ids: set[str]) -> None:
         if not image_ids:
@@ -817,7 +1638,10 @@ class WorkspaceScreen(QWidget):
         count = len(self.filmstrip.selectedItems())
         self.selection_label.setText(f"{count} selected")
         eligible = self._selected_image_ids(eligible_only=True)
-        self.selected_button.setText(f"Translate Selected ({len(eligible)})" if eligible else "Translate Selected")
+        self._set_responsive_button_text(
+            self.selected_button,
+            f"Translate Selected ({len(eligible)})" if eligible else "Translate Selected",
+        )
         self.selected_button.setEnabled(bool(eligible) and not APP_STATE.busy)
         if hasattr(self, "add_box"):
             self.add_box.setEnabled(not self._manual_busy)
@@ -836,13 +1660,15 @@ class WorkspaceScreen(QWidget):
         translate.setEnabled(bool(selected_ids) and not APP_STATE.busy)
         translate.triggered.connect(lambda: self._translate_selected(selected_ids))
         all_selected = self._selected_image_ids(eligible_only=False)
-        completed = {
-            image.id for image in WORKSPACE.current.images
-            if image.id in all_selected and image.status in {"ready", "review"}
-        } if WORKSPACE.current else set()
-        retranslate = menu.addAction(f"Retranslate Completed ({len(completed)})")
-        retranslate.setEnabled(bool(completed) and not APP_STATE.busy)
-        retranslate.triggered.connect(lambda: self._retranslate_selected(completed))
+        retranslate = menu.addAction(f"Retranslate Selected ({len(all_selected)})")
+        retranslate.setEnabled(bool(all_selected) and not APP_STATE.busy)
+        retranslate.triggered.connect(lambda: self._retranslate_selected(all_selected))
+        menu.addSeparator()
+        thumbnail_image_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        set_thumbnail = menu.addAction("Set as Recent Thumbnail")
+        set_thumbnail.setIcon(lucide_icon("image-plus"))
+        set_thumbnail.setEnabled(bool(thumbnail_image_id) and WORKSPACE.current is not None and not APP_STATE.busy)
+        set_thumbnail.triggered.connect(lambda: self._set_recent_thumbnail(thumbnail_image_id))
         menu.addSeparator()
         delete_label = "Delete Image" if len(all_selected) == 1 else f"Delete Images ({len(all_selected)})"
         delete_pages = menu.addAction(delete_label)
@@ -856,7 +1682,7 @@ class WorkspaceScreen(QWidget):
             return selected
         return {
             image.id for image in WORKSPACE.current.images
-            if image.id in selected and image.status in {"pending", "queued", "partial", "failed", "cancelled"}
+            if image.id in selected and image.status in TRANSLATE_ELIGIBLE_STATUSES
         }
 
     @staticmethod
@@ -870,12 +1696,37 @@ class WorkspaceScreen(QWidget):
     def _retranslate_selected(self, image_ids: set[str]) -> None:
         if not image_ids:
             return
-        answer = QMessageBox.question(
-            self, "Retranslate completed pages",
-            "Refresh automatic OCR and translations for the selected completed pages? Manual boxes and edits will be kept.",
-        )
-        if answer == QMessageBox.StandardButton.Yes:
+        if confirm(
+            self, "Retranslate selected pages",
+            "Remove existing OCR, automatic translation, and rendered output for the selected pages, then run OCR, translation, and rendering again? Manual boxes and edits will be kept.",
+        ):
             WORKSPACE.start_pipeline(image_ids, retranslate=True)
+
+    def _set_recent_thumbnail(self, image_id: str) -> None:
+        try:
+            thumbnail = WORKSPACE.set_recent_thumbnail(image_id)
+        except ValueError as error:
+            QMessageBox.warning(
+                self,
+                "Could not set thumbnail",
+                workspace_action_error(error, action="set recent project thumbnail"),
+            )
+            return
+        self.status.setText(f"Recent project thumbnail set to {thumbnail.name}")
+
+    def _set_identity_recent_thumbnail(self) -> None:
+        if self.identity_thumbnail_path is None:
+            return
+        try:
+            thumbnail = WORKSPACE.set_recent_thumbnail_path(self.identity_thumbnail_path)
+        except ValueError as error:
+            QMessageBox.warning(
+                self,
+                "Could not set thumbnail",
+                workspace_action_error(error, action="set Hydra identity as recent project thumbnail"),
+            )
+            return
+        self.status.setText(f"Recent project thumbnail set to Hydra identity ({thumbnail.name})")
 
     def _delete_selected_images(self, image_ids: set[str] | None = None) -> None:
         selected_ids = set(image_ids or self._selected_image_ids(eligible_only=False))
@@ -896,7 +1747,11 @@ class WorkspaceScreen(QWidget):
         try:
             removed = WORKSPACE.remove_images(selected_ids)
         except ValueError as error:
-            QMessageBox.warning(self, f"Could not delete {noun}", str(error))
+            QMessageBox.warning(
+                self,
+                f"Could not delete {noun}",
+                workspace_action_error(error, action=f"delete selected {noun}"),
+            )
             return
         if not removed:
             QMessageBox.warning(
@@ -922,8 +1777,10 @@ class WorkspaceScreen(QWidget):
         if project is None or not (0 <= index < len(project.images)): return
         self.identity_tile.setChecked(False)
         self.canvas_stack.setCurrentWidget(self.page_canvases)
+        self._sync_filmstrip_jump(index, len(project.images))
         image = project.images[index]; self.image_label.setText(f"Page {index + 1} of {len(project.images)}")
         self.info_path.setText(image.source_path); self.info_language.setText(image.source_language or "Not analyzed"); self.info_status.setText(image.status)
+        self._update_canvas_status(image.status)
         self.original.set_badge(_language_badge("Original", image.source_language))
         target_name = TARGET_LANGUAGE_NAMES.get(project.target_language, project.target_language.upper())
         self.translated.set_badge(_language_badge("Translated", target_name))
@@ -964,12 +1821,13 @@ class WorkspaceScreen(QWidget):
         self.remove_block.setEnabled(True)
         self.remove_block.setText("Delete Manual" if group.get("manual") else "Remove Auto")
         self.replace.setChecked(edit.replace); self.font.setCurrentText(edit.font_family); self.font_size.setValue(edit.font_size)
-        self._update_color_swatch(edit.color)
         alignment_index = self.alignment.findData(edit.alignment); self.alignment.setCurrentIndex(max(0, alignment_index))
         selected_type = edit.bubble_type or group.get("bubble_type", "dialogue")
         self._sync_bubble_type_options(str(selected_type))
         bubble_index = self.bubble_type.findData(selected_type); self.bubble_type.setCurrentIndex(max(0, bubble_index))
+        self._load_appearance_controls(group, edit)
         self.offset_x.setValue(edit.offset_x); self.offset_y.setValue(edit.offset_y)
+        self.offset_angle.setValue(edit.layout_angle or 0.0)
         self._update_ocr_queue_status()
 
     @staticmethod
@@ -977,12 +1835,18 @@ class WorkspaceScreen(QWidget):
         layout = group.get("text_layout")
         if isinstance(layout, dict):
             try:
-                return {
+                result = {
                     "x": int(layout["x"]),
                     "y": int(layout["y"]),
                     "width": int(layout["width"]),
                     "height": int(layout["height"]),
                 }
+                if layout.get("angle") is not None:
+                    try:
+                        result["angle"] = float(layout["angle"])
+                    except (TypeError, ValueError):
+                        pass
+                return result
             except (KeyError, TypeError, ValueError):
                 pass
         rect = group.get("manual_rect")
@@ -1007,16 +1871,107 @@ class WorkspaceScreen(QWidget):
     def _layout_key(image_index: int, group_index) -> tuple[int, str]:
         return (int(image_index), str(group_index))
 
+    def _capture_editor_history_state(self, image_index: int) -> dict | None:
+        if WORKSPACE.current is None or not (0 <= image_index < len(WORKSPACE.current.images)):
+            return None
+        try:
+            return WORKSPACE.capture_editor_state(image_index)
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _push_editor_history(
+        self,
+        label: str,
+        image_index: int,
+        before: dict | None,
+        after: dict | None = None,
+    ) -> None:
+        if before is None:
+            return
+        after = after if after is not None else self._capture_editor_history_state(image_index)
+        if after is None or before == after:
+            return
+        self._layout_undo.append({
+            "kind": "editor_state",
+            "label": label,
+            "image_index": image_index,
+            "before": before,
+            "after": after,
+        })
+        del self._layout_undo[:-200]
+        self._layout_redo.clear()
+
+    def _clear_pending_layouts_for_image(self, image_index: int) -> None:
+        for key in [
+            key for key in self._pending_text_layouts
+            if key[0] == int(image_index)
+        ]:
+            self._pending_text_layouts.pop(key, None)
+
+    def _discard_text_layout_history(self, image_index: int, group_indices: set[str]) -> None:
+        def keep(command: dict) -> bool:
+            return not (
+                command.get("kind") == "text_layout"
+                and int(command.get("image_index", -1)) == int(image_index)
+                and str(command.get("group_index")) in group_indices
+            )
+
+        self._layout_undo = [command for command in self._layout_undo if keep(command)]
+        self._layout_redo = [command for command in self._layout_redo if keep(command)]
+
+    def _restore_editor_history_command(self, command: dict, state_key: str) -> bool:
+        state = command.get(state_key)
+        if not isinstance(state, dict):
+            return False
+        image_index = int(command.get("image_index", APP_STATE.selected_image))
+        working = self._show_working(
+            "Undo" if state_key == "before" else "Redo",
+            "Restoring editor state...",
+        )
+        try:
+            WORKSPACE.restore_editor_state(
+                image_index,
+                state,
+                log_callback=working.append_log,
+            )
+            self._clear_pending_layouts_for_image(image_index)
+            row = APP_STATE.selected_block if image_index == APP_STATE.selected_image else -1
+            self._load_image(image_index, row)
+            self.status.setText(
+                f"{'Undid' if state_key == 'before' else 'Redid'} {command.get('label', 'editor change')}"
+            )
+            return True
+        except (MemoryError, OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
+            QMessageBox.warning(
+                self,
+                "Could not restore editor state",
+                workspace_action_error(error, action="restore the editor state"),
+            )
+            return False
+        finally:
+            self._close_working(working)
+
     def _text_layout_changed(self, row: int, layout: dict) -> None:
         if not (0 <= row < len(self._groups)):
             return
         group = self._groups[row]
         key = self._layout_key(APP_STATE.selected_image, group["index"])
         before = self._pending_text_layouts.get(key) or self._layout_from_group(group)
-        after = {key: int(layout[key]) for key in ("x", "y", "width", "height")}
+        after = {
+            "x": int(layout["x"]),
+            "y": int(layout["y"]),
+            "width": int(layout["width"]),
+            "height": int(layout["height"]),
+        }
+        if layout.get("angle") is not None:
+            try:
+                after["angle"] = float(layout["angle"])
+            except (TypeError, ValueError):
+                pass
         if before == after:
             return
         command = {
+            "kind": "text_layout",
             "image_index": APP_STATE.selected_image,
             "group_index": group["index"],
             "row": row,
@@ -1025,6 +1980,7 @@ class WorkspaceScreen(QWidget):
         }
         if self._apply_text_layout_command(command, after):
             self._layout_undo.append(command)
+            del self._layout_undo[:-200]
             self._layout_redo.clear()
 
     def _apply_text_layout_command(self, command: dict, layout: dict | None) -> bool:
@@ -1033,7 +1989,17 @@ class WorkspaceScreen(QWidget):
         image_index = int(command["image_index"])
         group_index = command["group_index"]
         row = int(command.get("row", APP_STATE.selected_block))
-        staged = {key: int(layout[key]) for key in ("x", "y", "width", "height")}
+        staged = {
+            "x": int(layout["x"]),
+            "y": int(layout["y"]),
+            "width": int(layout["width"]),
+            "height": int(layout["height"]),
+        }
+        if layout.get("angle") is not None:
+            try:
+                staged["angle"] = float(layout["angle"])
+            except (TypeError, ValueError):
+                pass
         self._pending_text_layouts[self._layout_key(image_index, group_index)] = staged
         if image_index == APP_STATE.selected_image and 0 <= row < len(self._groups):
             self._groups[row]["text_layout"] = dict(staged)
@@ -1055,6 +2021,10 @@ class WorkspaceScreen(QWidget):
         if not self._layout_undo:
             return
         command = self._layout_undo.pop()
+        if command.get("kind") == "editor_state":
+            if self._restore_editor_history_command(command, "before"):
+                self._layout_redo.append(command)
+            return
         if self._apply_text_layout_command(command, command.get("before")):
             self._layout_redo.append(command)
 
@@ -1066,6 +2036,10 @@ class WorkspaceScreen(QWidget):
         if not self._layout_redo:
             return
         command = self._layout_redo.pop()
+        if command.get("kind") == "editor_state":
+            if self._restore_editor_history_command(command, "after"):
+                self._layout_undo.append(command)
+            return
         if self._apply_text_layout_command(command, command.get("after")):
             self._layout_undo.append(command)
 
@@ -1086,13 +2060,18 @@ class WorkspaceScreen(QWidget):
         quality = str(group.get("translation_quality", "review" if group.get("review_reasons") else "good"))
         reasons = ", ".join(str(reason) for reason in group.get("review_reasons", [])[:2])
         label = f"OCR {ocr:.0%} • Translation {quality}"
+        tooltip = label
         if reasons:
-            label += f" • {reasons}"
+            tooltip += f" • {reasons}"
         self.confidence.setText(label)
+        self.confidence.setToolTip(tooltip)
         self.confidence_bar.setValue(round(ocr * 1000))
 
     def _select_block(self, row: int) -> None:
         if row < 0: return
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            return
         APP_STATE.select(APP_STATE.selected_image, row); self.blocks.blockSignals(True); self.blocks.setCurrentRow(row); self.blocks.blockSignals(False)
 
     def _select_relative_block(self, delta: int) -> None:
@@ -1106,10 +2085,16 @@ class WorkspaceScreen(QWidget):
 
     def _update_ocr_queue_status(self) -> None:
         count = len(WORKSPACE.ocr_review_queue())
-        self.next_ocr_issue.setText(f"Next OCR Issue ({count})" if count else "Next OCR Issue")
+        self._set_responsive_button_text(
+            self.next_ocr_issue,
+            f"Next OCR ({count})" if count else "Next OCR",
+        )
         self.next_ocr_issue.setEnabled(count > 0 and not APP_STATE.busy)
         review_count = len(WORKSPACE.review_issue_queue())
-        self.next_review_issue.setText(f"Next Review Issue ({review_count})" if review_count else "Next Review Issue")
+        self._set_responsive_button_text(
+            self.next_review_issue,
+            f"Next Review ({review_count})" if review_count else "Next Review",
+        )
         self.next_review_issue.setEnabled(review_count > 0 and not APP_STATE.busy)
 
     def _next_ocr_issue(self) -> None:
@@ -1152,21 +2137,31 @@ class WorkspaceScreen(QWidget):
             + ", ".join(selected["reasons"][:3])
         )
 
+    def _on_workspace_image_updated(self, index: int) -> None:
+        if not WORKSPACE.current or not (0 <= index < len(WORKSPACE.current.images)):
+            return
+        image = WORKSPACE.current.images[index]
+        item = self._filmstrip_items.get(image.id)
+        if item is not None:
+            self._update_filmstrip_item(item, image, index)
+        if index == APP_STATE.selected_image:
+            self._load_image(index)
+
     def _on_selection(self, image: int, block: int) -> None:
         if (
             image >= 0
-            and self._ignore_next_open_page_selection
+            and self._ignore_next_open_page_selection > 0
             and self.identity_tile.isChecked()
             and self.canvas_stack.currentWidget() is self.identity_preview
         ):
-            self._ignore_next_open_page_selection = False
+            self._ignore_next_open_page_selection -= 1
             APP_STATE.selected_image = -1
             APP_STATE.selected_block = -1
             self._clear_filmstrip_current()
             self._show_identity_workspace()
             return
         if image >= 0:
-            self._ignore_next_open_page_selection = False
+            self._ignore_next_open_page_selection = 0
             if WORKSPACE.current is not None and WORKSPACE.current.selected_image != image:
                 WORKSPACE.current.selected_image = image; WORKSPACE.save()
             self.filmstrip.blockSignals(True); self.filmstrip.setCurrentRow(image); self.filmstrip.blockSignals(False); self._load_image(image, block)
@@ -1200,42 +2195,68 @@ class WorkspaceScreen(QWidget):
         QApplication.processEvents()
 
     def _apply(self) -> None:
-        row = APP_STATE.selected_block
-        if row < 0 or row >= len(self._groups): return
-        group = self._groups[row]
-        existing = WORKSPACE.current.images[APP_STATE.selected_image].edits.get(str(group["index"]), RegionEdit()) if WORKSPACE.current else RegionEdit()
-        pending_layout = self._pending_text_layouts.get(self._layout_key(APP_STATE.selected_image, group["index"]))
-        edit = RegionEdit(
-            translated_text=self.translation.toPlainText(),
-            replace=self.replace.isChecked(),
-            font_size=0 if pending_layout else self.font_size.value(),
-            offset_x=self.offset_x.value(),
-            offset_y=self.offset_y.value(),
-            font_family=self.font.currentText(),
-            color=self.color.text(),
-            alignment=self.alignment.currentData(),
-            original_text=self.original_text.toPlainText(),
-            bubble_type=self.bubble_type.currentData(),
-            layout_x=pending_layout["x"] if pending_layout else existing.layout_x,
-            layout_y=pending_layout["y"] if pending_layout else existing.layout_y,
-            layout_width=pending_layout["width"] if pending_layout else existing.layout_width,
-            layout_height=pending_layout["height"] if pending_layout else existing.layout_height,
-        )
-        working = self._show_working("Apply & Rerender", "Preparing selected bubble...")
+        selected_rows = set(APP_STATE.selected_blocks)
+        if not selected_rows and (0 <= APP_STATE.selected_block < len(self._groups)):
+            selected_rows = {APP_STATE.selected_block}
+        valid_rows = [r for r in selected_rows if 0 <= r < len(self._groups)]
+        if not valid_rows:
+            return
+
+        image_index = APP_STATE.selected_image
+        before_state = self._capture_editor_history_state(image_index)
+        working = self._show_working("Apply & Rerender", f"Preparing {len(valid_rows)} selected bubble(s)...")
         try:
-            working.set_message("Validating text fit and render settings...")
-            WORKSPACE.validate_edit(APP_STATE.selected_image, group["index"], edit)
-            working.set_message("Saving edits and learning drafts...")
-            WORKSPACE.update_edit(APP_STATE.selected_image, group["index"], edit)
+            working.set_message(f"Saving edits for {len(valid_rows)} bubble(s)...")
+            is_single = (len(valid_rows) == 1)
+            edits_map: dict[int | str, RegionEdit] = {}
+            for row in valid_rows:
+                group = self._groups[row]
+                grp_index = group["index"]
+                existing = WORKSPACE.current.images[image_index].edits.get(str(grp_index), RegionEdit()) if WORKSPACE.current else RegionEdit()
+                pending_layout = self._pending_text_layouts.get(self._layout_key(image_index, grp_index))
+
+                orig_text = self.original_text.toPlainText() if is_single else group.get("original_text", "")
+                trans_text = self.translation.toPlainText() if is_single else group.get("translated_text", "")
+
+                edit = RegionEdit(
+                    translated_text=trans_text,
+                    replace=self.replace.isChecked(),
+                    font_size=0 if pending_layout else self.font_size.value(),
+                    offset_x=self.offset_x.value(),
+                    offset_y=self.offset_y.value(),
+                    font_family=self.font.currentText(),
+                    color=self.color.text(),
+                    alignment=self.alignment.currentData(),
+                    original_text=orig_text,
+                    bubble_type=self.bubble_type.currentData(),
+                    style_profile=self._style_profile_from_appearance(group, existing),
+                    layout_x=pending_layout["x"] if pending_layout else existing.layout_x,
+                    layout_y=pending_layout["y"] if pending_layout else existing.layout_y,
+                    layout_width=pending_layout["width"] if pending_layout else existing.layout_width,
+                    layout_height=pending_layout["height"] if pending_layout else existing.layout_height,
+                    layout_angle=self.offset_angle.value() if pending_layout is None and self.offset_angle.value() != (existing.layout_angle or 0.0) else (pending_layout.get("angle", existing.layout_angle or 0.0) if pending_layout else existing.layout_angle),
+                )
+                WORKSPACE.validate_edit(image_index, grp_index, edit)
+                edits_map[grp_index] = edit
+                self._pending_text_layouts.pop(self._layout_key(image_index, grp_index), None)
+
+            WORKSPACE.update_edits_batch(image_index, edits_map)
+
             working.set_message("Rendering the translated page...")
-            WORKSPACE.rerender_image(APP_STATE.selected_image, log_callback=working.append_log)
+            WORKSPACE.rerender_image(image_index, log_callback=working.append_log)
             working.set_message("Refreshing the editor preview...")
-            self._pending_text_layouts.pop(self._layout_key(APP_STATE.selected_image, group["index"]), None)
-            self._load_image(APP_STATE.selected_image, row)
-            self.status.setText("Text style applied and page rerendered")
+            primary_row = valid_rows[0]
+            self._load_image(image_index, primary_row)
+            self._discard_text_layout_history(image_index, {str(index) for index in edits_map})
+            self._push_editor_history("Apply & Rerender", image_index, before_state)
+            if len(valid_rows) > 1:
+                self._finish_bubble_selection_session()
+                self.status.setText(f"Applied region settings to {len(valid_rows)} text bubbles and rerendered page")
+            else:
+                self.status.setText("Text style applied and page rerendered")
         except (MemoryError, OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
             self._close_working(working); working = None
-            QMessageBox.warning(self, "Could not render", str(error))
+            QMessageBox.warning(self, "Could not render", render_error(error))
         finally:
             self._close_working(working)
 
@@ -1244,14 +2265,11 @@ class WorkspaceScreen(QWidget):
         if not (0 <= row < len(self._groups)):
             return
         group = self._groups[row]
-        answer = QMessageBox.question(
+        if not confirm(
             self,
             "Approve Bubble",
             "Approve the selected bubble and record its review outcome for learning?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        ):
             return
         working = self._show_working("Approve Bubble", "Capturing review outcome...")
         try:
@@ -1259,7 +2277,7 @@ class WorkspaceScreen(QWidget):
             summary = WORKSPACE.approve_ai_block(APP_STATE.selected_image, group["index"])
             if summary is None:
                 self._close_working(working); working = None
-                QMessageBox.warning(self, "Hydra AI", HYDRA_AI.error or "HydraMangaAi is unavailable.")
+                QMessageBox.warning(self, "Hydra AI", hydra_ai_error(HYDRA_AI.error))
                 return
             working.set_message("Refreshing review queues...")
             self._update_ocr_queue_status()
@@ -1280,12 +2298,11 @@ class WorkspaceScreen(QWidget):
             self.status.setText("No OCR/bubble issues remain on this page")
             self._update_ocr_queue_status()
             return
-        answer = QMessageBox.question(
+        if not confirm(
             self, "Approve page OCR",
             f"Approve all OCR/bubble review items on this page ({len(page_items)} block(s))?\n\n"
             "Only captured corrections become training samples; unchanged outputs remain review outcomes.",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        ):
             return
         working = self._show_working("Approve Page OCR", "Capturing OCR/bubble review outcomes...")
         try:
@@ -1293,7 +2310,7 @@ class WorkspaceScreen(QWidget):
             summary = WORKSPACE.approve_ai_page_bubbles(APP_STATE.selected_image)
             if summary is None:
                 self._close_working(working); working = None
-                QMessageBox.warning(self, "Hydra AI", HYDRA_AI.error or "HydraMangaAi is unavailable.")
+                QMessageBox.warning(self, "Hydra AI", hydra_ai_error(HYDRA_AI.error))
                 return
             working.set_message("Refreshing review queues...")
             self._update_ocr_queue_status()
@@ -1314,12 +2331,11 @@ class WorkspaceScreen(QWidget):
             self.status.setText("No review issues remain on this page")
             self._update_ocr_queue_status()
             return
-        answer = QMessageBox.question(
+        if not confirm(
             self, "Approve page review",
             f"Approve all non-OCR review items on this page ({len(page_items)} block(s))?\n\n"
             "Only captured corrections become training samples; unchanged outputs remain review outcomes.",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        ):
             return
         working = self._show_working("Approve Page Review", "Capturing page review outcomes...")
         try:
@@ -1327,7 +2343,7 @@ class WorkspaceScreen(QWidget):
             summary = WORKSPACE.approve_ai_page_reviews(APP_STATE.selected_image)
             if summary is None:
                 self._close_working(working); working = None
-                QMessageBox.warning(self, "Hydra AI", HYDRA_AI.error or "HydraMangaAi is unavailable.")
+                QMessageBox.warning(self, "Hydra AI", hydra_ai_error(HYDRA_AI.error))
                 return
             working.set_message("Refreshing review queues...")
             self._update_ocr_queue_status()
@@ -1390,19 +2406,35 @@ class WorkspaceScreen(QWidget):
 
     def _manual_rect_created(self, rect: list[int]) -> None:
         self._reset_region_tool()
-        if not WORKSPACE.request_manual_region(APP_STATE.selected_image, rect):
-            self.status.setText("Manual translation is already running")
+        image_index = APP_STATE.selected_image
+        before_state = self._capture_editor_history_state(image_index)
+        if WORKSPACE.request_manual_region(image_index, rect):
+            if before_state is not None:
+                self._pending_manual_history[image_index] = before_state
+            return
+        self._pending_manual_history.pop(image_index, None)
+        self.status.setText("Manual translation is already running")
 
     def _manual_region_created(self, polygon: list[list[int]]) -> None:
         kind = self._manual_creation_kind
         self._reset_region_tool()
         self._manual_creation_kind = "region"
+        image_index = APP_STATE.selected_image
+        before_state = self._capture_editor_history_state(image_index)
         if kind == "title":
-            if not WORKSPACE.request_title_region(APP_STATE.selected_image, polygon):
+            if WORKSPACE.request_title_region(image_index, polygon):
+                if before_state is not None:
+                    self._pending_manual_history[image_index] = before_state
+            else:
+                self._pending_manual_history.pop(image_index, None)
                 self.status.setText("Could not create title reconstruction region")
             return
-        if not WORKSPACE.request_manual_region(APP_STATE.selected_image, polygon):
-            self.status.setText("Manual translation is already running")
+        if WORKSPACE.request_manual_region(image_index, polygon):
+            if before_state is not None:
+                self._pending_manual_history[image_index] = before_state
+            return
+        self._pending_manual_history.pop(image_index, None)
+        self.status.setText("Manual translation is already running")
 
     def _on_manual_region_busy(self, busy: bool) -> None:
         self._manual_busy = busy
@@ -1493,6 +2525,7 @@ class WorkspaceScreen(QWidget):
             WORKSPACE.manual_service.submit(request)
 
     def _on_manual_region_finished(self, image_index: int, key: str) -> None:
+        before_state = self._pending_manual_history.pop(image_index, None)
         if image_index != APP_STATE.selected_image:
             return
         self._load_image(image_index)
@@ -1500,9 +2533,12 @@ class WorkspaceScreen(QWidget):
         if row >= 0:
             APP_STATE.select(image_index, row)
         group = self._groups[row] if row >= 0 else {}
+        label = "Create Title Region" if group.get("bubble_type") == "title" else "Create Manual Region"
+        self._push_editor_history(label, image_index, before_state)
         self.status.setText("Title reconstruction region created" if group.get("bubble_type") == "title" else "Manual text box translated")
 
     def _on_manual_region_failed(self, image_index: int, message: str) -> None:
+        self._pending_manual_history.pop(image_index, None)
         if image_index == APP_STATE.selected_image:
             self.status.setText("Manual translation failed")
         # Do not show QMessageBox popup window to satisfy Option C "No popup windows"
@@ -1526,10 +2562,149 @@ class WorkspaceScreen(QWidget):
         """Backward-compatible entry point for the editor Delete action."""
         self._remove_selected_block()
 
-    def _remove_selected_block(self) -> None:
-        row = APP_STATE.selected_block
-        if not (0 <= row < len(self._groups)):
+    def _select_pending_images(self) -> None:
+        if not WORKSPACE.current:
             return
+        self.filmstrip.blockSignals(True)
+        self.filmstrip.clearSelection()
+        for item in self._filmstrip_items.values():
+            image_id = str(item.data(Qt.ItemDataRole.UserRole))
+            image = next((img for img in WORKSPACE.current.images if img.id == image_id), None)
+            if image and image.status in TRANSLATE_ELIGIBLE_STATUSES:
+                item.setSelected(True)
+        self.filmstrip.blockSignals(False)
+        self._selection_changed()
+        self.status.setText("Selected pending images for translation")
+
+    def _clear_all_selections(self) -> None:
+        self.filmstrip.blockSignals(True)
+        self.filmstrip.clearSelection()
+        self.filmstrip.blockSignals(False)
+        self._selection_changed()
+
+        APP_STATE.select(APP_STATE.selected_image, -1)
+        self.original.update_region_highlights(set())
+        self.translated.update_region_highlights(set())
+        self.blocks.blockSignals(True)
+        self.blocks.clearSelection()
+        self.blocks.setCurrentRow(-1)
+        self.blocks.blockSignals(False)
+        self.remove_block.setText("Remove Block")
+        self.status.setText("Selection cleared")
+
+    def _toggle_bubble_selector(self) -> None:
+        if self.bubble_selector.isChecked():
+            self.add_box.setChecked(False)
+            self.title_reconstruction.setChecked(False)
+            self.original.begin_bubble_selection()
+            self.status.setText("Bubble Selector active: Drag box or Ctrl/Shift-click to toggle bubbles")
+        else:
+            self.original.cancel_manual_selection()
+            self.status.setText("Bubble Selector deactivated")
+
+    def _finish_bubble_selection_session(self) -> None:
+        APP_STATE.selected_block = -1
+        APP_STATE.selected_blocks.clear()
+        if self.bubble_selector.isChecked():
+            self.bubble_selector.setChecked(False)
+        self.original.cancel_manual_selection()
+        self.original.update_region_highlights(set())
+        self.translated.update_region_highlights(set())
+        self.blocks.blockSignals(True)
+        self.blocks.clearSelection()
+        self.blocks.setCurrentRow(-1)
+        self.blocks.blockSignals(False)
+        self.remove_block.setText("Remove Block")
+        self.remove_block.setEnabled(False)
+        self.apply_button.setText("Apply && Rerender")
+
+    def _batch_blocks_selected(self, primary_row: int, selected_rows: set[int]) -> None:
+        APP_STATE.select(APP_STATE.selected_image, primary_row, selected_rows)
+        self.original.update_region_highlights(selected_rows)
+        self.translated.update_region_highlights(selected_rows)
+        self.blocks.blockSignals(True)
+        self.blocks.clearSelection()
+        for row in selected_rows:
+            if 0 <= row < self.blocks.count():
+                item = self.blocks.item(row)
+                if item:
+                    item.setSelected(True)
+        if 0 <= primary_row < self.blocks.count():
+            self.blocks.setCurrentRow(primary_row)
+        self.blocks.blockSignals(False)
+        count = len(selected_rows)
+        if count > 1:
+            self.status.setText(f"{count} text bubbles selected on page")
+            self.remove_block.setText(f"Remove Blocks ({count})")
+            self.remove_block.setEnabled(True)
+            self.apply_button.setText(f"Apply && Rerender ({count})")
+        else:
+            self.remove_block.setText("Remove Block")
+            self.apply_button.setText("Apply && Rerender")
+
+    def _text_blocks_selection_changed(self) -> None:
+        selected_items = self.blocks.selectedItems()
+        selected_rows = {self.blocks.row(item) for item in selected_items if item is not None}
+        current_row = self.blocks.currentRow()
+        if selected_rows:
+            primary = current_row if current_row in selected_rows else next(iter(selected_rows))
+            APP_STATE.select(APP_STATE.selected_image, primary, selected_rows)
+            self.original.update_region_highlights(selected_rows)
+            self.translated.update_region_highlights(selected_rows)
+            if 0 <= primary < len(self._groups):
+                self._load_block(primary)
+            count = len(selected_rows)
+            if count > 1:
+                self.remove_block.setText(f"Remove Blocks ({count})")
+                self.remove_block.setEnabled(True)
+                self.apply_button.setText(f"Apply && Rerender ({count})")
+            else:
+                self.remove_block.setText("Remove Block")
+                self.apply_button.setText("Apply && Rerender")
+        else:
+            APP_STATE.select(APP_STATE.selected_image, -1, set())
+            self.original.update_region_highlights(set())
+            self.translated.update_region_highlights(set())
+            self.remove_block.setText("Remove Block")
+            self.remove_block.setEnabled(False)
+            self.apply_button.setText("Apply && Rerender")
+
+    def _remove_selected_block(self) -> None:
+        selected_rows = set(APP_STATE.selected_blocks)
+        if not selected_rows and (0 <= APP_STATE.selected_block < len(self._groups)):
+            selected_rows = {APP_STATE.selected_block}
+        valid_rows = [r for r in selected_rows if 0 <= r < len(self._groups)]
+        if not valid_rows:
+            return
+        if len(valid_rows) > 1:
+            answer = QMessageBox.question(
+                self,
+                "Delete Multiple Bubbles",
+                f"Delete the {len(valid_rows)} selected text bubbles?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            image_index = APP_STATE.selected_image
+            before_state = self._capture_editor_history_state(image_index)
+            working = self._show_working("Remove Selected Text Blocks", "Removing selected bubbles...")
+            try:
+                for row in sorted(valid_rows, reverse=True):
+                    if 0 <= row < len(self._groups):
+                        grp = self._groups[row]
+                        if bool(grp.get("manual")):
+                            WORKSPACE.delete_manual_region(image_index, str(grp["index"]))
+                        else:
+                            WORKSPACE.suppress_auto_region(image_index, int(grp["index"]))
+                self._load_image(image_index, -1)
+                self._push_editor_history("Delete Text Blocks", image_index, before_state)
+                self.status.setText(f"{len(valid_rows)} text bubbles removed")
+            finally:
+                self._close_working(working)
+            return
+
+        row = valid_rows[0]
         group = self._groups[row]
         is_manual = bool(group.get("manual"))
         label = "manual bubble" if is_manual else "automatic bubble"
@@ -1548,47 +2723,83 @@ class WorkspaceScreen(QWidget):
         if answer != QMessageBox.StandardButton.Yes:
             return
         success_message = ""
+        image_index = APP_STATE.selected_image
+        before_state = self._capture_editor_history_state(image_index)
         working = self._show_working("Remove Text Block", "Updating the translated page...")
         try:
             if is_manual:
                 working.set_message("Deleting the manual block and restoring covered regions...")
-                removed = WORKSPACE.delete_manual_region(APP_STATE.selected_image, str(group["index"]))
+                removed = WORKSPACE.delete_manual_region(image_index, str(group["index"]))
                 message = "Manual text box deleted; its automatic blocks were restored"
             else:
                 working.set_message("Removing the automatic block...")
-                removed = WORKSPACE.suppress_auto_region(APP_STATE.selected_image, int(group["index"]))
+                removed = WORKSPACE.suppress_auto_region(image_index, int(group["index"]))
                 message = "Automatic block removed; draw an Add Text Box replacement if needed"
             if removed:
                 working.set_message("Refreshing the editor preview...")
-                self._load_image(APP_STATE.selected_image, max(-1, row - 1))
+                self._load_image(image_index, max(-1, row - 1))
+                self._push_editor_history("Delete Text Block", image_index, before_state)
                 self.status.setText(message)
                 success_message = message
         except (MemoryError, OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
             self._close_working(working); working = None
-            QMessageBox.warning(self, "Could not remove text block", str(error))
+            QMessageBox.warning(self, "Could not remove text block", render_error(error))
         finally:
             self._close_working(working)
         if success_message:
             QMessageBox.information(self, "Bubble deleted", success_message)
 
     def _restore_auto_blocks(self) -> None:
+        image_index = APP_STATE.selected_image
+        before_state = self._capture_editor_history_state(image_index)
         try:
-            if WORKSPACE.restore_auto_regions(APP_STATE.selected_image):
-                self._load_image(APP_STATE.selected_image)
+            if WORKSPACE.restore_auto_regions(image_index):
+                self._load_image(image_index)
+                self._push_editor_history("Restore Auto Blocks", image_index, before_state)
                 self.status.setText("Removed automatic blocks restored")
         except (OSError, ValueError, json.JSONDecodeError) as error:
-            QMessageBox.warning(self, "Could not restore automatic blocks", str(error))
+            QMessageBox.warning(self, "Could not restore automatic blocks", render_error(error))
 
     def _choose_color(self) -> None:
         color = QColorDialog.getColor(QColor(self.color.text()), self)
         if color.isValid(): self._update_color_swatch(color.name())
 
-    def _update_color_swatch(self, value: str) -> None:
+    def _choose_gradient_start(self) -> None:
+        color = QColorDialog.getColor(QColor(self.gradient_start.text()), self)
+        if color.isValid():
+            self._update_gradient_start_swatch(color.name())
+
+    def _choose_gradient_end(self) -> None:
+        color = QColorDialog.getColor(QColor(self.gradient_end.text()), self)
+        if color.isValid():
+            self._update_gradient_end_swatch(color.name())
+
+    def _set_color_swatch(self, button: QPushButton, value: str, tooltip: str) -> None:
         color = QColor(value)
         if not color.isValid(): color = QColor("#111111")
         pixmap = QPixmap(18, 18); pixmap.fill(color)
-        self.color.setIcon(QIcon(pixmap)); self.color.setText(color.name())
-        self.color.setToolTip(f"Choose text color ({color.name()})")
+        button.setIcon(QIcon(pixmap)); button.setText(color.name())
+        button.setToolTip(f"{tooltip} ({color.name()})")
+
+    def _update_color_swatch(self, value: str) -> None:
+        self._set_color_swatch(self.color, value, "Choose text color")
+
+    def _update_gradient_start_swatch(self, value: str) -> None:
+        self._set_color_swatch(self.gradient_start, value, "Choose gradient start color")
+
+    def _update_gradient_end_swatch(self, value: str) -> None:
+        self._set_color_swatch(self.gradient_end, value, "Choose gradient end color")
+
+    def _update_gradient_controls_enabled(self, checked: bool = False) -> None:
+        art_region = self._current_region_uses_art_appearance()
+        self.gradient_enabled.setEnabled(art_region)
+        self.gradient_start.setEnabled(art_region and checked)
+        self.gradient_end.setEnabled(art_region and checked)
+        self.gradient_angle.setEnabled(art_region and checked)
+        if art_region:
+            self.gradient_enabled.setToolTip("Use two colors for title, SFX, sign, or credit text")
+        else:
+            self.gradient_enabled.setToolTip("Gradient fill is available for title, SFX, sign, and credit regions")
 
     def _update_font_preview(self, family: str) -> None:
         if family == "Arial Bold":
@@ -1609,20 +2820,26 @@ class WorkspaceScreen(QWidget):
     def _open_settings(self) -> None:
         if SettingsDialog(self).exec() == QDialog.DialogCode.Accepted:
             self._configure_manual_shortcut()
+            self._region_cycle_mode = SETTINGS.manual_region_mode or "rectangle"
+            self._filmstrip_policy_mode = SETTINGS.filmstrip_collapse_mode or "current"
             if WORKSPACE.current is not None:
                 project_id = str(getattr(WORKSPACE.current, "id", WORKSPACE.current.name))
                 self._apply_filmstrip_collapse_preference(WORKSPACE.current, project_id)
             self.status.setText("Translation provider settings saved")
 
     def _update_project_title(self) -> None:
-        width = max(150, min(420, self.width() // 3))
-        self.project_title.setText(QFontMetrics(self.project_title.font()).elidedText(
-            self._project_title_full, Qt.TextElideMode.ElideMiddle, width,
-        ))
+        display_title = self._compact_project_title(self._project_title_full)
+        self.project_title.setText(display_title)
+        self.project_title.setToolTip(self._project_title_full)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._update_project_title()
+        self._update_header_responsive_mode()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._update_header_responsive_mode()
 
     def _move_image(self, delta: int) -> None:
         if WORKSPACE.current and WORKSPACE.current.images: APP_STATE.select(max(0, min(len(WORKSPACE.current.images)-1, APP_STATE.selected_image + delta)))
@@ -1735,8 +2952,45 @@ class WorkspaceScreen(QWidget):
         self.stage_status.setText(self._stage_text(display_stage))
         if stage == "ready":
             self._schedule_job_panel_collapse("failed" if self._job_failure_count else "complete")
+            self._notify_translation_finished()
         elif stage == "cancelled" and not self._job_is_busy:
             self._schedule_job_panel_collapse("cancelled")
+
+    def _notify_translation_finished(self) -> None:
+        """Fire desktop notifications at translation pipeline terminal state.
+
+        Called only from the ``stage == 'ready'`` branch of ``_on_pipeline``.
+        Reads failure/total counts from the already-updated progress state so
+        no extra state needs to be maintained.
+        """
+        total = self._job_total
+        failures = self._job_failure_count
+        if total == 0:
+            return
+        from hydra_manga_tl.core.notifications import NOTIFICATION_SERVICE, NotificationEvent
+        from hydra_manga_tl.project.workspace import WORKSPACE
+        if failures:
+            NOTIFICATION_SERVICE.notify(
+                NotificationEvent.TRANSLATION_FAILED,
+                "Translation finished with errors",
+                f"{total - failures} page(s) done, {failures} failed.",
+            )
+        else:
+            NOTIFICATION_SERVICE.notify(
+                NotificationEvent.TRANSLATION_COMPLETED,
+                "Translation complete",
+                f"{total} page(s) translated successfully.",
+            )
+        # Review queue is a separate, additive notification
+        project = WORKSPACE.current
+        if project:
+            review_count = sum(1 for img in project.images if img.status == "review")
+            if review_count:
+                NOTIFICATION_SERVICE.notify(
+                    NotificationEvent.REVIEW_QUEUE,
+                    "Review queue",
+                    f"{review_count} page(s) need review.",
+                )
 
     def _advance_progress_animation(self) -> None:
         if self._progress_stage not in self._PROGRESS_RANGES:
@@ -1838,7 +3092,7 @@ class WorkspaceScreen(QWidget):
     def _on_busy(self, busy: bool) -> None:
         self._job_is_busy = busy
         self.filmstrip.set_reorder_enabled(not busy)
-        pending = bool(WORKSPACE.current and any(image.status in {"pending", "queued", "partial", "failed", "cancelled"} for image in WORKSPACE.current.images))
+        pending = bool(WORKSPACE.current and any(image.status in TRANSLATE_ELIGIBLE_STATUSES for image in WORKSPACE.current.images))
         self.start_button.setEnabled(not busy and pending)
         self.cancel_button.setEnabled(busy or self._manual_busy)
         self.close_button.setEnabled(not (busy or self._manual_busy))
@@ -1850,31 +3104,127 @@ class WorkspaceScreen(QWidget):
         if not busy and not keep_result:
             self.progress.setValue(0); self.page_progress.setValue(0)
 
+    @staticmethod
+    def _matches_review_filter(region: dict, category: str) -> bool:
+        if category == "untranslated":
+            return region.get("original_text") == region.get("translated_text")
+        if category == "residual_source":
+            text = region.get("translated_text") or ""
+            return any(0x3000 <= ord(c) <= 0x9FFF or 0xFF00 <= ord(c) <= 0xFFEF for c in text)
+        if category == "overflow":
+            return "text_does_not_fit" in region.get("review_reasons", [])
+        if category == "missing_glyph":
+            return "□" in region.get("translated_text", "")
+        if category == "low_ocr":
+            return region.get("ocr_confidence", 1.0) < 0.6
+        if category == "provider_fallback":
+            return region.get("translation_source") == "fallback"
+        return False
+
+    def _default_export_target(self) -> tuple[Path, str]:
+        import re
+        parent = Path(SETTINGS.export_root)
+        name = "manga"
+        if WORKSPACE.current:
+            raw_name = WORKSPACE.current.name or "manga"
+            name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", raw_name).strip("_")
+        return parent, name
+
+    def _start_export_worker(self, output_type: str, destination: Path, *, image_format: str = "png", archive_format: str = "zip") -> None:
+        self._export_dialog = BackgroundWorkDialog(self)
+        self._export_dialog.setWindowTitle("Exporting")
+        self._export_dialog.message.setText(f"Exporting files to:\n{destination}\n\nPlease wait...")
+        self._export_dialog.set_progress_visible(True)
+        self._export_dialog.set_progress_fraction(0, 1)
+
+        self._export_thread = QThread(self)
+        worker = ExportWorker(output_type, destination, image_format=image_format, archive_format=archive_format)
+        worker.moveToThread(self._export_thread)
+
+        self._export_thread.started.connect(worker.run)
+
+        worker.progress.connect(self._on_export_progress)
+        worker.finished.connect(self._on_export_finished)
+        worker.failed.connect(self._on_export_failed)
+
+        worker.finished.connect(self._export_thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(self._export_thread.quit)
+        worker.failed.connect(worker.deleteLater)
+        self._export_thread.finished.connect(self._export_thread.deleteLater)
+
+        self._export_thread.start()
+        self._export_dialog.exec()
+        self._export_dialog = None
+        self._export_thread = None
+
+    @Slot(int, int)
+    def _on_export_progress(self, current: int, total: int) -> None:
+        if hasattr(self, "_export_dialog") and self._export_dialog is not None:
+            self._export_dialog.set_progress_fraction(current, total)
+
+    @Slot(str, object)
+    def _on_export_finished(self, ot: str, result):
+        if hasattr(self, "_export_dialog") and self._export_dialog is not None:
+            self._export_dialog.accept()
+        if ot == "folder":
+            QMessageBox.information(self, "Export complete", f"Exported {result} image(s).")
+        elif ot == "pdf":
+            QMessageBox.information(self, "Export complete", f"Exported PDF:\n{result}")
+        else:
+            QMessageBox.information(self, "Export complete", f"Exported archive:\n{result}")
+        from hydra_manga_tl.core.notifications import NOTIFICATION_SERVICE, NotificationEvent
+        from pathlib import Path as _Path
+        if ot == "folder":
+            notif_msg = f"Exported {result} image(s)."
+        else:
+            notif_msg = f"Saved: {_Path(str(result)).name}"
+        NOTIFICATION_SERVICE.notify(
+            NotificationEvent.EXPORT_COMPLETED,
+            "Export complete",
+            notif_msg,
+        )
+
+    @Slot(str)
+    def _on_export_failed(self, err: str):
+        if hasattr(self, "_export_dialog") and self._export_dialog is not None:
+            self._export_dialog.reject()
+        QMessageBox.warning(self, "Export failed", err)
+        from hydra_manga_tl.core.notifications import NOTIFICATION_SERVICE, NotificationEvent
+        NOTIFICATION_SERVICE.notify(
+            NotificationEvent.EXPORT_FAILED,
+            "Export failed",
+            err[:120],
+        )
+
     def _export(self) -> None:
         dialog = ExportOptionsDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         output_type = str(dialog.output_type.currentData())
         image_format = str(dialog.image_format.currentData())
+
+        export_root, base_name = self._default_export_target()
+
         if output_type == "folder":
-            folder = QFileDialog.getExistingDirectory(self, "Export image folder")
+            folder = QFileDialog.getExistingDirectory(self, "Export image folder", str(export_root))
             if not folder:
                 return
-            try:
-                count = WORKSPACE.export(Path(folder), image_format=image_format)
-            except (OSError, ValueError) as error:
-                QMessageBox.warning(self, "Export failed", str(error)); return
-            QMessageBox.information(self, "Export complete", f"Exported {count} image(s).")
+            self._start_export_worker(output_type, Path(folder) / base_name, image_format=image_format)
+            return
+
+        if output_type == "pdf":
+            default_pdf_path = str(export_root / f"{base_name}.pdf")
+            path, _ = QFileDialog.getSaveFileName(self, "Export PDF", default_pdf_path, "PDF document (*.pdf);;All files (*.*)")
+            if not path:
+                return
+            self._start_export_worker(output_type, Path(path))
             return
 
         archive_format = "cbz" if output_type == "cbz" else "zip"
         filter_label = "CBZ comic archive (*.cbz)" if archive_format == "cbz" else "ZIP archive (*.zip)"
-        path, _ = QFileDialog.getSaveFileName(self, "Export archive", "", f"{filter_label};;All files (*.*)")
+        default_archive_path = str(export_root / f"{base_name}.{archive_format}")
+        path, _ = QFileDialog.getSaveFileName(self, "Export archive", default_archive_path, f"{filter_label};;All files (*.*)")
         if not path:
             return
-        try:
-            archive = WORKSPACE.export_archive(Path(path), image_format=image_format, archive_format=archive_format)
-        except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "Export failed", str(error)); return
-        if archive is not None:
-            QMessageBox.information(self, "Export complete", f"Exported archive:\n{archive}")
+        self._start_export_worker(output_type, Path(path), image_format=image_format, archive_format=archive_format)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QItemSelectionModel, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QDrag, QDragEnterEvent, QDragMoveEvent, QDropEvent, QIcon, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QApplication, QAbstractItemView, QListWidget, QListWidgetItem, QToolTip
 
@@ -14,6 +14,7 @@ class ReorderableFilmstrip(QListWidget):
 
     order_changed = Signal(list)
     reorder_hint = Signal(str)
+    add_pages_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -42,8 +43,48 @@ class ReorderableFilmstrip(QListWidget):
         self.viewport().setAcceptDrops(True)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
+    def page_item_count(self) -> int:
+        return sum(
+            1 for row in range(self.count())
+            if self.item(row) is not None and str(self.item(row).data(Qt.ItemDataRole.UserRole) or "") not in {"", "__add_pages__"}
+        )
+
+    def create_add_pages_icon(self) -> QIcon:
+        size = FILMSTRIP_PREVIEW_SIZE
+        pixmap = QPixmap(size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = pixmap.rect().adjusted(2, 2, -2, -2)
+        painter.setPen(QPen(QColor("#4c566a"), 1.5, Qt.PenStyle.DashLine))
+        painter.setBrush(QColor("#1e2330"))
+        painter.drawRoundedRect(rect, 6, 6)
+        cx = pixmap.width() // 2
+        cy = (pixmap.height() // 2) - 4
+        pen = QPen(QColor("#69a0ff"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        arm = 11
+        painter.drawLine(cx - arm, cy, cx + arm, cy)
+        painter.drawLine(cx, cy - arm, cx, cy + arm)
+        painter.end()
+        return QIcon(pixmap)
+
     def mousePressEvent(self, event) -> None:
         position = self._event_position(event)
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            item = self.itemAt(position)
+            if item is not None:
+                if str(item.data(Qt.ItemDataRole.UserRole) or "") == "__add_pages__":
+                    item.setSelected(False)
+                    self.add_pages_requested.emit()
+                else:
+                    item.setSelected(not item.isSelected())
+                    self.setCurrentItem(item, QItemSelectionModel.SelectionFlag.NoUpdate)
+                event.accept()
+                return
         is_plain_left = (
             event.button() == Qt.MouseButton.LeftButton
             and event.modifiers() == Qt.KeyboardModifier.NoModifier
@@ -86,10 +127,60 @@ class ReorderableFilmstrip(QListWidget):
             return
         super().wheelEvent(event)
 
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        modifiers = event.modifiers()
+        if modifiers == Qt.KeyboardModifier.ControlModifier and key in {
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+        }:
+            self._extend_selection_by_keyboard(-1 if key == Qt.Key.Key_Left else 1)
+            event.accept()
+            return
+        if (
+            modifiers == Qt.KeyboardModifier.ControlModifier
+            and key == Qt.Key.Key_Space
+        ):
+            current = self.currentItem()
+            if current is not None:
+                current.setSelected(not current.isSelected())
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _extend_selection_by_keyboard(self, direction: int) -> None:
+        if self.count() <= 0:
+            return
+        current_row = self.currentRow()
+        if current_row < 0:
+            target_row = 0
+        else:
+            target_row = current_row + (-1 if direction < 0 else 1)
+        if not 0 <= target_row < self.count():
+            return
+        target = self.item(target_row)
+        if target is None:
+            return
+        current = self.currentItem()
+        if current is not None:
+            current.setSelected(True)
+        selection_model = self.selectionModel()
+        if selection_model is not None:
+            selection_model.setCurrentIndex(
+                self.indexFromItem(target),
+                QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
+        target.setSelected(True)
+        self.scrollToItem(target, QAbstractItemView.ScrollHint.EnsureVisible)
+
     def _event_position(self, event):
         return event.position().toPoint() if hasattr(event, "position") else event.pos()
 
     def _select_single_item(self, item: QListWidgetItem) -> None:
+        if str(item.data(Qt.ItemDataRole.UserRole) or "") == "__add_pages__":
+            item.setSelected(False)
+            self.add_pages_requested.emit()
+            return
         self.clearSelection()
         item.setSelected(True)
         self.setCurrentItem(item)
@@ -100,7 +191,8 @@ class ReorderableFilmstrip(QListWidget):
         self.viewport().setAcceptDrops(enabled)
         self.setDropIndicatorShown(enabled)
         self.setToolTip(
-            "Drag pages to reorder them. Ctrl/Shift-click to move several pages together."
+            "Drag pages to reorder them. Ctrl/Shift-click selects several pages; "
+            "Ctrl+Left/Right grows the keyboard batch."
             if enabled else "Page order cannot be changed while translation is running."
         )
 
@@ -182,6 +274,8 @@ class ReorderableFilmstrip(QListWidget):
                 self.takeItem(0)
             for image_id in after:
                 self.addItem(items[image_id])
+            if "__add_pages__" in items:
+                self.addItem(items["__add_pages__"])
             if current_id in items:
                 self.setCurrentItem(items[current_id])
             self.clearSelection()
@@ -194,7 +288,11 @@ class ReorderableFilmstrip(QListWidget):
         return True
 
     def ordered_ids(self) -> list[str]:
-        return [str(self.item(row).data(Qt.ItemDataRole.UserRole)) for row in range(self.count())]
+        return [
+            str(self.item(row).data(Qt.ItemDataRole.UserRole))
+            for row in range(self.count())
+            if self.item(row) is not None and str(self.item(row).data(Qt.ItemDataRole.UserRole) or "") not in {"", "__add_pages__"}
+        ]
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -283,12 +381,13 @@ class ReorderableFilmstrip(QListWidget):
 
     def _target_index_at(self, position) -> int:
         target_item = self.itemAt(position)
-        if target_item is None:
-            return self.count()
+        page_count = self.page_item_count()
+        if target_item is None or str(target_item.data(Qt.ItemDataRole.UserRole) or "") == "__add_pages__":
+            return page_count
         target_index = self.row(target_item)
         if position.x() >= self.visualItemRect(target_item).center().x():
             target_index += 1
-        return max(0, min(self.count(), target_index))
+        return max(0, min(page_count, target_index))
 
     def _update_drop_feedback(self, position) -> None:
         target_index = self._target_index_at(position)

@@ -7,21 +7,10 @@ import multiprocessing
 import sys
 from pathlib import Path
 
-import builtins
-
-_real_import = builtins.__import__
-
-def debug_import(name, *args, **kwargs):
-    if name.startswith("torchvision"):
-        print(f"IMPORTING: {name}")
-    return _real_import(name, *args, **kwargs)
-
-builtins.__import__ = debug_import
-
 def _apply_qwen_runtime_defaults() -> None:
     """Make the local Qwen GGUF runtime default to the same settings as the CLI example."""
     defaults = {
-        "QWEN_N_CTX": "2048",
+        "QWEN_N_CTX": "4096",
         "QWEN_N_BATCH": "128",
         "QWEN_N_UBATCH": "64",
         "QWEN_N_GPU_LAYERS": "-1",
@@ -60,6 +49,21 @@ _activate_project_runtime()
 multiprocessing.freeze_support()
 
 
+def _configure_profile(arguments: list[str]) -> list[str]:
+    remaining = list(arguments)
+    if "--profile" not in remaining:
+        return remaining
+    index = remaining.index("--profile")
+    if index + 1 >= len(remaining):
+        raise ValueError("--profile requires stable or development.")
+    profile = remaining[index + 1].strip().casefold()
+    if profile not in {"stable", "development"}:
+        raise ValueError("--profile requires stable or development.")
+    os.environ["HYDRA_PROFILE"] = profile
+    del remaining[index:index + 2]
+    return remaining
+
+
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--phase3-render":
         sys.argv = [sys.argv[0], *sys.argv[2:]]
@@ -67,9 +71,10 @@ def main() -> int:
 
         return phase3_main()
 
+    arguments = _configure_profile(sys.argv[1:])
     from hydra_manga_tl.core.application import MangaApplication
 
-    startup_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else None
+    startup_path = Path(arguments[0]).expanduser() if arguments else None
     try:
         return MangaApplication(startup_path=startup_path).run()
     except KeyboardInterrupt:

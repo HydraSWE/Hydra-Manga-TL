@@ -48,7 +48,7 @@ if BUILD_SUPPORT.is_dir():
 for qt_path_name in ("plugins", "qml", "translations"):
     ensure_qt_reported_path(qt_path_name)
 
-APP_VERSION = "0.9.0"
+APP_VERSION = "1.0.0"
 APP_STATUS = "current development"
 
 # PaddleOCR and PaddleX discover inference pipelines and operators dynamically.

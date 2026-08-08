@@ -19,6 +19,7 @@ class ApplicationState(QObject):
         self.project = None
         self.selected_image = -1
         self.selected_block = -1
+        self.selected_blocks: set[int] = set()
         self.pipeline_stage = ""
         self.progress_current = 0
         self.progress_total = 0
@@ -33,15 +34,22 @@ class ApplicationState(QObject):
         self.project = project
         self.selected_image = 0 if project and project.images else -1
         self.selected_block = -1
+        self.selected_blocks.clear()
         self.project_changed.emit(project)
         self.selection_changed.emit(self.selected_image, self.selected_block)
 
     def refresh_project(self) -> None:
         self.project_changed.emit(self.project)
 
-    def select(self, image_index: int, block_index: int = -1) -> None:
+    def select(self, image_index: int, block_index: int = -1, block_indices: set[int] | list[int] | None = None) -> None:
         self.selected_image = image_index
         self.selected_block = block_index
+        if block_indices is not None:
+            self.selected_blocks = set(block_indices)
+        elif block_index >= 0:
+            self.selected_blocks = {block_index}
+        else:
+            self.selected_blocks.clear()
         self.selection_changed.emit(image_index, block_index)
 
     def set_pipeline(self, stage: str, current: int, total: int, message: str) -> None:

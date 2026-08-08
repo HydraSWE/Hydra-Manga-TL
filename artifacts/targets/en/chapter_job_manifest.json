@@ -1,0 +1,36 @@
+{
+  "version": 3,
+  "updated_at": "2026-08-08T05:02:56.498421+00:00",
+  "pages": {
+    "second": {
+      "image_id": "second",
+      "source_path": "2.png",
+      "state": "partial",
+      "completed_stages": [],
+      "stage_records": {},
+      "stage_errors": {},
+      "error": "",
+      "updated_at": "2026-08-08T05:02:56.497419+00:00"
+    },
+    "first": {
+      "image_id": "first",
+      "source_path": "1.png",
+      "state": "partial",
+      "completed_stages": [],
+      "stage_records": {},
+      "stage_errors": {},
+      "error": "",
+      "updated_at": "2026-08-08T05:02:56.498421+00:00"
+    },
+    "page": {
+      "image_id": "page",
+      "source_path": "page.png",
+      "state": "partial",
+      "completed_stages": [],
+      "stage_records": {},
+      "stage_errors": {},
+      "error": "",
+      "updated_at": "2026-08-08T05:02:56.484033+00:00"
+    }
+  }
+}

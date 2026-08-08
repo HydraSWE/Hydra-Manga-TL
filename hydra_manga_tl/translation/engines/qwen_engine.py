@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
-import re
 import site
 from pathlib import Path
 from typing import Any
 
 from hydra_manga_tl.core.settings import SETTINGS
-from .base import PageDialogue, PageTranslation
+from hydra_manga_tl.translation.postprocessing import clean_pronoun_artifacts
+from .base import PageDialogue, PageTranslation, prepare_dialogue_item
 from .prompts import SYSTEM_PROMPT, build_page_prompt
 
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _load_dotenv_values() -> dict[str, str]:
@@ -92,7 +95,7 @@ def _resolve_runtime_config(runtime_config: dict[str, Any] | None = None) -> dic
     dotenv_values = _load_dotenv_values()
     env = {**dotenv_values, **os.environ}
     resolved = {
-        "n_ctx": _coerce_int(env.get("QWEN_N_CTX") or env.get("LLAMA_N_CTX") or 2048, 2048),
+        "n_ctx": _coerce_int(env.get("QWEN_N_CTX") or env.get("LLAMA_N_CTX") or 4096, 4096),
         "n_batch": _coerce_int(env.get("QWEN_N_BATCH") or env.get("LLAMA_N_BATCH") or 64, 64),
         "n_ubatch": _coerce_int(env.get("QWEN_N_UBATCH") or env.get("LLAMA_N_UBATCH") or 32, 32),
         "n_gpu_layers": _coerce_int(env.get("QWEN_N_GPU_LAYERS") or env.get("LLAMA_N_GPU_LAYERS") or -1, -1),
@@ -103,6 +106,7 @@ def _resolve_runtime_config(runtime_config: dict[str, Any] | None = None) -> dic
         "type_v": _coerce_quantization(env.get("QWEN_TYPE_V") or env.get("LLAMA_TYPE_V") or "q4_0", 2),
         "n_threads": _coerce_int(env.get("QWEN_N_THREADS") or env.get("LLAMA_N_THREADS") or 6, 6),
         "n_threads_batch": _coerce_int(env.get("QWEN_N_THREADS_BATCH") or env.get("LLAMA_N_THREADS_BATCH") or 6, 6),
+        "max_batch_items": _coerce_int(env.get("QWEN_MAX_BATCH_ITEMS") or 4, 4),
         "verbose": _coerce_bool(env.get("QWEN_VERBOSE") or env.get("LLAMA_VERBOSE") or False, False),
     }
     if runtime_config:
@@ -176,9 +180,18 @@ class QwenGGUFEngine:
         _add_nvidia_dll_directories()
         try:
             llama_module = importlib.import_module("llama_cpp")
+            LOGGER.info(
+                "Qwen runtime config: %s",
+                json.dumps(self.runtime_config, indent=2)
+            )
+            LOGGER.info("Model path: %s", model_path)
+            LOGGER.info("llama_cpp version: %s", llama_module.__version__)
             llama_cls = getattr(llama_module, "Llama")
         except Exception as exc:  # pragma: no cover - optional dependency path
-            raise RuntimeError("Optional dependency 'llama-cpp-python' is not installed; install it to enable local Qwen translation.") from exc
+            raise RuntimeError(
+                "Local Qwen runtime could not load llama-cpp-python or one of "
+                f"its native dependencies: {exc}"
+            ) from exc
         self._llama = llama_cls(
             model_path=str(model_path),
             n_ctx=self.runtime_config["n_ctx"],
@@ -195,6 +208,10 @@ class QwenGGUFEngine:
             verbose=self.runtime_config["verbose"],
         )
         self._loaded = True
+        print("=" * 80)
+        print("MODEL:", model_path)
+        print("CONFIG:", self.runtime_config)
+        print("=" * 80)
 
     @staticmethod
     def _looks_like_name(text: str) -> bool:
@@ -225,11 +242,10 @@ class QwenGGUFEngine:
     @staticmethod
     def restore_protected_text(text: str, mapping: dict[str, str]) -> str:
         restored = str(text)
-        if not mapping:
-            return restored
-        for placeholder, original in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
-            restored = restored.replace(placeholder, original)
-        return restored
+        if mapping:
+            for placeholder, original in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
+                restored = restored.replace(placeholder, original)
+        return clean_pronoun_artifacts(restored)
 
     def translate_page(self, page: PageDialogue) -> PageTranslation:
         if not self._loaded:
@@ -238,7 +254,7 @@ class QwenGGUFEngine:
             raise RuntimeError("Qwen GGUF engine could not be loaded")
         if not page.dialogue:
             return PageTranslation(source_language=page.source_language, target_language=page.target_language, translations=[])
-        dialog_items = [{"id": str(item.get("id", "")), "text": str(item.get("text", ""))} for item in page.dialogue]
+        dialog_items = [prepare_dialogue_item(item) for item in page.dialogue]
         protected_dialogue, entity_map = self.protect_dialogue(dialog_items)
         pm_terms = None
         if getattr(SETTINGS, "phrase_memory_enabled", True):
@@ -253,74 +269,238 @@ class QwenGGUFEngine:
                 )
             except Exception:
                 pm_terms = None
-        prompt = build_page_prompt(
-            source_language=page.source_language,
-            target_language=page.target_language,
-            style="Manga",
-            glossary=self.glossary,
-            dialogue=protected_dialogue,
-            temperature=self.temperature,
-            page_context=page.page_context,
-            protected_entities=entity_map,
-            phrase_memory_terminology=pm_terms,
-        )
+        n_ctx = self.runtime_config["n_ctx"]
+        # Reserve 200 tokens for ChatML framing overhead
+        chatml_overhead = 200
+        # Maximum retries for a single batch before giving up
+        max_retries = 2
+        max_batch_items = max(1, _coerce_int(self.runtime_config.get("max_batch_items"), 4))
 
-        try:
-            completion = self._llama.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
+        def _estimate_output_tokens(count: int) -> int:
+            """Estimate output tokens needed: JSON wrapper + ~64 tokens per entry."""
+            return 48 + count * 64
+
+        def get_token_count(chunk: list[dict]) -> int:
+            prompt = build_page_prompt(
+                source_language=page.source_language,
+                target_language=page.target_language,
+                style="Manga",
+                glossary=self.glossary,
+                dialogue=chunk,
                 temperature=self.temperature,
-                max_tokens=512,
+                page_context=page.page_context,
+                protected_entities=entity_map,
+                phrase_memory_terminology=pm_terms,
             )
-            raw = completion["choices"][0]["message"]["content"]
-        except AttributeError:
-            result = self._llama(prompt, max_tokens=512, temperature=self.temperature, echo=False)
-            raw = result["choices"][0]["text"]
-        except Exception as exc:  # pragma: no cover - runtime-specific
-            raise RuntimeError(f"Qwen GGUF generation failed: {exc}") from exc
-        payload = extract_first_json_object(raw)
-        translations = payload.get("translations", [])
-        if not isinstance(translations, list):
-            raise RuntimeError("Qwen response did not include a translations array")
-        expected_ids = [str(item.get("id", "")) for item in page.dialogue]
-        by_id: dict[str, dict[str, str]] = {}
-        for item in translations:
-            if not isinstance(item, dict):
-                continue
-            entry_id = str(item.get("id", "")).strip()
-            entry_text = self.restore_protected_text(str(item.get("text", "")).strip(), entity_map)
-            if not entry_id:
-                raise RuntimeError("Qwen response omitted translation ids")
-            by_id[entry_id] = {"id": entry_id, "text": entry_text}
-        if len(by_id) != len(expected_ids):
-            raise RuntimeError("Qwen response did not preserve the expected number of ids")
-        normalized = []
-        for entry_id in expected_ids:
-            if entry_id not in by_id:
-                raise RuntimeError(f"Qwen response omitted id {entry_id}")
-            normalized.append({"id": entry_id, "text": by_id[entry_id]["text"]})
+            raw_text = SYSTEM_PROMPT + prompt
+            if hasattr(self._llama, "tokenize"):
+                return len(self._llama.tokenize(raw_text.encode("utf-8")))
+            return len(raw_text) // 4
+
+        def fits_in_context(chunk: list[dict]) -> bool:
+            prompt_tokens = get_token_count(chunk)
+            output_tokens = _estimate_output_tokens(len(chunk))
+            total = prompt_tokens + output_tokens + chatml_overhead
+            return total <= n_ctx
+
+        def split_dialogue(chunk: list[dict]) -> list[list[dict]]:
+            if not chunk:
+                return []
+            if len(chunk) <= max_batch_items and fits_in_context(chunk):
+                return [chunk]
+            if len(chunk) == 1:
+                # Single item exceeds context — cannot split further, send anyway
+                # and let the model do its best (it will likely truncate)
+                LOGGER.warning(
+                    "Single dialogue item exceeds context window (%d tokens); "
+                    "sending anyway with best-effort generation",
+                    get_token_count(chunk),
+                )
+                return [chunk]
+            mid = len(chunk) // 2
+            return split_dialogue(chunk[:mid]) + split_dialogue(chunk[mid:])
+
+        batches = split_dialogue(protected_dialogue)
+        if len(batches) > 1:
+            LOGGER.info(
+                "Auto token management: split %d dialogue items into %d batches "
+                "(n_ctx=%d)",
+                len(protected_dialogue), len(batches), n_ctx,
+            )
+        all_translations: list[dict[str, str]] = []
+
+        def _translate_batch(batch: list[dict]) -> list[dict]:
+            """Translate a single batch, returning normalized translation dicts."""
+            batch_expected_ids = [str(item.get("id", "")) for item in batch]
+            prompt = build_page_prompt(
+                source_language=page.source_language,
+                target_language=page.target_language,
+                style="Manga",
+                glossary=self.glossary,
+                dialogue=batch,
+                temperature=self.temperature,
+                page_context=page.page_context,
+                protected_entities=entity_map,
+                phrase_memory_terminology=pm_terms,
+            )
+            prompt += (
+                "\nStrict batch contract:\n"
+                f"- Return exactly {len(batch_expected_ids)} translation object(s).\n"
+                f"- Return these ids exactly once, in this exact order: {json.dumps(batch_expected_ids, ensure_ascii=False)}.\n"
+                "- Do not include translations from any previous, later, or example batch.\n"
+                "- If unsure, still return one object per listed id with the best faithful translation.\n"
+            )
+
+            batch_max_tokens = max(512, _estimate_output_tokens(len(batch)))
+            # Clamp to remaining context after prompt
+            prompt_tokens = get_token_count(batch)
+            remaining = n_ctx - prompt_tokens - chatml_overhead
+            if remaining > 0:
+                batch_max_tokens = min(batch_max_tokens, remaining)
+
+            try:
+                completion = self._llama.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=self.temperature,
+                    max_tokens=batch_max_tokens,
+                )
+                raw = completion["choices"][0]["message"]["content"]
+            except AttributeError:
+                result = self._llama(prompt, max_tokens=batch_max_tokens, temperature=self.temperature, echo=False)
+                raw = result["choices"][0]["text"]
+            except ValueError as exc:
+                # Token overflow — will be caught by retry logic
+                raise
+            except Exception as exc:  # pragma: no cover - runtime-specific
+                raise RuntimeError(f"Qwen GGUF generation failed: {exc}") from exc
+
+            payload = extract_first_json_object(raw)
+            batch_translations = payload.get("translations", [])
+            if not isinstance(batch_translations, list):
+                raise RuntimeError("Qwen response did not include a translations array")
+
+            # --- ID reconciliation ---
+            by_id: dict[str, dict[str, str]] = {}
+            usable_items: list[dict[str, str]] = []
+            for item in batch_translations:
+                if not isinstance(item, dict):
+                    continue
+                entry_id = str(item.get("id", "")).strip()
+                entry_text = self.restore_protected_text(str(item.get("text", "")).strip(), entity_map)
+                if entry_text:
+                    usable_items.append({"id": entry_id, "text": entry_text})
+                if not entry_id:
+                    if len(batch_expected_ids) == 1 and len(batch_translations) == 1:
+                        entry_id = batch_expected_ids[0]
+                    else:
+                        entry_id = ""
+                by_id[entry_id] = {"id": entry_id, "text": entry_text}
+
+            if len(batch_expected_ids) == 1 and len(by_id) == 1 and batch_expected_ids[0] not in by_id:
+                only = next(iter(by_id.values()))
+                by_id = {batch_expected_ids[0]: {"id": batch_expected_ids[0], "text": only["text"]}}
+
+            # Check if all expected IDs are present by name
+            missing_ids = [eid for eid in batch_expected_ids if eid not in by_id]
+            result_items: list[dict[str, str]] = []
+            if not missing_ids:
+                # Perfect ID match — use ID-based mapping
+                for entry_id in batch_expected_ids:
+                    result_items.append({"id": entry_id, "text": by_id[entry_id]["text"]})
+            elif len(batch_translations) == len(batch_expected_ids):
+                # Count matches but IDs are mangled — fall back to positional mapping
+                LOGGER.warning(
+                    "Qwen returned mangled IDs for batch of %d items; using positional mapping",
+                    len(batch_expected_ids),
+                )
+                for idx, entry_id in enumerate(batch_expected_ids):
+                    item = batch_translations[idx]
+                    entry_text = self.restore_protected_text(
+                        str(item.get("text", "")).strip() if isinstance(item, dict) else "",
+                        entity_map,
+                    )
+                    result_items.append({"id": entry_id, "text": entry_text})
+            elif len(batch_expected_ids) == 1 and usable_items:
+                LOGGER.warning(
+                    "Qwen returned %d translations for single-item batch id=%s; "
+                    "using first usable translation by position",
+                    len(batch_translations),
+                    batch_expected_ids[0],
+                )
+                result_items.append({"id": batch_expected_ids[0], "text": usable_items[0]["text"]})
+            else:
+                raise RuntimeError(
+                    f"Qwen response returned {len(batch_translations)} translations "
+                    f"but expected {len(batch_expected_ids)}"
+                )
+            return result_items
+
+        # --- Process each batch with automatic retry and re-split ---
+        pending_batches = list(batches)
+        while pending_batches:
+            batch = pending_batches.pop(0)
+            retries = 0
+            while True:
+                try:
+                    result_items = _translate_batch(batch)
+                    all_translations.extend(result_items)
+                    break
+                except (RuntimeError, ValueError) as exc:
+                    retries += 1
+                    if len(batch) > 1 and retries <= max_retries:
+                        # Re-split the failed batch in half and retry
+                        mid = len(batch) // 2
+                        LOGGER.warning(
+                            "Batch of %d items failed (%s); re-splitting into %d + %d",
+                            len(batch), exc, mid, len(batch) - mid,
+                        )
+                        # Insert the two halves at the front of pending
+                        pending_batches.insert(0, batch[mid:])
+                        pending_batches.insert(0, batch[:mid])
+                        break
+                    elif retries <= max_retries:
+                        LOGGER.warning(
+                            "Single-item batch failed (%s); retrying (%d/%d)",
+                            exc, retries, max_retries,
+                        )
+                        continue
+                    else:
+                        raise
+
         return PageTranslation(
             source_language=page.source_language,
             target_language=page.target_language,
-            translations=normalized,
+            translations=all_translations,
         )
 
     def unload(self) -> None:
-        self._llama = None
+        llama, self._llama = self._llama, None
         self._loaded = False
-
-
-_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+        if llama is None:
+            return
+        close = getattr(llama, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:
+            LOGGER.exception("Qwen native context cleanup failed")
 
 
 def extract_first_json_object(raw: str) -> dict[str, Any]:
     """Best-effort extraction of the first top-level JSON object."""
-    raw = raw.strip()
-    if raw.startswith("{") and raw.endswith("}"):
-        return json.loads(raw)
-    match = _JSON_RE.search(raw)
-    if not match:
-        raise ValueError("No JSON object found")
-    return json.loads(match.group(0))
+    decoder = json.JSONDecoder()
+    source = str(raw).strip()
+    for index, character in enumerate(source):
+        if character != "{":
+            continue
+        try:
+            payload, _end = decoder.raw_decode(source[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError("No valid JSON object found")

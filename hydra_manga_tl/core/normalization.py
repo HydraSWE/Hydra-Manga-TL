@@ -17,6 +17,104 @@ if TYPE_CHECKING:
 
 HONORIFICS = ("先輩", "先生", "さん", "くん", "君", "ちゃん", "様")
 TOPIC_MARKERS = (*HONORIFICS, "は", "が", "も", "：", ":")
+INVALID_HONORIFIC_CARRIERS = {
+    "a",
+    "about",
+    "after",
+    "ah",
+    "am",
+    "an",
+    "and",
+    "ano",
+    "anoo",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "but",
+    "by",
+    "can",
+    "could",
+    "da",
+    "desu",
+    "did",
+    "do",
+    "does",
+    "eh",
+    "etto",
+    "for",
+    "from",
+    "ga",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "i",
+    "if",
+    "in",
+    "is",
+    "it",
+    "its",
+    "itself",
+    "me",
+    "mine",
+    "my",
+    "myself",
+    "nor",
+    "of",
+    "on",
+    "or",
+    "our",
+    "ours",
+    "ourselves",
+    "she",
+    "should",
+    "so",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "to",
+    "um",
+    "wa",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "whose",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
+}
 ILLNESS_MARKERS = ("体調不良", "風邪", "病気", "具合")
 ABSENCE_MARKERS = ("休み", "休む", "欠席", "休養")
 START_MARKERS = ("始める", "始めよう", "始めるぞ", "開始")
@@ -120,9 +218,17 @@ def source_honorific(text: str) -> str:
     return ""
 
 
+def is_invalid_honorific_carrier(text: str) -> bool:
+    words = re.findall(r"[A-Za-z]+", str(text))
+    return bool(words) and words[0].casefold() in INVALID_HONORIFIC_CARRIERS
+
+
 def english_lead_name(text: str) -> str:
     match = re.match(r"\s*([A-Z][A-Za-z]+)(?:'s|\b)", str(text))
-    return match.group(1) if match else ""
+    if not match:
+        return ""
+    name = match.group(1)
+    return "" if is_invalid_honorific_carrier(name) else name
 
 
 def english_subject(text: str) -> str:
@@ -131,7 +237,10 @@ def english_subject(text: str) -> str:
         r"(?:'s| is| was| has| has been|\b)",
         str(text),
     )
-    return match.group("subject") if match else ""
+    if not match:
+        return ""
+    subject = match.group("subject")
+    return "" if is_invalid_honorific_carrier(subject) else subject
 
 
 def name_aliases(page: PageDialogue, translations: list[dict]) -> dict[str, str]:
@@ -375,6 +484,8 @@ class MangaStyleRewriter:
 
     def _preserve_honorific_name(self) -> None:
         if not (self.features.subject and self.features.honorific):
+            return
+        if is_invalid_honorific_carrier(self.features.subject):
             return
         romanized = {
             "先輩": "senpai",

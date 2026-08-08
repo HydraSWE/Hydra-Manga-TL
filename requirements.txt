@@ -2,13 +2,8 @@ paddleocr==3.7.0
 paddlepaddle==3.3.1
 paddlex[ocr-core]>=3.7,<3.8
 numpy>=1.26,<2
-# opencv-python>=4.11,<5
-# PaddleX OCR extras require the contrib OpenCV wheel; it still provides cv2.
 opencv-contrib-python==4.10.0.84
 Pillow>=11.0,<13
-# GPU PyTorch for Windows/Python 3.12. This project is expected to run on NVIDIA
-# CUDA, not the CPU wheel. Keep this index before the torch pin so fresh installs
-# resolve the verified CUDA build.
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch==2.11.0+cu128
 transformers>=4.49,<5
@@ -19,12 +14,5 @@ SudachiPy==0.6.11
 SudachiDict-small==20260428
 keyring>=25,<26
 pyinstaller>=6.11,<7
-# Optional title-background inpainting runtime: install requirements-inpaint.txt
-# into a separate environment and pass it to scripts/prototype_title_inpaint.py
-# with --iopaint-python.
-# CUDA-enabled llama-cpp-python wheels for local Qwen GPU offload.
-# If pip keeps an old CPU wheel, reinstall with --force-reinstall --no-cache-dir.
---extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu125
-nvidia-cuda-runtime-cu12==12.5.82
-nvidia-cublas-cu12==12.5.3.2
-llama-cpp-python>=0.3.34
+ninja>=1.13,<2
+llama-cpp-python==0.3.34

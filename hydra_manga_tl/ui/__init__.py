@@ -16,7 +16,7 @@ from hydra_manga_tl.ui.dialogs import (
     WorkingDialog,
 )
 from hydra_manga_tl.ui.filmstrip import ReorderableFilmstrip
-from hydra_manga_tl.ui.landing import DropZone, ImportProgressScreen, LandingScreen, RecentProjectCard, RecentProjectsScrollArea
+from hydra_manga_tl.ui.landing import DropZone, ImportProgressScreen, LandingScreen, RecentProjectCard, RecentProjectsDialog, RecentProjectsScrollArea
 from hydra_manga_tl.ui.main import MainWindow
 from hydra_manga_tl.ui.shared import (
     FILMSTRIP_CARD_SIZE,
@@ -27,6 +27,7 @@ from hydra_manga_tl.ui.shared import (
     _language_badge,
     _page_label,
     _relative_opened_label,
+    lucide_icon,
     _speaker_icon,
 )
 from hydra_manga_tl.ui.workspace import WorkspaceScreen
@@ -48,6 +49,7 @@ __all__ = [
     "QMessageBox",
     "PolygonVertexHandle",
     "RecentProjectCard",
+    "RecentProjectsDialog",
     "RecentProjectsScrollArea",
     "ReorderableFilmstrip",
     "SettingsDialog",
@@ -60,5 +62,6 @@ __all__ = [
     "_language_badge",
     "_page_label",
     "_relative_opened_label",
+    "lucide_icon",
     "_speaker_icon",
 ]

@@ -181,6 +181,7 @@ class OCRService:
         *,
         preferred_language: str,
         quality: str,
+        strict: bool = False,
         cache_path: Path | None = None,
     ) -> OCRServiceResult:
         started = time.perf_counter()
@@ -197,6 +198,7 @@ class OCRService:
                 "languages": self.languages,
                 "preferred_language": preferred_language,
                 "quality": quality,
+                "strict": strict,
             })
             result = OCRResult.from_dict(response["ocr_result"])
             final_regions = list(response["final_regions"])
@@ -205,7 +207,7 @@ class OCRService:
                 self._engine = get_ocr_engine_for_language(preferred_language, self.languages)
                 self._manager = SmartOCRManager(self._engine, get_ocr_engine)
             managed = self._manager.analyze_selection(
-                image_path, rect, preferred_language=preferred_language, quality=quality,
+                image_path, rect, preferred_language=preferred_language, quality=quality, strict=strict,
             )
             result, final_regions = managed.ocr_result, managed.final_regions
         if cache_path is not None:

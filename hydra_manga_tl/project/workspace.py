@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import shutil
@@ -34,12 +35,13 @@ from hydra_manga_tl.project.manual_region import (
 )
 from hydra_manga_tl.core.normalization import normalize_global_text
 from hydra_manga_tl.core.paths import PATHS
-from hydra_manga_tl.phase.pipeline import PipelineService
+from hydra_manga_tl.phase.pipeline import PipelineService, _completed_project_output
 from hydra_manga_tl.project.model import MangaProject, ManualRegion
 from hydra_manga_tl.phase.render_queue import RENDER_QUEUE, RenderQueue
 from hydra_manga_tl.core.region_types import normalize_region_type
 from hydra_manga_tl.core.settings import SETTINGS
 from hydra_manga_tl.core.state import APP_STATE
+from hydra_manga_tl.core.user_errors import pipeline_error, render_error
 from hydra_manga_tl.translation.requests import RenderRequest
 from hydra_manga_tl.translation.engines import PageDialogue, PageTranslation
 from hydra_manga_tl.translation.memory import (
@@ -49,6 +51,7 @@ from hydra_manga_tl.translation.memory import (
 )
 
 LOGGER = logging.getLogger(__name__)
+RECENT_PROJECT_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -59,7 +62,27 @@ class RecentProjectSummary:
     target_language: str
     page_count: int
     last_opened: str
-
+    thumbnail_path: Path | None = None
+    schema: str = "v1"
+    created_by: str = ""
+    last_saved_by: str = ""
+    minimum_app_version: str = "1.0.0"
+    compatibility_status: str = "compatible"
+    compatibility_message: str = ""
+    # Processing state derived from persisted ImageRecord.status values
+    state_label: str = ""
+    state_ready: int = 0
+    state_review: int = 0
+    state_failed: int = 0
+    state_queued: int = 0
+    state_display: str = ""
+    # Last successful export metadata (empty when never exported)
+    exported: bool = False
+    export_relative_time: str = ""
+    export_type: str = ""
+    export_count: int = 0
+    export_destination: str = ""
+    export_format: str = ""
 
 LANGUAGE_NAMES = {
     "en": "English",
@@ -72,9 +95,101 @@ LANGUAGE_NAMES = {
 }
 
 
-def _box_text_layout(box: list[int]) -> dict:
+_STATE_REVIEW = {"review"}
+_STATE_READY = {"done", "ready"}
+_STATE_FAILED = {"failed", "cancelled"}
+_STATE_QUEUED = {
+    "queued", "pending", "partial", "preprocessing", "analyzing",
+    "OCR", "ocr", "translating", "localizing", "rendering", "reconstructing",
+}
+
+
+def _derive_state_summary(images: list) -> dict:
+    """Derive processing state counts from raw image list read from project.json.
+
+    Returns a dict of kwargs suitable for RecentProjectSummary state fields.
+    No model deserialization is performed — only raw dicts are accepted.
+    """
+    ready = review = failed = queued = 0
+    for img in images:
+        if not isinstance(img, dict):
+            continue
+        status = str(img.get("status", "queued") or "queued")
+        if status in _STATE_READY:
+            ready += 1
+        elif status in _STATE_REVIEW:
+            review += 1
+        elif status in _STATE_FAILED:
+            failed += 1
+        else:
+            queued += 1
+    total = ready + review + failed + queued
+    if total == 0:
+        label, display = "Not Started", "Not Started"
+    elif failed > 0:
+        parts = [f"{failed} failed"]
+        if ready:
+            parts.append(f"{ready} ready")
+        label = "Failed"
+        display = "Failed \u2022 " + " \u2022 ".join(parts)
+    elif review > 0:
+        parts = [f"{review} review"]
+        if ready:
+            parts.append(f"{ready} ready")
+        label = "Needs Review"
+        display = "Needs Review \u2022 " + " \u2022 ".join(parts)
+    elif queued > 0 and ready > 0:
+        label = "Partial"
+        display = f"Partial \u2022 {ready} ready \u2022 {queued} pending"
+    elif queued > 0:
+        label, display = "Not Started", "Not Started"
+    else:
+        label = "Ready"
+        display = f"Ready \u2022 {ready} pages"
+    return {
+        "state_label": label,
+        "state_ready": ready,
+        "state_review": review,
+        "state_failed": failed,
+        "state_queued": queued,
+        "state_display": display,
+    }
+
+
+def _export_relative_time(iso_str: str) -> str:
+    """Convert an ISO-8601 UTC string to a compact human-readable relative display."""
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        now = datetime.now(timezone.utc)
+        delta = now - dt.astimezone(timezone.utc)
+        days = delta.days
+        if days < 0:
+            days = 0
+        if days == 0:
+            return "Today"
+        if days == 1:
+            return "Yesterday"
+        if days < 30:
+            return f"{days} days ago"
+        # Cross-platform month + day (avoids %-d / %#d platform differences)
+        return dt.strftime("%b").strip() + " " + str(dt.day)
+    except (ValueError, OverflowError, OSError):
+        return ""
+
+
+def _box_text_layout(box: list[int], angle: float | None = None) -> dict:
     x1, y1, x2, y2 = [int(value) for value in box]
-    return {"x": x1, "y": y1, "width": max(1, x2 - x1), "height": max(1, y2 - y1)}
+    layout = {
+        "x": x1,
+        "y": y1,
+        "width": max(1, x2 - x1),
+        "height": max(1, y2 - y1),
+    }
+    if angle is not None:
+        layout["angle"] = float(angle)
+    return layout
 
 
 def _polygon_box(polygon: list) -> list[int] | None:
@@ -199,7 +314,7 @@ class WorkspaceManager(QObject):
         APP_STATE.refresh_project()
         return added
 
-    def open_project(self, path: Path) -> MangaProject:
+    def open_project(self, path: Path, *, allow_migration: bool = False) -> MangaProject:
         project_file = path / "project.json" if path.is_dir() else path
         payload = json.loads(project_file.read_text(encoding="utf-8"))
         if "documents" in payload and "images" not in payload:
@@ -207,6 +322,9 @@ class WorkspaceManager(QObject):
         project = MangaProject.load(project_file)
         self._set_current(project)
         return project
+
+    def load_project(self, path: Path, *, allow_migration: bool = False) -> MangaProject:
+        return self.open_project(path, allow_migration=allow_migration)
 
     def import_phase2(self, folder: Path, legacy_payload: dict | None = None) -> MangaProject:
         files = sorted(folder.glob("*_translated_*.json"))
@@ -244,6 +362,9 @@ class WorkspaceManager(QObject):
         APP_STATE.set_dirty(False)
         self._remember(project.project_file)
         self.project_opened.emit(project)
+
+    def activate_project(self, project: MangaProject) -> None:
+        self._set_current(project)
 
     @staticmethod
     def _recover_interrupted_project(project: MangaProject) -> None:
@@ -371,6 +492,17 @@ class WorkspaceManager(QObject):
         next_index = next(
             index for index, image in enumerate(remaining) if image.id == next_id
         )
+        removed_sources = {
+            str(Path(image.source_path).resolve())
+            for image in removed
+        }
+        if self.current.recent_thumbnail:
+            try:
+                current_thumbnail = str(Path(self.current.recent_thumbnail).resolve())
+            except (OSError, RuntimeError):
+                current_thumbnail = self.current.recent_thumbnail
+            if current_thumbnail in removed_sources:
+                self.current.recent_thumbnail = ""
         self.current.images = remaining
         self.current.selected_image = next_index
         self.current.save()
@@ -379,25 +511,58 @@ class WorkspaceManager(QObject):
         APP_STATE.refresh_project()
         return len(removed)
 
+    def set_recent_thumbnail(self, image_id: str) -> Path:
+        """Use a project image as the landing/recent-project thumbnail."""
+        if self.current is None:
+            raise ValueError("No project is open.")
+        image = next((item for item in self.current.images if item.id == image_id), None)
+        if image is None:
+            raise ValueError("The selected page is not in the current project.")
+        thumbnail = Path(image.source_path)
+        if not thumbnail.is_file():
+            raise ValueError("The selected page image is missing from disk.")
+        return self.set_recent_thumbnail_path(thumbnail)
+
+    def set_recent_thumbnail_path(self, thumbnail_path: Path) -> Path:
+        """Use an explicit image path as the landing/recent-project thumbnail."""
+        if self.current is None:
+            raise ValueError("No project is open.")
+        thumbnail = Path(thumbnail_path)
+        if not thumbnail.is_file():
+            raise ValueError("The selected thumbnail image is missing from disk.")
+        self.current.recent_thumbnail = str(thumbnail.resolve())
+        self.current.save()
+        APP_STATE.set_dirty(False)
+        APP_STATE.refresh_project()
+        return thumbnail
+
     def start_pipeline(self, image_ids: set[str] | None = None, *, retranslate: bool = False) -> bool:
         if self.current is None:
             return False
-        eligible = {"pending", "queued", "partial", "failed", "cancelled"}
+        eligible = {"pending", "queued", "failed", "cancelled"}
         if retranslate and image_ids:
             for image in self.current.images:
-                if image.id in image_ids and image.status in {"ready", "review"}:
+                if image.id in image_ids:
                     image.status = "queued"
                     image.error = ""
             self.save()
-        self._active_job_ids = [
-            image.id for image in self.current.images
-            if image.status in eligible and (image_ids is None or image.id in image_ids)
-        ]
+        if retranslate and image_ids:
+            self._active_job_ids = [
+                image.id for image in self.current.images
+                if image.id in image_ids
+            ]
+        else:
+            self._active_job_ids = [
+                image.id for image in self.current.images
+                if image.status in eligible and (image_ids is None or image.id in image_ids)
+            ]
         if not self._active_job_ids:
             return False
         self._active_job_completed = 0
         if hasattr(self.pipeline, "set_request_type"):
             self.pipeline.set_request_type("batch" if image_ids is None else "selected")
+        if hasattr(self.pipeline, "set_force_retranslate"):
+            self.pipeline.set_force_retranslate(retranslate)
         started = self.pipeline.process_project(self.current, set(self._active_job_ids))
         if started:
             APP_STATE.set_busy(True)
@@ -439,6 +604,120 @@ class WorkspaceManager(QObject):
         self.save()
         self.image_updated.emit(image_index)
 
+    def update_edits_batch(self, image_index: int, edits_map: dict[int | str, RegionEdit]) -> None:
+        if self.current is None or not edits_map:
+            return
+        payload = self.effective_translation_payload(image_index)
+        groups_by_id = {str(item["index"]): item for item in payload.get("translation_groups", [])}
+        image = self.current.images[image_index]
+        for group_index, edit in edits_map.items():
+            group_key = str(group_index)
+            group = groups_by_id.get(group_key)
+            if group is not None:
+                self._capture_edit_corrections(image_index, group, edit)
+                self._learn_user_translation_edit(image_index, group, edit)
+            image.edits[group_key] = edit
+        APP_STATE.set_dirty(True)
+        self.save()
+        self.image_updated.emit(image_index)
+
+    def restore_edit(
+        self,
+        image_index: int,
+        group_index: int | str,
+        edit: RegionEdit | None,
+        *,
+        rerender: bool = True,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        if self.current is None or not (0 <= image_index < len(self.current.images)):
+            raise ValueError("No page is available for editor history.")
+        image = self.current.images[image_index]
+        group_key = str(group_index)
+        if edit is None:
+            image.edits.pop(group_key, None)
+        else:
+            image.edits[group_key] = RegionEdit(**asdict(edit))
+        self._update_image_review_status(image_index)
+        APP_STATE.set_dirty(True)
+        self.save()
+        if rerender:
+            self.rerender_image(image_index, log_callback=log_callback)
+        self.image_updated.emit(image_index)
+
+    def capture_editor_state(self, image_index: int) -> dict:
+        if self.current is None or not (0 <= image_index < len(self.current.images)):
+            raise ValueError("No page is available for editor history.")
+        image = self.current.images[image_index]
+        return {
+            "status": image.status,
+            "error": image.error,
+            "source_language": image.source_language,
+            "rendered_image": image.rendered_image,
+            "preview_image": image.preview_image,
+            "edits": {
+                str(key): asdict(edit)
+                for key, edit in image.edits.items()
+            },
+            "manual_regions": [
+                asdict(region)
+                for region in image.manual_regions
+            ],
+            "suppressed_auto_group_indices": list(image.suppressed_auto_group_indices),
+            "approved_ai_subject_ids": list(image.approved_ai_subject_ids),
+            "reading_order": list(image.reading_order),
+        }
+
+    def restore_editor_state(
+        self,
+        image_index: int,
+        state: dict,
+        *,
+        rerender: bool = True,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        if self.current is None or not (0 <= image_index < len(self.current.images)):
+            raise ValueError("No page is available for editor history.")
+        image = self.current.images[image_index]
+        image.status = str(state.get("status", image.status))
+        image.error = str(state.get("error", image.error))
+        image.source_language = str(state.get("source_language", image.source_language))
+        image.rendered_image = str(state.get("rendered_image", image.rendered_image))
+        image.preview_image = str(state.get("preview_image", image.preview_image))
+        image.edits = {
+            str(key): RegionEdit(**dict(value))
+            for key, value in dict(state.get("edits", {})).items()
+            if isinstance(value, dict)
+        }
+        image.manual_regions = [
+            ManualRegion(**dict(value))
+            for value in list(state.get("manual_regions", []))
+            if isinstance(value, dict)
+        ]
+        image.suppressed_auto_group_indices = [
+            int(value)
+            for value in state.get("suppressed_auto_group_indices", [])
+        ]
+        image.approved_ai_subject_ids = [
+            str(value)
+            for value in state.get("approved_ai_subject_ids", [])
+        ]
+        image.reading_order = [
+            str(value)
+            for value in state.get("reading_order", [])
+        ]
+        self._update_image_review_status(image_index)
+        APP_STATE.set_dirty(True)
+        self.save()
+        if rerender and (
+            image.translation_result
+            or image.manual_regions
+            or image.edits
+            or image.suppressed_auto_group_indices
+        ):
+            self.rerender_image(image_index, log_callback=log_callback)
+        self.image_updated.emit(image_index)
+
     def update_text_layout(self, image_index: int, group_index: int | str, layout: dict) -> None:
         if self.current is None:
             raise ValueError("No project is open.")
@@ -451,6 +730,7 @@ class WorkspaceManager(QObject):
             y = int(layout["y"])
             width = int(layout["width"])
             height = int(layout["height"])
+            angle = float(layout.get("angle", 0) or 0)
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("Text layout must include integer x, y, width, and height.") from error
         if width < 20 or height < 12:
@@ -464,6 +744,7 @@ class WorkspaceManager(QObject):
         edit.layout_y = y
         edit.layout_width = width
         edit.layout_height = height
+        edit.layout_angle = angle
         edit.font_size = 0
         image.edits[group_key] = edit
         try:
@@ -521,12 +802,15 @@ class WorkspaceManager(QObject):
         existing = group.get("text_layout")
         if isinstance(existing, dict):
             try:
-                return {
+                layout = {
                     "x": int(existing["x"]),
                     "y": int(existing["y"]),
                     "width": int(existing["width"]),
                     "height": int(existing["height"]),
                 }
+                if existing.get("angle") is not None:
+                    layout["angle"] = float(existing["angle"])
+                return layout
             except (KeyError, TypeError, ValueError):
                 pass
         if image_size is not None:
@@ -537,6 +821,28 @@ class WorkspaceManager(QObject):
                     return _box_text_layout(candidates[0][1])
             except (KeyError, TypeError, ValueError):
                 pass
+        if group.get("manual"):
+            polygon = group.get("polygon", [])
+            if len(polygon) == 4:
+                p0, p1, p2, p3 = polygon
+                dx = p1[0] - p0[0]
+                dy = p1[1] - p0[1]
+                angle = math.atan2(dy, dx) * 180.0 / math.pi
+                if angle > 90:
+                    angle -= 180
+                elif angle < -90:
+                    angle += 180
+                width = math.hypot(dx, dy)
+                height = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                center_x = sum(p[0] for p in polygon) / 4.0
+                center_y = sum(p[1] for p in polygon) / 4.0
+                return {
+                    "x": int(round(center_x - width / 2.0)),
+                    "y": int(round(center_y - height / 2.0)),
+                    "width": max(1, int(round(width))),
+                    "height": max(1, int(round(height))),
+                    "angle": float(round(angle, 2))
+                }
         for key in ("safe_area",):
             box = group.get(key)
             if isinstance(box, list) and len(box) == 4:
@@ -552,10 +858,13 @@ class WorkspaceManager(QObject):
     @staticmethod
     def _apply_edit_text_layout(group: dict, edit: RegionEdit) -> None:
         if all(value is not None for value in (edit.layout_x, edit.layout_y, edit.layout_width, edit.layout_height)):
-            group["text_layout"] = {
+            layout = {
                 "x": edit.layout_x, "y": edit.layout_y,
                 "width": edit.layout_width, "height": edit.layout_height,
             }
+            if edit.layout_angle is not None:
+                layout["angle"] = float(edit.layout_angle)
+            group["text_layout"] = layout
 
     def _ensure_text_layouts(self, payload: dict, image_size: tuple[int, int] | None = None) -> None:
         for group in payload.get("translation_groups", []):
@@ -594,7 +903,9 @@ class WorkspaceManager(QObject):
         ]
         for manual in image.manual_regions:
             x1, y1, x2, y2 = manual.rect
-            polygon = manual.polygon or rect_to_polygon(manual.rect)
+            polygon = manual.selection_polygon or manual.polygon or rect_to_polygon(manual.rect)
+            placement_polygon = manual.placement_polygon or polygon
+            cleanup_polygons = list(manual.cleanup_polygons) or list(manual.source_polygons) or [polygon]
             bubble_type = normalize_region_type(getattr(manual, "bubble_type", "dialogue") or "dialogue")
             render_direction = (
                 "vertical-rtl" if manual.direction == "vertical-rtl" and (x2 - x1) < 40 else "horizontal-ltr"
@@ -606,6 +917,13 @@ class WorkspaceManager(QObject):
                 "ocr_confidence": manual.ocr_confidence,
                 "manual_rect": [x1, y1, x2, y2],
                 "polygon": polygon,
+                "selection_polygon": polygon,
+                "cleanup_polygons": cleanup_polygons,
+                "placement_polygon": placement_polygon,
+                "decorative_symbols": [
+                    dict(symbol) for symbol in manual.decorative_symbols
+                ],
+                "preserved_marks": [dict(mark) for mark in manual.preserved_marks],
                 "status": manual.status, "review_reasons": list(manual.review_reasons),
                 "member_region_indices": [], "direction": manual.direction,
                 "source_direction": manual.direction,
@@ -626,9 +944,9 @@ class WorkspaceManager(QObject):
                     "title_composition": dict(manual.title_composition),
                     "title_reconstruction": reconstruction,
                 })
-                cleanup_polygons = reconstruction.get("cleanup_polygons") or reconstruction.get("mask_polygons")
-                if isinstance(cleanup_polygons, list) and cleanup_polygons:
-                    group["cleanup_polygons"] = cleanup_polygons
+                reconstruction_cleanup = reconstruction.get("cleanup_polygons") or reconstruction.get("mask_polygons")
+                if isinstance(reconstruction_cleanup, list) and reconstruction_cleanup:
+                    group["cleanup_polygons"] = reconstruction_cleanup
                 if manual.style_profile is not None:
                     group["style_profile"] = dict(manual.style_profile)
             payload["translation_groups"].append(group)
@@ -1004,6 +1322,11 @@ class WorkspaceManager(QObject):
                 "groq": SETTINGS.groq_model,
                 "gemini": SETTINGS.gemini_model,
                 "deepseek": SETTINGS.deepseek_model,
+                "openai": SETTINGS.openai_model,
+                "openai_compatible": SETTINGS.openai_compatible_model,
+            },
+            "provider_base_urls": {
+                "openai_compatible": SETTINGS.openai_compatible_base_url,
             },
             "ocr_cache_dir": str(self.paths.ocr_cache),
             "ocr_subprocess_enabled": SETTINGS.ocr_subprocess_enabled,
@@ -1071,6 +1394,11 @@ class WorkspaceManager(QObject):
                 "groq": SETTINGS.groq_model,
                 "gemini": SETTINGS.gemini_model,
                 "deepseek": SETTINGS.deepseek_model,
+                "openai": SETTINGS.openai_model,
+                "openai_compatible": SETTINGS.openai_compatible_model,
+            },
+            "provider_base_urls": {
+                "openai_compatible": SETTINGS.openai_compatible_base_url,
             },
             "ocr_cache_dir": str(self.paths.ocr_cache),
             "ocr_subprocess_enabled": SETTINGS.ocr_subprocess_enabled,
@@ -1596,26 +1924,86 @@ class WorkspaceManager(QObject):
 
     @staticmethod
     def _render_failure_message(error: BaseException) -> str:
-        if isinstance(error, MemoryError):
-            return (
-                "Could not rerender this page because the original image exceeded available memory. "
-                "Close other jobs or use a lower-resolution copy of this page."
-            )
-        return f"Could not rerender this page: {error}"
+        return render_error(error)
 
-    def export(self, destination: Path, *, mode: str = "translated", image_format: str = "png") -> int:
+    def export(
+        self,
+        destination: Path,
+        *,
+        mode: str = "translated",
+        image_format: str = "png",
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> int:
         if self.current is None:
             return 0
-        count = export_images(self.current, destination, mode=mode, image_format=image_format)
+        count = export_images(
+            self.current,
+            destination,
+            mode=mode,
+            image_format=image_format,
+            progress_callback=progress_callback,
+        )
         APP_STATE.set_export(str(destination.resolve()), count)
+        self.record_export(
+            export_type="folder",
+            path=destination,
+            count=count,
+            mode=mode,
+            image_format=image_format,
+        )
         return count
 
-    def export_archive(self, destination: Path, *, mode: str = "translated", image_format: str = "png", archive_format: str = "zip") -> Path | None:
+    def export_archive(
+        self,
+        destination: Path,
+        *,
+        mode: str = "translated",
+        image_format: str = "png",
+        archive_format: str = "zip",
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> Path | None:
         if self.current is None:
             return None
-        archive = export_archive(self.current, destination, mode=mode, image_format=image_format, archive_format=archive_format)
+        archive = export_archive(
+            self.current,
+            destination,
+            mode=mode,
+            image_format=image_format,
+            archive_format=archive_format,
+            progress_callback=progress_callback,
+        )
         APP_STATE.set_export(str(archive.resolve()), 1)
+        self.record_export(
+            export_type="archive",
+            path=archive,
+            count=len(self.current.images),
+            mode=mode,
+            image_format=archive_format,
+        )
         return archive
+
+    def record_export(
+        self,
+        *,
+        export_type: str,
+        path: Path,
+        count: int,
+        mode: str,
+        image_format: str,
+    ) -> None:
+        """Persist last-export metadata to the open project file.
+
+        Must be called only after a successful export. No-op if no project is open.
+        """
+        if self.current is None:
+            return
+        self.current.last_exported_at = datetime.now(timezone.utc).isoformat()
+        self.current.last_export_path = str(path.resolve())
+        self.current.last_export_type = export_type
+        self.current.last_export_count = count
+        self.current.last_export_mode = mode
+        self.current.last_export_format = image_format
+        self.save()
 
     def _recent_entries(self) -> list[tuple[Path, str]]:
         if not self.paths.recent.is_file():
@@ -1639,10 +2027,15 @@ class WorkspaceManager(QObject):
                 continue
             if path.is_file():
                 entries.append((path, last_opened))
-        return entries[:5]
+        return entries[:RECENT_PROJECT_LIMIT]
 
     def recent_projects(self) -> list[Path]:
         return [path for path, _ in self._recent_entries()]
+
+    def project_metadata(self, path: Path):
+        from hydra_manga_tl.project.compatibility import inspect_project
+        from hydra_manga_tl.project.model import PROJECT_VERSION
+        return inspect_project(path, current_schema=PROJECT_VERSION)
 
     def recent_project_summaries(self) -> list[RecentProjectSummary]:
         summaries: list[RecentProjectSummary] = []
@@ -1668,7 +2061,36 @@ class WorkspaceManager(QObject):
             target = payload.get("target_language", "en")
             target = target.strip() if isinstance(target, str) and target.strip() else "en"
             target = LANGUAGE_NAMES.get(target.casefold(), target.upper())
-            summaries.append(RecentProjectSummary(path, name, source, target, len(images), last_opened))
+            thumbnail_path = None
+            thumbnail_raw = payload.get("recent_thumbnail")
+            if isinstance(thumbnail_raw, str) and thumbnail_raw.strip():
+                candidate = Path(thumbnail_raw)
+                if candidate.is_file():
+                    thumbnail_path = candidate
+            summaries.append(
+                RecentProjectSummary(
+                    path=path,
+                    name=name,
+                    source_language=source,
+                    target_language=target,
+                    page_count=len(images),
+                    last_opened=last_opened,
+                    thumbnail_path=thumbnail_path,
+                    **_derive_state_summary(images),
+                    exported=bool(payload.get("last_exported_at")),
+                    export_relative_time=_export_relative_time(
+                        str(payload.get("last_exported_at") or "")
+                    ),
+                    export_type=str(payload.get("last_export_type") or ""),
+                    export_count=int(payload.get("last_export_count") or 0),
+                    export_destination=(
+                        Path(str(payload.get("last_export_path") or "")).name
+                        if payload.get("last_export_path")
+                        else ""
+                    ),
+                    export_format=str(payload.get("last_export_format") or ""),
+                )
+            )
         return summaries
 
     def forget_recent_project(self, project_file: Path) -> None:
@@ -1729,7 +2151,10 @@ class WorkspaceManager(QObject):
             if path.resolve() != project_file.resolve()
         )
         self.paths.recent.parent.mkdir(parents=True, exist_ok=True)
-        self.paths.recent.write_text(json.dumps(remembered[:5], indent=2), encoding="utf-8")
+        self.paths.recent.write_text(
+            json.dumps(remembered[:RECENT_PROJECT_LIMIT], indent=2),
+            encoding="utf-8",
+        )
 
     def _find_image(self, image_id: str):
         if self.current is None:
@@ -1760,7 +2185,7 @@ class WorkspaceManager(QObject):
                 self.rerender_image(index)
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 image.status = "review"
-                image.error = f"Automatic translation completed, but editor overrides could not be rendered: {error}"
+                image.error = render_error(error)
                 self.save()
         self.image_updated.emit(index)
         if image_id in self._active_job_ids:
@@ -1772,11 +2197,12 @@ class WorkspaceManager(QObject):
 
     def _on_image_failed(self, image_id: str, message: str) -> None:
         index, image = self._find_image(image_id)
+        user_message = pipeline_error(message)
         if image is not None:
             image.status = "failed"
-            image.error = message
+            image.error = user_message
             self.image_updated.emit(index)
-        APP_STATE.report_error(message)
+        APP_STATE.report_error(user_message)
         self.save()
         if image_id in self._active_job_ids:
             self._active_job_completed += 1
@@ -1788,8 +2214,25 @@ class WorkspaceManager(QObject):
 
     def _on_completed(self, cancelled: bool) -> None:
         if cancelled and self.current is not None:
+            cancellable = {
+                "preprocessing",
+                "OCR",
+                "ocr",
+                "translating",
+                "localizing",
+                "rendering",
+                "reconstructing",
+                "analyzing",
+            }
             for image in self.current.images:
-                if image.id in self._active_job_ids and image.status in {"pending", "queued", "partial", "preprocessing", "OCR", "ocr", "translating", "localizing", "rendering", "reconstructing", "analyzing", "review"}:
+                if image.id not in self._active_job_ids:
+                    continue
+                completed = _completed_project_output(self.current, image)
+                if completed is not None:
+                    for key, value in completed.items():
+                        setattr(image, key, value)
+                    continue
+                if image.status in cancellable:
                     image.status = "cancelled"
         APP_STATE.set_busy(False)
         total = len(self._active_job_ids)

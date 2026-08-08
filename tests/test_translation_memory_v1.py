@@ -441,6 +441,18 @@ class TranslationMemoryUiAndEditTests(unittest.TestCase):
                     "question",
                     return_value=QMessageBox.StandardButton.No,
                 ):
+                    self.assertGreaterEqual(dialog.localization.findData("openai"), 0)
+                    self.assertGreaterEqual(dialog.localization.findData("openai_compatible"), 0)
+                    self.assertGreaterEqual(dialog.localization.findData("qwen"), 0)
+                    self.assertGreaterEqual(dialog.translation_engine.findData("openai"), 0)
+                    self.assertGreaterEqual(dialog.translation_engine.findData("openai_compatible"), 0)
+                    self.assertGreaterEqual(dialog.translation_engine.findData("qwen"), 0)
+                    self.assertGreaterEqual(dialog.translation_fallback.findData("openai"), 0)
+                    self.assertGreaterEqual(dialog.translation_fallback.findData("openai_compatible"), 0)
+                    self.assertIn("openai", dialog.keys)
+                    self.assertIn("openai_compatible", dialog.keys)
+                    self.assertEqual(dialog.openai_compatible_base_url.text(), "https://agentrouter.org/v1")
+                    self.assertEqual(dialog.openai_compatible_model.text(), "moonshotai/kimi-k3-free")
                     dialog._clear_translation_memory()
                 self.assertEqual(memory.statistics().total_entries, 1)
                 with (

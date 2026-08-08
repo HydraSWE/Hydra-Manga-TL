@@ -16,6 +16,11 @@ class FittedText:
     font_size: int
     box: list[int]
     line_height: int
+    line_positions: list[list[int]] | None = None
+    constraint_strategy: str = "rectangular"
+    preserved_overlap_pixels: int = 0
+    preserved_content_aware: bool = False
+    fallback_reason: str = ""
 
 
 def _text_bbox(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, **kwargs) -> tuple[int, int, int, int]:
@@ -53,32 +58,57 @@ def balance_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeType
     if 1 < len(words) <= 20:
         best_layout = greedy_lines
         best_score = float("inf")
-        
-        target_lines = max_lines if max_lines > 0 else len(words)
-        
+
+        target_lines = min(len(words), max_lines if max_lines > 0 else len(words))
+        span_widths: dict[tuple[int, int], int] = {}
+        for start in range(len(words)):
+            for end in range(start + 1, len(words) + 1):
+                span_widths[(start, end)] = _text_width(
+                    draw,
+                    " ".join(words[start:end]),
+                    font,
+                    stroke_width=stroke_width,
+                )
+
         for line_count in range(1, target_lines + 1):
-            candidates: list[list[str]] = []
+            costs: dict[tuple[int, int], tuple[float, list[tuple[int, int]]]] = {
+                (0, 0): (0.0, [])
+            }
+            for used_lines in range(line_count):
+                for start in range(len(words)):
+                    state = costs.get((start, used_lines))
+                    if state is None:
+                        continue
+                    remaining_lines = line_count - used_lines - 1
+                    maximum_end = len(words) - remaining_lines
+                    for end in range(start + 1, maximum_end + 1):
+                        width = span_widths[(start, end)]
+                        if width > max_width:
+                            break
+                        raggedness = float((max_width - width) ** 2)
+                        if end == len(words):
+                            raggedness = 0.0
+                            if end - start == 1 and len(words) > 3:
+                                raggedness += 2500.0
+                        candidate_cost = state[0] + raggedness
+                        key = (end, used_lines + 1)
+                        previous = costs.get(key)
+                        if previous is None or candidate_cost < previous[0]:
+                            costs[key] = (
+                                candidate_cost,
+                                [*state[1], (start, end)],
+                            )
+            completed = costs.get((len(words), line_count))
+            if completed is None:
+                continue
+            candidate = [" ".join(words[start:end]) for start, end in completed[1]]
+            widths = [span_widths[span] for span in completed[1]]
+            score = max(widths) - min(widths)
+            if len(candidate[-1].split()) == 1 and len(words) > 3:
+                score += 50
+            if score < best_score:
+                best_layout, best_score = candidate, score
 
-            def split(start: int, remaining: int, current_lines: list[str]) -> None:
-                if remaining == 1:
-                    if start < len(words): 
-                        candidates.append(current_lines + [" ".join(words[start:])])
-                    return
-                for end in range(start + 1, len(words) - remaining + 2):
-                    split(end, remaining - 1, current_lines + [" ".join(words[start:end])])
-
-            split(0, line_count, [])
-            for candidate in candidates:
-                widths = [_text_width(draw, line, font, stroke_width=stroke_width) for line in candidate]
-                if widths and max(widths) <= max_width:
-                    score = max(widths) - min(widths) 
-                    # Penalize orphan words on the last line
-                    if len(candidate[-1].split()) == 1 and len(words) > 3:
-                        score += 50  
-                        
-                    if score < best_score:
-                        best_layout, best_score = candidate, score
-                        
         return best_layout if not max_lines or len(best_layout) <= max_lines else greedy_lines
         
     return greedy_lines if not max_lines or len(greedy_lines) <= max_lines else []
@@ -117,6 +147,312 @@ def fit_text(
         if max_width <= usable_width and total_height <= usable_height:
             return FittedText(lines, size, safe_box, line_height)
             
+    return None
+
+
+def has_preserved_content(group: dict) -> bool:
+    return bool(_preserve_polygons(group))
+
+
+def preserved_constraint_mask(
+    size: tuple[int, int],
+    group: dict,
+    box: list[int],
+    margin: int = 4,
+) -> np.ndarray:
+    width = max(1, int(box[2]) - int(box[0]))
+    height = max(1, int(box[3]) - int(box[1]))
+    mask = np.zeros((height, width), dtype=np.uint8)
+    allowed_polygon = (
+        group.get("placement_polygon")
+        or group.get("polygon")
+        or group.get("selection_polygon")
+        or []
+    )
+    if allowed_polygon:
+        allowed = np.zeros((height, width), dtype=np.uint8)
+        points = np.asarray(allowed_polygon, dtype=np.int32)
+        if points.ndim == 2 and points.shape[0] >= 3:
+            shifted = points.copy()
+            shifted[:, 0] = np.clip(shifted[:, 0] - int(box[0]), 0, width - 1)
+            shifted[:, 1] = np.clip(shifted[:, 1] - int(box[1]), 0, height - 1)
+            cv2.fillPoly(allowed, [shifted], 255)
+            mask[allowed == 0] = 255
+    image_width, image_height = size
+    for polygon in _preserve_polygons(group):
+        points = np.asarray(polygon, dtype=np.int32)
+        if points.ndim != 2 or points.shape[0] < 3:
+            continue
+        shifted = points.copy()
+        shifted[:, 0] = np.clip(shifted[:, 0] - int(box[0]), 0, width - 1)
+        shifted[:, 1] = np.clip(shifted[:, 1] - int(box[1]), 0, height - 1)
+        if (
+            int(points[:, 0].max()) < int(box[0])
+            or int(points[:, 0].min()) > int(box[2])
+            or int(points[:, 1].max()) < int(box[1])
+            or int(points[:, 1].min()) > int(box[3])
+        ):
+            continue
+        cv2.fillPoly(mask, [shifted], 255)
+    if margin > 0 and mask.any():
+        radius = max(1, int(margin))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (radius * 2 + 1, radius * 2 + 1),
+        )
+        mask = cv2.dilate(mask, kernel)
+    if image_width <= 0 or image_height <= 0:
+        return mask
+    return mask
+
+
+def _available_runs(blocked_columns: np.ndarray, left: int, right: int) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for x in range(left, right):
+        blocked = bool(blocked_columns[x])
+        if not blocked and start is None:
+            start = x
+        elif blocked and start is not None:
+            runs.append((start, x))
+            start = None
+    if start is not None:
+        runs.append((start, right))
+    return runs
+
+
+def _line_position_for_band(
+    mask: np.ndarray,
+    line_width: int,
+    line_y: int,
+    line_height: int,
+    usable_left: int,
+    usable_right: int,
+    preferred_center: float,
+) -> int | None:
+    y1 = max(0, int(line_y))
+    y2 = min(mask.shape[0], int(line_y + line_height))
+    if y2 <= y1:
+        return None
+    blocked_columns = mask[y1:y2, :].any(axis=0)
+    best_x: int | None = None
+    best_score = float("inf")
+    for run_left, run_right in _available_runs(blocked_columns, usable_left, usable_right):
+        if run_right - run_left < line_width:
+            continue
+        candidate = int(round(preferred_center - line_width / 2))
+        candidate = max(run_left, min(candidate, run_right - line_width))
+        score = abs((candidate + line_width / 2) - preferred_center)
+        if score < best_score:
+            best_score = score
+            best_x = candidate
+    return best_x
+
+
+def _distributed_line_positions(
+    mask: np.ndarray,
+    lines: list[str],
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.FreeTypeFont,
+    *,
+    stroke_width: int,
+    line_height: int,
+    usable_left: int,
+    usable_top: int,
+    usable_right: int,
+    usable_bottom: int,
+    preferred_center: float,
+) -> list[list[int]] | None:
+    if not lines:
+        return []
+    min_gap = max(1, line_height // 4)
+    usable_height = max(1, usable_bottom - usable_top)
+    if len(lines) == 1:
+        preferred_y = [usable_top + max(0, (usable_height - line_height) // 2)]
+    else:
+        span = max(0, usable_height - line_height)
+        preferred_y = [
+            int(round(usable_top + span * (index / max(1, len(lines) - 1))))
+            for index in range(len(lines))
+        ]
+
+    positions: list[list[int]] = []
+    next_min_y = usable_top
+    for index, line in enumerate(lines):
+        remaining = len(lines) - index - 1
+        max_y = usable_bottom - line_height - remaining * (line_height + min_gap)
+        if max_y < next_min_y:
+            return None
+        candidates = list(range(next_min_y, max_y + 1))
+        candidates.sort(key=lambda value: abs(value - preferred_y[index]))
+        bounds = _text_bbox(draw, line, font, stroke_width=stroke_width)
+        line_width = bounds[2] - bounds[0]
+        selected: tuple[int, int] | None = None
+        for line_y in candidates:
+            line_left = _line_position_for_band(
+                mask,
+                line_width,
+                line_y,
+                line_height,
+                usable_left,
+                usable_right,
+                preferred_center,
+            )
+            if line_left is None:
+                continue
+            selected = (line_left, line_y)
+            break
+        if selected is None:
+            return None
+        line_left, line_y = selected
+        positions.append([int(line_left - bounds[0]), int(line_y)])
+        next_min_y = int(line_y + line_height + min_gap)
+    return positions
+
+
+def _compact_line_positions(
+    mask: np.ndarray,
+    lines: list[str],
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.FreeTypeFont,
+    *,
+    stroke_width: int,
+    line_height: int,
+    usable_left: int,
+    usable_top: int,
+    usable_right: int,
+    usable_bottom: int,
+    preferred_center: float,
+) -> list[list[int]] | None:
+    total_height = line_height * len(lines)
+    if total_height > usable_bottom - usable_top:
+        return None
+    center_y = usable_top + max(0, ((usable_bottom - usable_top) - total_height) // 2)
+    max_y = usable_bottom - total_height
+    y_candidates = list(range(usable_top, max_y + 1))
+    y_candidates.sort(key=lambda value: abs(value - center_y))
+
+    for y_start in y_candidates:
+        positions: list[list[int]] = []
+        valid = True
+        for line_index, line in enumerate(lines):
+            bounds = _text_bbox(draw, line, font, stroke_width=stroke_width)
+            line_width = bounds[2] - bounds[0]
+            line_y = y_start + line_index * line_height
+            line_left = _line_position_for_band(
+                mask,
+                line_width,
+                line_y,
+                line_height,
+                usable_left,
+                usable_right,
+                preferred_center,
+            )
+            if line_left is None:
+                valid = False
+                break
+            positions.append([int(line_left - bounds[0]), int(line_y)])
+        if valid:
+            return positions
+    return None
+
+
+def fit_text_avoiding_preserved(
+    text: str,
+    safe_box: list[int],
+    font_path: Path,
+    group: dict,
+    image_size: tuple[int, int],
+    maximum: int = 72,
+    minimum: int = 5,
+    max_lines: int = 0,
+) -> FittedText | None:
+    width, height = safe_box[2] - safe_box[0], safe_box[3] - safe_box[1]
+    if width < minimum or height < minimum or not has_preserved_content(group):
+        return None
+
+    padding = int(min(width, height) * 0.15)
+    usable_left = padding
+    usable_top = padding
+    usable_right = width - padding
+    usable_bottom = height - padding
+    usable_width = usable_right - usable_left
+    usable_height = usable_bottom - usable_top
+    if usable_width < minimum or usable_height < minimum:
+        return None
+
+    canvas = Image.new("L", (max(1, width), max(1, height)))
+    draw = ImageDraw.Draw(canvas)
+    preferred_center = width / 2.0
+
+    for size in range(maximum, minimum - 1, -1):
+        font = ImageFont.truetype(str(font_path), size)
+        stroke_width = max(1, size // 10)
+        lines = balance_lines(
+            draw,
+            text,
+            font,
+            usable_width,
+            max_lines,
+            stroke_width=stroke_width,
+        )
+        if not lines:
+            continue
+
+        sample = _text_bbox(draw, "Ag", font, stroke_width=stroke_width)
+        line_height = max(1, sample[3] - sample[1] + max(1, size // 5))
+        total_height = line_height * len(lines)
+        if total_height > usable_height:
+            continue
+
+        margin = max(3, size // 5)
+        mask = preserved_constraint_mask(image_size, group, safe_box, margin=margin)
+        for strategy, positions in (
+            (
+                "preserved_content_distributed",
+                _distributed_line_positions(
+                    mask,
+                    lines,
+                    draw,
+                    font,
+                    stroke_width=stroke_width,
+                    line_height=line_height,
+                    usable_left=usable_left,
+                    usable_top=usable_top,
+                    usable_right=usable_right,
+                    usable_bottom=usable_bottom,
+                    preferred_center=preferred_center,
+                ),
+            ),
+            (
+                "preserved_content_aware",
+                _compact_line_positions(
+                    mask,
+                    lines,
+                    draw,
+                    font,
+                    stroke_width=stroke_width,
+                    line_height=line_height,
+                    usable_left=usable_left,
+                    usable_top=usable_top,
+                    usable_right=usable_right,
+                    usable_bottom=usable_bottom,
+                    preferred_center=preferred_center,
+                ),
+            ),
+        ):
+            if positions is not None:
+                return FittedText(
+                    lines,
+                    size,
+                    safe_box,
+                    line_height,
+                    line_positions=positions,
+                    constraint_strategy=strategy,
+                    preserved_overlap_pixels=0,
+                    preserved_content_aware=True,
+                )
+
     return None
 
 
@@ -315,17 +651,61 @@ def detect_bubble_box(image: Image.Image, polygon: list[list[int]], padding: int
         
     return [left, top, right, bottom]
 
+def _preserve_polygons(group: dict) -> list[list[list[int]]]:
+    polygons: list[list[list[int]]] = []
+    for polygon in group.get("preserve_polygons", []) or []:
+        if polygon:
+            polygons.append(polygon)
+    for mark in group.get("preserved_marks", []) or []:
+        if isinstance(mark, dict) and mark.get("preserve_policy", "preserve_original") == "preserve_original":
+            polygon = mark.get("polygon")
+            if polygon:
+                polygons.append(polygon)
+    return polygons
+
+
+def _cleanup_clip_polygon(group: dict) -> list[list[int]]:
+    return (
+        group.get("cleanup_clip_polygon")
+        or group.get("selection_polygon")
+        or group.get("polygon")
+        or []
+    )
+
+
+def _fill_polygons(mask: np.ndarray, polygons: list) -> None:
+    for polygon in polygons or []:
+        points = np.asarray(polygon, dtype=np.int32)
+        if points.ndim != 2 or points.shape[0] < 3:
+            continue
+        cv2.fillPoly(mask, [points], 255)
+
+
 def make_mask(size: tuple[int, int], groups: list[dict], dilation: int = 2) -> np.ndarray:
     width, height = size
     mask = np.zeros((height, width), dtype=np.uint8)
     for group in groups:
-        polygons = group.get("mask_polygons") or group.get("cleanup_polygons") or group["source_polygons"]
-        for polygon in polygons:
-            points = np.asarray(polygon, dtype=np.int32)
-            cv2.fillPoly(mask, [points], 255)
-    if dilation:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation * 2 + 1, dilation * 2 + 1))
-        mask = cv2.dilate(mask, kernel)
+        group_mask = np.zeros((height, width), dtype=np.uint8)
+        preserve_mask = np.zeros((height, width), dtype=np.uint8)
+        polygons = (
+            group.get("cleanup_polygons")
+            or group.get("mask_polygons")
+            or group.get("source_polygons")
+            or []
+        )
+        _fill_polygons(group_mask, polygons)
+        _fill_polygons(preserve_mask, _preserve_polygons(group))
+        if dilation:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation * 2 + 1, dilation * 2 + 1))
+            group_mask = cv2.dilate(group_mask, kernel)
+            preserve_mask = cv2.dilate(preserve_mask, kernel)
+        clip_polygon = _cleanup_clip_polygon(group)
+        if clip_polygon:
+            clip_mask = np.zeros((height, width), dtype=np.uint8)
+            _fill_polygons(clip_mask, [clip_polygon])
+            group_mask[clip_mask == 0] = 0
+        group_mask[preserve_mask > 0] = 0
+        mask = np.maximum(mask, group_mask)
     return mask
 
 
@@ -357,6 +737,7 @@ def render_group(
     color: str | None = None,
     alignment: str = "center",
     direction: str = "horizontal-ltr",
+    angle: float = 0.0,
 ) -> dict:
     font = ImageFont.truetype(str(font_path), fitted.font_size)
     x1, y1, x2, y2 = fitted.box
@@ -371,29 +752,60 @@ def render_group(
     total_height = fitted.line_height * len(fitted.lines)
     layer = Image.new("RGBA", (max(1, x2 - x1), max(1, y2 - y1)), (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
-    
+
+    explicit_positions = fitted.line_positions or []
     y = max(0, int((y2 - y1 - total_height) / 2))
     positions = []
-    for line in fitted.lines:
+    for index, line in enumerate(fitted.lines):
         bounds = _text_bbox(draw, line, font, stroke_width=stroke_width)
         line_width = bounds[2] - bounds[0]
-        if alignment == "left":
+        if index < len(explicit_positions):
+            x = int(explicit_positions[index][0])
+            y_for_line = int(explicit_positions[index][1])
+        elif alignment == "left":
             x = -bounds[0]
+            y_for_line = y
         elif alignment == "right":
             x = (x2 - x1) - line_width - bounds[0]
+            y_for_line = y
         else:
             x = max(0, (x2 - x1 - line_width) // 2) - bounds[0]
-        draw.text((x, y), line, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
-        positions.append([x1 + x, y1 + y])
+            y_for_line = y
+        draw.text((x, y_for_line), line, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
+        positions.append([x1 + x, y1 + y_for_line])
         y += fitted.line_height
         
-    if image.mode != "RGBA":
-        base = image.convert("RGBA")
-        base.alpha_composite(layer, (x1, y1))
-        image.paste(base.convert(image.mode))
+    if angle and abs(angle) > 0.01:
+        rotated = layer.rotate(-angle, expand=True, resample=Image.Resampling.BICUBIC)
+        center_x = x1 + (x2 - x1) / 2
+        center_y = y1 + (y2 - y1) / 2
+        paste_x = int(round(center_x - rotated.width / 2))
+        paste_y = int(round(center_y - rotated.height / 2))
+        if image.mode != "RGBA":
+            base = image.convert("RGBA")
+            base.alpha_composite(rotated, (paste_x, paste_y))
+            image.paste(base.convert(image.mode))
+        else:
+            image.alpha_composite(rotated, (paste_x, paste_y))
     else:
-        image.alpha_composite(layer, (x1, y1))
-    return {"text": text, "lines": fitted.lines, "font_size": fitted.font_size, "box": fitted.box, "positions": positions}
+        if image.mode != "RGBA":
+            base = image.convert("RGBA")
+            base.alpha_composite(layer, (x1, y1))
+            image.paste(base.convert(image.mode))
+        else:
+            image.alpha_composite(layer, (x1, y1))
+    return {
+        "text": text,
+        "lines": fitted.lines,
+        "font_size": fitted.font_size,
+        "box": fitted.box,
+        "positions": positions,
+        "preserved_content_aware": bool(fitted.preserved_content_aware),
+        "preserved_overlap_pixels": int(fitted.preserved_overlap_pixels),
+        "constraint_strategy": fitted.constraint_strategy,
+        "preserved_overlap_fallback": fitted.fallback_reason == "preserved_overlap_fallback",
+        "constraint_fallback_reason": fitted.fallback_reason,
+    }
 
 def expanded_box(polygon: list[list[int]], image_size: tuple[int, int]) -> list[int]:
     xs, ys = [point[0] for point in polygon], [point[1] for point in polygon]

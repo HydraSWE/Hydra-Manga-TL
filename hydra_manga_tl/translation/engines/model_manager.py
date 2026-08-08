@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from pathlib import Path
@@ -17,6 +18,8 @@ from hydra_manga_tl.translation.memory import (
 from .base import PageDialogue, PageTranslation, TranslationEngine
 from .registry import TRANSLATION_PROVIDER_REGISTRY
 
+
+LOGGER = logging.getLogger(__name__)
 
 
 class TranslationValidationError(RuntimeError):
@@ -75,6 +78,46 @@ KNOWN_MODEL_PACKAGES = {
 }
 
 
+def scan_local_qwen_models() -> list[ModelPackage]:
+    """Scan candidate model folders for local .gguf files."""
+    candidates = [
+        Path.cwd() / "models",
+        Path.cwd() / "models" / "qwen",
+        Path(__file__).resolve().parents[3] / "models",
+        Path(__file__).resolve().parents[3] / "models" / "qwen",
+    ]
+    seen_paths: set[Path] = set()
+    packages: list[ModelPackage] = []
+
+    for folder in candidates:
+        if not folder.is_dir():
+            continue
+        for file in folder.glob("*.gguf"):
+            resolved = file.resolve()
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            try:
+                size_gb = round(resolved.stat().st_size / (1024 ** 3), 2)
+            except OSError:
+                size_gb = 0.0
+            key = f"local:{resolved.name}"
+            label = f"Local: {resolved.name} ({size_gb:.1f} GB)"
+            packages.append(
+                ModelPackage(
+                    key=key,
+                    label=label,
+                    description=f"Local GGUF model found at {resolved}",
+                    filename=str(resolved),
+                    estimated_size_gb=size_gb,
+                    quantization="Local",
+                    recommended_for="Local File",
+                )
+            )
+    return packages
+
+
+
 @dataclass
 class EngineSelection:
     literal_engine_id: str
@@ -98,6 +141,7 @@ class TranslationEngineManager:
         fallback_engine: str | None = "marian",
         qwen_model_name: str = "Qwen3-4B-Instruct-2507",
         provider_models: dict[str, str] | None = None,
+        provider_base_urls: dict[str, str] | None = None,
         translation_memory: TranslationMemory | None = None,
         translation_memory_enabled: bool = True,
         translation_memory_prefer_verified: bool = True,
@@ -121,6 +165,7 @@ class TranslationEngineManager:
         ):
             self.fallback_engine = None
         self.provider_models = provider_models or {}
+        self.provider_base_urls = provider_base_urls or {}
         self.translation_memory = translation_memory or TRANSLATION_MEMORY
         self.translation_memory_enabled = bool(translation_memory_enabled)
         self.translation_memory_prefer_verified = bool(
@@ -151,6 +196,8 @@ class TranslationEngineManager:
             kwargs = dict(self._engine_kwargs)
             if key in self.provider_models:
                 kwargs["model"] = self.provider_models[key]
+            if key in self.provider_base_urls:
+                kwargs["base_url"] = self.provider_base_urls[key]
             if key == "qwen":
                 kwargs["model_path"] = self._resolved_qwen_model_path
             engine = registration.factory(**kwargs)
@@ -165,15 +212,18 @@ class TranslationEngineManager:
     def marian(self) -> TranslationEngine:
         return self._engine("marian")
 
-    def load(self) -> None:
+    def load(self) -> bool:
         selected = self._selected_engine_key()
         registration = TRANSLATION_PROVIDER_REGISTRY[selected]
         engine = self._engine(selected)
-        if not registration.cloud:
-            try:
-                engine.load()
-            except Exception:
-                self._failed_engines.add(selected)
+        if registration.cloud:
+            return True
+        try:
+            engine.load()
+            return True
+        except Exception:
+            self._failed_engines.add(selected)
+            return False
 
     def unload(self) -> None:
         for engine in tuple(self.engines.values()):
@@ -201,11 +251,69 @@ class TranslationEngineManager:
             if not text:
                 raise TranslationValidationError("empty translation for id")
 
+    @staticmethod
+    def _is_single_manual_selection(page: PageDialogue) -> bool:
+        if len(page.dialogue) != 1:
+            return False
+        entry_id = str(page.dialogue[0].get("id", "")).strip()
+        if not entry_id.startswith("manual:"):
+            return False
+        context = str(page.page_context or "")
+        return "Manual user-selected text box" in context
+
+    @classmethod
+    def _coerce_single_manual_translation(
+        cls,
+        page: PageDialogue,
+        result: PageTranslation,
+        *,
+        engine_id: str,
+    ) -> PageTranslation:
+        if not cls._is_single_manual_selection(page):
+            return result
+        expected_id = str(page.dialogue[0].get("id", "")).strip()
+        if (
+            len(result.translations) == 1
+            and str(result.translations[0].get("id", "")).strip() == expected_id
+        ):
+            return result
+        usable = [
+            dict(item)
+            for item in result.translations
+            if isinstance(item, dict) and str(item.get("text", "")).strip()
+        ]
+        if not usable:
+            return result
+        selected = usable[0]
+        LOGGER.info(
+            "Manual translation returned non-matching ids; using first usable text "
+            "expected_id=%s returned_ids=%s returned_count=%d provider=%s",
+            expected_id,
+            [str(item.get("id", "")) for item in result.translations if isinstance(item, dict)],
+            len(result.translations),
+            engine_id,
+        )
+        recovered = {
+            **selected,
+            "id": expected_id,
+            "text": str(selected.get("text", "")).strip(),
+        }
+        return PageTranslation(
+            source_language=result.source_language,
+            target_language=result.target_language,
+            translations=[recovered],
+        )
+
     def get_model_package(self, model_name: str | None = None) -> ModelPackage | None:
         if model_name is None:
             model_name = str(getattr(self.qwen, "model_name", "")).lower().replace("-", "")
         key = next((name for name in KNOWN_MODEL_PACKAGES if name in model_name.lower()), None)
-        return KNOWN_MODEL_PACKAGES.get(key) if key else None
+        if key:
+            return KNOWN_MODEL_PACKAGES.get(key)
+        for pkg in scan_local_qwen_models():
+            if pkg.key == model_name or pkg.filename == model_name or Path(pkg.filename).name == model_name:
+                return pkg
+        return None
 
     def translate_page(self, page: PageDialogue) -> PageTranslation:
         selected = self._selected_engine_key()
@@ -359,6 +467,11 @@ class TranslationEngineManager:
             )
             result = engine.translate_page(missing_page)
             result = normalize_page_translation(missing_page, result)
+            result = self._coerce_single_manual_translation(
+                missing_page,
+                result,
+                engine_id=engine_id,
+            )
             self._validate_page_translation(missing_page, result)
             source_by_id = {str(item.get("id", "")): str(item.get("text", "")).strip() for item in missing_page.dialogue}
             for translated in result.translations:

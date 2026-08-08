@@ -157,6 +157,22 @@ def _sanitized_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _hidden_subprocess_kwargs() -> dict:
+    if sys.platform != "win32":
+        return {}
+    kwargs = {}
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creation_flags:
+        kwargs["creationflags"] = creation_flags
+    startupinfo_type = getattr(subprocess, "STARTUPINFO", None)
+    if startupinfo_type is not None:
+        startupinfo = startupinfo_type()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
 def run_lama_inpaint(
     image_path: Path,
     mask_path: Path,
@@ -174,7 +190,16 @@ def run_lama_inpaint(
     env = _sanitized_subprocess_env()
     env["PYTHONIOENCODING"] = "utf-8"
     try:
-        completed = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", env=env)
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            **_hidden_subprocess_kwargs(),
+        )
     except FileNotFoundError as exc:
         raise InpaintRuntimeUnavailable(f"LaMa inpaint runtime is unavailable: {executable}") from exc
     candidates = sorted(output_dir.glob("*.png"))

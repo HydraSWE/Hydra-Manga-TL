@@ -415,48 +415,90 @@ class PaddleOCREngine:
 
     def analyze_selection(
         self, image_path: Path, rect: list[int], *, preferred_language: str | None = None,
-        add_context: bool = False, rtl_context: bool = False,
+        add_context: bool = False, rtl_context: bool = False, strict: bool = False,
     ) -> OCRResult:
-        """Run one deterministic focused pass on a 2x color crop.
-
-        Uncertain output is routed to Review instead of multiplying a region
-        into color, grayscale, and original native Paddle predictions.
-        """
+        """Run deterministic focused pass with background margin padding and spatial filtering."""
         with Image.open(image_path) as opened:
             image = opened.convert("RGB")
         x1, y1, x2, y2 = [int(value) for value in rect]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(image.width, x2), min(image.height, y2)
-        if add_context:
-            width, height = max(1, x2 - x1), max(1, y2 - y1)
+
+        orig_x1, orig_y1, orig_x2, orig_y2 = x1, y1, x2, y2
+        width, height = max(1, x2 - x1), max(1, y2 - y1)
+
+        if strict:
+            pad_x = 12
+            pad_y = 12
+            x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+            x2, y2 = min(image.width, x2 + pad_x), min(image.height, y2 + pad_y)
+        elif add_context:
             left_pad = max(12, width)
             right_pad = max(6, width // 4) if rtl_context else left_pad
             top_pad = max(4, height // 8) if height < 50 else 8
             bottom_pad = max(8, round(height * 1.25)) if height < 50 else 8
             x1, y1 = max(0, x1 - left_pad), max(0, y1 - top_pad)
             x2, y2 = min(image.width, x2 + right_pad), min(image.height, y2 + bottom_pad)
+        else:
+            pad_x = max(28, int(width * 0.28))
+            pad_y = max(28, int(height * 0.28))
+            x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+            x2, y2 = min(image.width, x2 + pad_x), min(image.height, y2 + pad_y)
+
         crop = image.crop((x1, y1, x2, y2))
         languages = [preferred_language] if preferred_language in self._languages else self._languages
+        model_language = languages[0]
+
         with tempfile.TemporaryDirectory(prefix="hydra-ocr-retry-") as temporary:
             folder = Path(temporary)
             color_2x = crop.resize((crop.width * 2, crop.height * 2), Image.Resampling.LANCZOS)
             variant_path = folder / "color2.png"
             color_2x.save(variant_path)
-            model_language = languages[0]
             predictions = list(self._engine(model_language).predict(str(variant_path)))
             raw_regions = self._regions(predictions[0].json) if predictions else []
             regions = self._remap_regions(raw_regions, 2, (x1, y1))
-        combined_text = "\n".join(region.text for region in regions)
+
+            if not regions and crop.width >= 10 and crop.height >= 10:
+                gray_crop = ImageOps.autocontrast(ImageOps.grayscale(crop))
+                gray_2x = gray_crop.convert("RGB").resize((crop.width * 2, crop.height * 2), Image.Resampling.LANCZOS)
+                variant_path2 = folder / "gray2.png"
+                gray_2x.save(variant_path2)
+                predictions2 = list(self._engine(model_language).predict(str(variant_path2)))
+                raw_regions2 = self._regions(predictions2[0].json) if predictions2 else []
+                regions = self._remap_regions(raw_regions2, 2, (x1, y1))
+
+        if strict:
+            tol_x = 0
+            tol_y = 0
+        else:
+            tol_x = max(10, int((orig_x2 - orig_x1) * 0.25))
+            tol_y = max(10, int((orig_y2 - orig_y1) * 0.25))
+        min_x, max_x = orig_x1 - tol_x, orig_x2 + tol_x
+        min_y, max_y = orig_y1 - tol_y, orig_y2 + tol_y
+
+        filtered_regions: list[TextRegion] = []
+        for region in regions:
+            r_xs = [pt[0] for pt in region.polygon]
+            r_ys = [pt[1] for pt in region.polygon]
+            cx = (min(r_xs) + max(r_xs)) / 2.0
+            cy = (min(r_ys) + max(r_ys)) / 2.0
+            if min_x <= cx <= max_x and min_y <= cy <= max_y:
+                filtered_regions.append(region)
+
+        final_regions = filtered_regions if filtered_regions else regions
+
+        combined_text = "\n".join(region.text for region in final_regions)
         evidence = detect_language(combined_text)
-        average = sum(region.confidence for region in regions) / len(regions) if regions else 0.0
+        average = sum(region.confidence for region in final_regions) / len(final_regions) if final_regions else 0.0
         return OCRResult(
             source=str(image_path.resolve()), model_language=model_language,
             language=evidence.language, language_confidence=evidence.confidence,
-            average_ocr_confidence=average, regions=regions, language_scripts=evidence.scripts,
+            average_ocr_confidence=average, regions=final_regions, language_scripts=evidence.scripts,
             metadata={
-                "selection_rect": [x1, y1, x2, y2],
+                "selection_rect": [orig_x1, orig_y1, orig_x2, orig_y2],
+                "padded_rect": [x1, y1, x2, y2],
                 "selection_scale": 2,
-                "selection_variant": "color2",
+                "selection_variant": "color2_padded_v2",
                 "prediction_count": 1,
             },
         )

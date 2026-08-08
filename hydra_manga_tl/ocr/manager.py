@@ -21,6 +21,113 @@ class OCRRetryReason(StrEnum):
     SHORT_VERTICAL_TEXT = "short_vertical_text"
     WRONG_SCRIPT = "wrong_script"
     TINY_TEXT = "tiny_text"
+    OVERLAPPING_BOX = "overlapping_box"
+
+
+@dataclass(frozen=True)
+class OCRAttempt:
+    region_id: str
+    reason: str
+    rect: list[int]
+    preferred_language: str
+    engine_variant: str
+    text: str
+    confidence: float
+    scripts: dict[str, int]
+    accepted: bool
+    score_delta: float
+    runtime_seconds: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ManagedOCRResult:
+    ocr_result: OCRResult
+    final_regions: list[dict[str, Any]]
+    page_language: dict[str, Any]
+    region_languages: list[dict[str, Any]]
+    attempts: list[OCRAttempt] = field(default_factory=list)
+    retry_summary: dict[str, Any] = field(default_factory=dict)
+    review_queue: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "page_language": self.page_language,
+            "region_languages": self.region_languages,
+            "attempts": [attempt.to_dict() for attempt in self.attempts],
+            "retry_summary": self.retry_summary,
+            "review_queue": self.review_queue,
+        }
+
+
+EngineFactory = Callable[[tuple[str, ...]], Any]
+
+
+def _box_from_polygon(polygon: list[list[int]]) -> tuple[int, int, int, int]:
+    xs = [int(point[0]) for point in polygon]
+    ys = [int(point[1]) for point in polygon]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _polygon_overlap(first: list[list[int]], second: list[list[int]]) -> float:
+    ax1, ay1, ax2, ay2 = _box_from_polygon(first)
+    bx1, by1, bx2, by2 = _box_from_polygon(second)
+    intersection = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
+    first_area = max(1, (ax2 - ax1) * (ay2 - ay1))
+    second_area = max(1, (bx2 - bx1) * (by2 - by1))
+    return intersection / min(first_area, second_area)
+
+
+def _language_dict(evidence: LanguageEvidence) -> dict[str, Any]:
+    return {
+        "language": evidence.language,
+        "confidence": evidence.confidence,
+        "scripts": evidence.scripts,
+    }
+
+
+class SmartOCRManager:
+    """Own OCR retry policy while keeping PaddleOCR as the low-level adapter."""
+
+    def __init__(self, ocr_engine: Any, engine_factory: EngineFactory | None = None) -> None:
+        self.ocr_engine = ocr_engine
+        self.engine_factory = engine_factory
+
+    def analyze_page(
+        self,
+        image_path: Path,
+        *,
+        preferred_language: str | None = None,
+        quality: str = "Balanced",
+        auto_language_fallback: bool = False,
+    ) -> ManagedOCRResult:
+        retry_budget = self.retry_budget_for_quality(quality)
+        engine = self.ocr_engine
+        ocr_result = engine.analyze(image_path, preferred_language)
+        attempts: list[OCRAttempt] = []
+
+        if (
+            quality == "Maximum"
+            and retry_budget > 0
+            and auto_language_fallback
+            and preferred_language
+            and self.engine_factory
+            and self._needs_auto_fallback(ocr_result)
+        ):
+            attempt_started = time.perf_counter()
+            fallback = self.engine_factory(("japan", "ch", "en"))
+            fallback_result = fallback.analyze(image_path)
+            accepted = self._page_score(fallback_result) > self._page_score(ocr_result) + 0.02
+            attempts.append(self._page_attempt(
+                OCRRetryReason.WRONG_SCRIPT,
+                preferred_language,
+                fallback_result,
+                accepted,
+                self._page_score(fallback_result) - self._page_score(ocr_result),
+                time.perf_counter() - attempt_started,
+            ))
 
 
 @dataclass(frozen=True)
@@ -150,8 +257,11 @@ class SmartOCRManager:
         *,
         preferred_language: str | None = None,
         quality: str = "Balanced",
+        strict: bool = False,
     ) -> ManagedOCRResult:
-        ocr_result = self.ocr_engine.analyze_selection(image_path, rect, preferred_language=preferred_language)
+        ocr_result = self.ocr_engine.analyze_selection(
+            image_path, rect, preferred_language=preferred_language, strict=strict,
+        )
         final_regions = self._normalized_regions(ocr_result)
         attempts: list[OCRAttempt] = []
         # The user-drawn box is already a focused OCR request. Never turn it
@@ -165,6 +275,7 @@ class SmartOCRManager:
         combined_text = "\n".join(str(region.get("text", "")) for region in final_regions)
         page_evidence = detect_language(combined_text)
         region_languages = []
+        self._mark_overlapping_regions(final_regions)
         for index, region in enumerate(final_regions, 1):
             evidence = detect_language(str(region.get("text", "")))
             region_languages.append({
@@ -323,6 +434,22 @@ class SmartOCRManager:
                 "polygon": [[int(point[0]), int(point[1])] for point in region.get("polygon", [])],
             })
         return regions
+
+    @staticmethod
+    def _mark_overlapping_regions(regions: list[dict[str, Any]], *, threshold: float = 0.20) -> None:
+        for first_index, first in enumerate(regions):
+            first_polygon = first.get("polygon", [])
+            if len(first_polygon) < 4:
+                continue
+            for second in regions[first_index + 1:]:
+                second_polygon = second.get("polygon", [])
+                if len(second_polygon) < 4 or _polygon_overlap(first_polygon, second_polygon) < threshold:
+                    continue
+                for region in (first, second):
+                    reasons = list(region.get("ocr_review_reasons", []))
+                    if OCRRetryReason.OVERLAPPING_BOX.value not in reasons:
+                        reasons.append(OCRRetryReason.OVERLAPPING_BOX.value)
+                    region["ocr_review_reasons"] = reasons
 
     @staticmethod
     def _needs_auto_fallback(ocr_result: OCRResult) -> bool:

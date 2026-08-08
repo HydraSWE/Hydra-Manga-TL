@@ -1,0 +1,11 @@
+Lucide icon assets
+
+Source: https://github.com/lucide-icons/lucide
+Downloaded from official lucide-icons/lucide SVG sources.
+License: ISC. See LUCIDE-LICENSE.txt in this folder.
+
+Vendored icons:
+play, send, square-x, save, download, settings, book-open, folder-open, image-plus, search, trash-2, ellipsis-vertical, scan-text, message-circle-warning, box, type, message-square, maximize, clock, x.
+
+Note: box.svg is used for the Region Tool because box-select.svg is not present in the current official Lucide source.
+Local adaptation: SVG strokes are set to #9ec2ff so Qt renders the icons in Hydra's dark-theme accent color instead of black.

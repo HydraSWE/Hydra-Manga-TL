@@ -12,6 +12,8 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from hydra_manga_tl.phase.art_inpaint import inpaint_python, is_art_text_group, render_art_text
+from hydra_manga_tl.core.fonts import default_font_file, resolve_font_file
+from hydra_manga_tl.project.artifacts import rendered_filename
 from hydra_manga_tl.core.normalization import normalize_global_text
 from hydra_manga_tl.core.region_types import group_region_type, is_title_like_region
 from hydra_manga_tl.phase.segmentation import reusable_segmentation
@@ -20,23 +22,19 @@ from hydra_manga_tl.title import extract_title_glyph_mask
 from hydra_manga_tl.title.reconstruction import reconstruct_title_page
 # Updated imports to match the new layout engine in renderer.py
 from hydra_manga_tl.phase.renderer import (
-    clean_background, 
-    compute_safe_text_area, 
-    detect_bubble_box, 
-    expanded_box, 
-    fit_text, 
-    make_mask, 
+    clean_background,
+    compute_safe_text_area,
+    detect_bubble_box,
+    expanded_box,
+    fit_text,
+    fit_text_avoiding_preserved,
+    has_preserved_content,
+    make_mask,
     render_group
 )
 
-DEFAULT_FONT = Path(r"C:\Windows\Fonts\arial.ttf")
+DEFAULT_FONT = default_font_file()
 LOGGER = logging.getLogger(__name__)
-FONT_PATHS = {
-    "Arial": Path(r"C:\Windows\Fonts\arial.ttf"),
-    "Arial Bold": Path(r"C:\Windows\Fonts\arialbd.ttf"),
-    "Comic Sans MS": Path(r"C:\Windows\Fonts\comic.ttf"),
-    "Segoe UI": Path(r"C:\Windows\Fonts\segoeui.ttf"),
-}
 STYLE_DEFAULTS = {
     "Manga": {"font_family": "Arial Bold", "alignment": "center", "max_lines": 3},
     "Comic": {"font_family": "Comic Sans MS", "alignment": "center", "max_lines": 3},
@@ -59,8 +57,11 @@ def _preview_pair(original: Image.Image, final: Image.Image) -> Image.Image:
 
 def resolve_font_path(font_family: str, fallback: Path = DEFAULT_FONT) -> Path:
     """Resolve an editor font choice to a renderable Windows font file."""
-    path = FONT_PATHS.get(font_family, fallback)
-    return path if path.is_file() else fallback
+    return resolve_font_file(
+        font_family,
+        fallback=fallback,
+        bold_fallback=font_family == "Arial Bold",
+    )
 
 
 def decorative_horizontal(group: dict, size: tuple[int, int]) -> bool:
@@ -112,6 +113,34 @@ def renderer_for_region(group: dict) -> str:
 
 def is_title_renderer_region(group: dict) -> bool:
     return renderer_for_region(group) == "title"
+
+
+def _rgb_to_hex(color: object) -> str | None:
+    if not isinstance(color, (list, tuple)) or len(color) < 3:
+        return None
+    try:
+        red, green, blue = (max(0, min(255, int(round(float(value))))) for value in color[:3])
+    except (TypeError, ValueError):
+        return None
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _source_solid_text_color(group: dict) -> str | None:
+    colors = group.get("source_text_colors")
+    if not isinstance(colors, list):
+        return None
+    for color in colors:
+        hex_color = _rgb_to_hex(color)
+        if hex_color is not None:
+            return hex_color
+    return None
+
+
+def _render_text_color(group: dict) -> str | None:
+    explicit = group.get("text_color")
+    if isinstance(explicit, str) and explicit.strip().startswith("#"):
+        return explicit
+    return _source_solid_text_color(group)
 
 
 def _region_layout_polygon(group: dict, image_size: tuple[int, int]) -> list[list[int]] | None:
@@ -204,6 +233,12 @@ def _validated_segmentation_box(group: dict, segmentation: dict, image_size: tup
 def _manual_exact_box(group: dict, image_size: tuple[int, int]) -> list[int] | None:
     if group.get("placement_policy") != "exact" and not group.get("manual"):
         return None
+    placement_rect = group.get("placement_rect")
+    if isinstance(placement_rect, list) and len(placement_rect) == 4:
+        return _clip_box([int(value) for value in placement_rect], image_size)
+    placement_polygon = group.get("placement_polygon") or []
+    if placement_polygon:
+        return _clip_box(_box_from_polygon(placement_polygon), image_size)
     rect = group.get("manual_rect")
     if isinstance(rect, list) and len(rect) == 4:
         return _clip_box([int(value) for value in rect], image_size)
@@ -271,7 +306,7 @@ def _vertical_source_cluster_box(group: dict, image_size: tuple[int, int]) -> li
 
 def placement_candidates(group: dict, image_size: tuple[int, int], image: Image.Image | None = None) -> list[tuple[str, list[int]]]:
     """Return anchored-first placement boxes, falling back to detected bubbles."""
-    polygon = group["polygon"]
+    polygon = group.get("placement_polygon") or group.get("polygon") or group.get("selection_polygon") or []
     offset = group.get("placement_offset", [0, 0])
     candidates: list[tuple[str, list[int]]] = []
 
@@ -301,7 +336,8 @@ def placement_candidates(group: dict, image_size: tuple[int, int], image: Image.
     add("source_cluster_bounds", _vertical_source_cluster_box(group, image_size))
     if segmentation is None:
         add("segmented_safe_area", group.get("safe_area"))
-    add("anchored_text_bounds", expanded_box(polygon, image_size))
+    if polygon:
+        add("anchored_text_bounds", expanded_box(polygon, image_size))
 
     # A validated phase-2 segmentation is authoritative. Avoid repeating
     # connected-component bubble detection for each render candidate.
@@ -328,7 +364,7 @@ def prepare_group_fit(
     defaults = STYLE_DEFAULTS.get(group.get("text_style", "Manga"), STYLE_DEFAULTS["Manga"])
     group_font = resolve_font_path(group.get("font_family", defaults["font_family"]), fallback_font)
     text_layout_box = _text_layout_box(group, image_size)
-    orig_polygon = group["polygon"]
+    orig_polygon = group.get("placement_polygon") or group.get("polygon") or group.get("selection_polygon") or []
     if text_layout_box is not None:
         layout_h = max(1, text_layout_box[3] - text_layout_box[1])
         layout_w = max(1, text_layout_box[2] - text_layout_box[0])
@@ -343,8 +379,10 @@ def prepare_group_fit(
             dynamic_max = min(dynamic_max, 40 if (group.get("placement_policy") == "exact" or group.get("manual")) else 32)
         maximum = 28 if decorative_horizontal(group, image_size) else dynamic_max
     max_lines = int(group.get("max_lines", defaults["max_lines"]) or 0)
-    if (group.get("placement_policy") == "exact" or group.get("manual")) and max_lines <= defaults["max_lines"]:
-        box = text_layout_box if text_layout_box is not None else _manual_exact_box(group, image_size)
+    if text_layout_box is not None:
+        max_lines = 0
+    elif (group.get("placement_policy") == "exact" or group.get("manual")) and max_lines <= defaults["max_lines"]:
+        box = _manual_exact_box(group, image_size)
         if box is not None:
             box_height = max(1, box[3] - box[1])
             max_lines = max(max_lines, min(8, max(3, box_height // 42)))
@@ -356,17 +394,72 @@ def prepare_group_fit(
         vertical_source = group.get("source_direction", group.get("direction")) == "vertical-rtl"
         auto_minimum = 5 if text_layout_box is not None else (10 if (vertical_source and not exact_or_manual) else 5)
     largest = None
+    preserved_aware = has_preserved_content(group)
     for strategy, box in placement_candidates(group, image_size, image):
         if override > 0:
-            fitted = fit_text(group["translated_text"], box, group_font, maximum=override, minimum=override, max_lines=max_lines)
+            fitted = (
+                fit_text_avoiding_preserved(
+                    group["translated_text"],
+                    box,
+                    group_font,
+                    group,
+                    image_size,
+                    maximum=override,
+                    minimum=override,
+                    max_lines=max_lines,
+                )
+                if preserved_aware
+                else None
+            )
             if fitted is None:
-                fallback = fit_text(group["translated_text"], box, group_font, maximum=max(auto_minimum, override - 1), minimum=auto_minimum, max_lines=max_lines)
+                fitted = fit_text(group["translated_text"], box, group_font, maximum=override, minimum=override, max_lines=max_lines)
+                if fitted is not None and preserved_aware:
+                    fitted.fallback_reason = "preserved_overlap_fallback"
+                    fitted.constraint_strategy = "rectangular_fallback"
+            if fitted is None:
+                fallback = (
+                    fit_text_avoiding_preserved(
+                        group["translated_text"],
+                        box,
+                        group_font,
+                        group,
+                        image_size,
+                        maximum=max(auto_minimum, override - 1),
+                        minimum=auto_minimum,
+                        max_lines=max_lines,
+                    )
+                    if preserved_aware
+                    else None
+                )
+                if fallback is None:
+                    fallback = fit_text(group["translated_text"], box, group_font, maximum=max(auto_minimum, override - 1), minimum=auto_minimum, max_lines=max_lines)
+                    if fallback is not None and preserved_aware:
+                        fallback.fallback_reason = "preserved_overlap_fallback"
+                        fallback.constraint_strategy = "rectangular_fallback"
                 if fallback is not None and (largest is None or fallback.font_size > largest.font_size):
                     setattr(fallback, "placement_strategy", strategy)
                     largest = fallback
                 continue
         else:
-            fitted = fit_text(group["translated_text"], box, group_font, maximum=maximum, minimum=auto_minimum, max_lines=max_lines)
+            fitted = (
+                fit_text_avoiding_preserved(
+                    group["translated_text"],
+                    box,
+                    group_font,
+                    group,
+                    image_size,
+                    maximum=maximum,
+                    minimum=auto_minimum,
+                    max_lines=max_lines,
+                )
+                if preserved_aware
+                else None
+            )
+            if fitted is None:
+                fitted = fit_text(group["translated_text"], box, group_font, maximum=maximum, minimum=auto_minimum, max_lines=max_lines)
+                if fitted is not None and preserved_aware:
+                    fitted.fallback_reason = "preserved_overlap_fallback"
+                    fitted.constraint_strategy = "rectangular_fallback"
             if fitted is None:
                 continue
         setattr(fitted, "placement_strategy", strategy)
@@ -381,7 +474,13 @@ def prepare_group_fit(
         raise ValueError(f"Font size {override} does not fit text block {group['index']}{suggestion}.")
     return None, group_font
 
-def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: str = "complete") -> dict:
+def run(
+    input_path: Path,
+    output: Path,
+    font_path: Path = DEFAULT_FONT,
+    policy: str = "complete",
+    skip_title_reconstruction: bool = False,
+) -> dict:
     files = inputs(input_path)
     if not files:
         raise ValueError("No Phase 2 translated JSON files were found.")
@@ -440,7 +539,8 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
         normal_groups = [group for group in eligible if group not in title_jobs]
         title_mask_reports: list[dict] = []
         title_reconstruction_reports: list[dict] = []
-        if title_jobs:
+        title_reconstruction_disabled = False
+        if title_jobs and not skip_title_reconstruction:
             normal_mask = make_mask(size, normal_groups, dilation=2) if normal_groups else np.zeros((size[1], size[0]), dtype=np.uint8)
             reconstruction = reconstruct_title_page(
                 original,
@@ -460,6 +560,13 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
             title_mask_reports = reconstruction.title_mask_reports
             title_reconstruction_reports = reconstruction.reports
             background_plate_reports = reconstruction.background_plate_reports
+        elif title_jobs and skip_title_reconstruction:
+            title_reconstruction_disabled = True
+            mask = make_mask(size, eligible, dilation=2) if eligible else np.zeros((size[1], size[0]), dtype=np.uint8)
+            cleaning_method = "unchanged"
+            inpaint_warning = ""
+            background_plate_reports = []
+            cleaned = None
         else:
             mask = make_mask(size, eligible)
             cleaning_method = "unchanged"
@@ -475,7 +582,10 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
             if cleaning_method == "unchanged":
                 cleaning_method = base_method
         cleaned_path = output / f"{stem}_cleaned.png"
-        final_path = output / f"{stem}_translated_en.png"
+        final_path = output / rendered_filename(
+            source,
+            str(payload.get("target_language", "en")),
+        )
         mask_path = output / f"{stem}_mask.png"
         preview_path = output / f"{stem}_preview.png"
         cleaned.save(cleaned_path)
@@ -496,9 +606,10 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
                 fitted,
                 group["translated_text"],
                 group_font,
-                color=group.get("text_color"),
+                color=_render_text_color(group),
                 alignment=group.get("alignment", "center"),
                 direction=group.get("render_direction", group.get("direction", "horizontal-ltr")),
+                angle=float(group.get("text_layout", {}).get("angle", 0.0)),
             )
             details["group"] = group["index"]
             details["source_region_indices"] = group.get("member_region_indices", [])
@@ -566,6 +677,8 @@ def run(input_path: Path, output: Path, font_path: Path = DEFAULT_FONT, policy: 
                 image_report["needs_title_mask_review"] = False
         if inpaint_warning:
             image_report["inpaint_warning"] = inpaint_warning
+        if title_reconstruction_disabled:
+            image_report["title_reconstruction_disabled"] = True
         (output / f"{stem}_render.json").write_text(json.dumps(image_report, ensure_ascii=False, indent=2), encoding="utf-8")
         reports.append({"file": source.name, "rendered": len(rendered), "skipped": len(skipped), "output": final_path.name})
         print(f"  rendered {len(rendered)} in-place; skipped {len(skipped)}")
@@ -585,9 +698,20 @@ def main() -> int:
     parser.add_argument("--font", type=Path, default=DEFAULT_FONT)
     parser.add_argument("--policy", choices=["complete", "safe"], default="complete",
                         help="complete replaces review/title text; safe keeps it unchanged")
+    parser.add_argument(
+        "--skip-title-reconstruction",
+        action="store_true",
+        help="Avoid title reconstruction/inpaint for title-like regions during batch rendering.",
+    )
     args = parser.parse_args()
     try:
-        run(args.input, args.output, args.font, args.policy)
+        run(
+            args.input,
+            args.output,
+            args.font,
+            args.policy,
+            skip_title_reconstruction=args.skip_title_reconstruction,
+        )
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
         parser.error(str(error))
     return 0

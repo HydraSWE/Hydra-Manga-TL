@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF, QPixmap, QWheelEvent
-from PySide6.QtWidgets import QLabel, QGraphicsEllipseItem, QGraphicsItem, QGraphicsPixmapItem, QGraphicsPolygonItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView, QPushButton
+from PySide6.QtWidgets import QLabel, QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsPixmapItem, QGraphicsPolygonItem, QGraphicsRectItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QPushButton
 
 from hydra_manga_tl.project.manual_region import normalize_image_polygon, normalize_image_rect, polygon_bounding_rect, rect_to_polygon
 from hydra_manga_tl.ui.overlay import OverlayProgressWidget
@@ -33,6 +34,7 @@ class PolygonVertexHandle(QGraphicsEllipseItem):
 
 class CanvasView(QGraphicsView):
     region_selected = Signal(int)
+    batch_regions_selected = Signal(int, object)
     text_layout_changed = Signal(int, object)
     manual_rect_created = Signal(object)
     manual_region_created = Signal(object)
@@ -47,16 +49,26 @@ class CanvasView(QGraphicsView):
         self._scene = QGraphicsScene(self); self.setScene(self._scene)
         self._pixmap = QGraphicsPixmapItem(); self._scene.addItem(self._pixmap)
         self._regions: list[QGraphicsPolygonItem] = []
+        self._reading_order_labels: list[QGraphicsSimpleTextItem] = []
+        self._reading_order_visible = False
         self._layout_frame: QGraphicsRectItem | None = None
-        self._layout_handles: list[QGraphicsRectItem] = []
+        self._layout_handles: list[QGraphicsEllipseItem] = []
         self._layout_row = -1
         self._layout_drag: dict | None = None
+        self._rotation_pivot_item: QGraphicsEllipseItem | None = None
+        self._rotation_guide_line: QGraphicsLineItem | None = None
+        self._rotation_angle_text: QGraphicsSimpleTextItem | None = None
+        self._hovered_layout_handle: tuple[str, str] | None = None
         self._manual_mode = ""
         self._manual_start: QPointF | None = None
         self._manual_preview: QGraphicsRectItem | None = None
         self._polygon_points: list[QPointF] = []
         self._polygon_preview: QGraphicsPolygonItem | None = None
         self._polygon_handles: list[PolygonVertexHandle] = []
+        self._selected_rows: set[int] = set()
+        self._selection_marquee_start: QPointF | None = None
+        self._selection_marquee_preview: QGraphicsRectItem | None = None
+        self._selection_marquee_base_selected: set[int] = set()
         self._polygon_confirm = QPushButton("Confirm", self.viewport())
         self._polygon_cancel = QPushButton("Cancel", self.viewport())
         self._polygon_confirm.clicked.connect(self._confirm_polygon_selection)
@@ -87,12 +99,21 @@ class CanvasView(QGraphicsView):
         self.badge.adjustSize()
         self.badge.raise_()
 
-    def set_content(self, image_path: Path | None, groups: list[dict], selected: int = -1) -> None:
+    def set_content(self, image_path: Path | None, groups: list[dict], selected: int = -1, selected_set: set[int] | None = None) -> None:
         self.cancel_manual_selection()
         self.clear_manual_overlays()
         self._clear_text_layout_transform()
         for item in self._regions: self._scene.removeItem(item)
         self._regions.clear()
+        for item in self._reading_order_labels:
+            self._scene.removeItem(item)
+        self._reading_order_labels.clear()
+        if selected_set is not None:
+            self._selected_rows = set(selected_set)
+        elif selected >= 0:
+            self._selected_rows = {selected}
+        else:
+            self._selected_rows = set()
         pixmap = QPixmap(str(image_path)) if image_path and image_path.is_file() else QPixmap()
         self._pixmap.setPixmap(pixmap); self._scene.setSceneRect(self._pixmap.boundingRect())
         self._update_pixmap_filter()
@@ -100,7 +121,7 @@ class CanvasView(QGraphicsView):
             polygon = QPolygonF([QPointF(point[0], point[1]) for point in group.get("polygon", [])])
             item = QGraphicsPolygonItem(polygon)
             item.setData(0, row)
-            active = row == selected
+            active = row in self._selected_rows
             manual = bool(group.get("manual"))
             inactive_color = "#b36cff" if manual else "#4d91ff"
             if self.title == "Translated" and active:
@@ -110,15 +131,40 @@ class CanvasView(QGraphicsView):
                 item.setPen(QPen(QColor("#ffd35a" if active else inactive_color), 3 if active else (2 if manual else 1)))
                 item.setBrush(QColor(255, 211, 90, 28) if active else (QColor(179, 108, 255, 24) if manual else QColor(77, 145, 255, 20)))
             item.setZValue(2); self._scene.addItem(item); self._regions.append(item)
+            if self._reading_order_visible and not polygon.isEmpty():
+                label = QGraphicsSimpleTextItem(
+                    str(group.get("reading_order", row + 1))
+                )
+                label.setBrush(QColor("#ffffff"))
+                label.setPos(polygon.boundingRect().topLeft() + QPointF(3, 3))
+                label.setZValue(4)
+                label.setFlag(
+                    QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,
+                    True,
+                )
+                self._scene.addItem(label)
+                self._reading_order_labels.append(label)
         if self.title == "Translated" and 0 <= selected < len(groups):
             self._show_text_layout_transform(selected, groups[selected])
         if not pixmap.isNull() and self._zoom == 1.0: self.fit_image()
+
+    def set_reading_order_visible(self, visible: bool) -> None:
+        self._reading_order_visible = bool(visible)
 
     def begin_manual_selection(self, mode: str = "rectangle") -> bool:
         if self._pixmap.pixmap().isNull():
             return False
         self.cancel_manual_selection()
         self._manual_mode = "polygon" if mode == "polygon" else "rectangle"
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        return True
+
+    def begin_bubble_selection(self) -> bool:
+        if self._pixmap.pixmap().isNull():
+            return False
+        self.cancel_manual_selection()
+        self._manual_mode = "bubble_select"
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setCursor(Qt.CursorShape.CrossCursor)
         return True
@@ -134,6 +180,10 @@ class CanvasView(QGraphicsView):
         if self._polygon_preview is not None:
             self._scene.removeItem(self._polygon_preview)
             self._polygon_preview = None
+        if self._selection_marquee_preview is not None:
+            self._scene.removeItem(self._selection_marquee_preview)
+            self._selection_marquee_preview = None
+        self._selection_marquee_start = None
         for handle in self._polygon_handles:
             self._scene.removeItem(handle)
         self._polygon_handles.clear()
@@ -144,7 +194,59 @@ class CanvasView(QGraphicsView):
         if was_active:
             self.manual_selection_finished.emit()
 
+    def update_region_highlights(self, selected_set: set[int]) -> None:
+        self._selected_rows = set(selected_set)
+        for item in self._regions:
+            row = item.data(0)
+            if row is not None:
+                row_idx = int(row)
+                active = row_idx in self._selected_rows
+                item.setPen(QPen(QColor("#ffd35a" if active else "#4d91ff"), 3 if active else 1))
+                item.setBrush(QColor(255, 211, 90, 28) if active else QColor(77, 145, 255, 20))
+
     def mousePressEvent(self, event) -> None:
+        if self._manual_mode == "bubble_select" and event.button() == Qt.MouseButton.LeftButton:
+            modifiers = event.modifiers()
+            is_extend = bool(modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier))
+            item = self.itemAt(event.position().toPoint())
+            clicked_row = None
+            while item is not None:
+                row = item.data(0)
+                if row is not None:
+                    clicked_row = int(row)
+                    break
+                item = item.parentItem()
+
+            if is_extend:
+                self._selection_marquee_base_selected = set(self._selected_rows)
+            else:
+                self._selection_marquee_base_selected = set()
+
+            if clicked_row is not None and not is_extend:
+                self._selected_rows = {clicked_row}
+                self.update_region_highlights(self._selected_rows)
+                self.batch_regions_selected.emit(clicked_row, set(self._selected_rows))
+                event.accept()
+                return
+            elif clicked_row is not None and is_extend:
+                if clicked_row in self._selected_rows:
+                    self._selected_rows.remove(clicked_row)
+                else:
+                    self._selected_rows.add(clicked_row)
+                self.update_region_highlights(self._selected_rows)
+                primary = clicked_row if clicked_row in self._selected_rows else (next(iter(self._selected_rows)) if self._selected_rows else -1)
+                self.batch_regions_selected.emit(primary, set(self._selected_rows))
+                event.accept()
+                return
+
+            self._selection_marquee_start = self.mapToScene(event.position().toPoint())
+            self._selection_marquee_preview = QGraphicsRectItem()
+            self._selection_marquee_preview.setPen(QPen(QColor("#37d3ff"), 2, Qt.PenStyle.DashLine))
+            self._selection_marquee_preview.setBrush(QColor(55, 211, 255, 30))
+            self._selection_marquee_preview.setZValue(6)
+            self._scene.addItem(self._selection_marquee_preview)
+            event.accept()
+            return
         if self._manual_mode == "rectangle" and event.button() == Qt.MouseButton.LeftButton:
             self._manual_start = self.mapToScene(event.position().toPoint())
             self._manual_preview = QGraphicsRectItem()
@@ -160,15 +262,29 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
         if self._layout_frame is not None and event.button() == Qt.MouseButton.LeftButton:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            hit = self._layout_corner_hit_test(scene_pos)
+            if hit is not None:
+                role, zone = hit
+                drag_role = "rotate" if zone == "rotate" else role
+                self._layout_drag = {
+                    "role": drag_role,
+                    "start": scene_pos,
+                    "rect": QRectF(self._layout_frame.rect()),
+                    "angle": float(self._layout_frame.rotation()),
+                }
+                self.setDragMode(QGraphicsView.DragMode.NoDrag)
+                event.accept()
+                return
             item = self.itemAt(event.position().toPoint())
             while item is not None:
                 layout_role = item.data(1)
-                if layout_role is not None:
-                    scene_pos = self.mapToScene(event.position().toPoint())
+                if layout_role == "body":
                     self._layout_drag = {
-                        "role": str(layout_role),
+                        "role": "body",
                         "start": scene_pos,
                         "rect": QRectF(self._layout_frame.rect()),
+                        "angle": float(self._layout_frame.rotation()),
                     }
                     self.setDragMode(QGraphicsView.DragMode.NoDrag)
                     event.accept()
@@ -183,6 +299,18 @@ class CanvasView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if self._manual_mode == "bubble_select" and self._selection_marquee_start is not None and self._selection_marquee_preview is not None:
+            current = self.mapToScene(event.position().toPoint())
+            rect = QRectF(self._selection_marquee_start, current).normalized().intersected(self._pixmap.boundingRect())
+            self._selection_marquee_preview.setRect(rect)
+            intersected = set(self._selection_marquee_base_selected)
+            for item in self._regions:
+                row = item.data(0)
+                if row is not None and rect.intersects(item.polygon().boundingRect()):
+                    intersected.add(int(row))
+            self.update_region_highlights(intersected)
+            event.accept()
+            return
         if self._manual_start is not None and self._manual_preview is not None:
             current = self.mapToScene(event.position().toPoint())
             rect = QRectF(self._manual_start, current).normalized().intersected(self._pixmap.boundingRect())
@@ -193,13 +321,36 @@ class CanvasView(QGraphicsView):
             current = self.mapToScene(event.position().toPoint())
             start = self._layout_drag["start"]
             base = QRectF(self._layout_drag["rect"])
-            dx = current.x() - start.x()
-            dy = current.y() - start.y()
             role = self._layout_drag["role"]
             if role == "body":
+                dx = current.x() - start.x()
+                dy = current.y() - start.y()
                 rect = base.translated(dx, dy)
+                self._layout_frame.setPen(QPen(QColor("#37d3ff"), 2, Qt.PenStyle.SolidLine))
+                self._set_text_layout_rect(self._clamp_layout_rect(rect))
+            elif role == "rotate":
+                center = self._layout_frame.mapToScene(base.center())
+                start_angle = math.atan2(start.y() - center.y(), start.x() - center.x()) * 180.0 / math.pi
+                current_angle = math.atan2(current.y() - center.y(), current.x() - center.x()) * 180.0 / math.pi
+                angle_delta = current_angle - start_angle
+                if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+                    angle_delta *= 0.25
+                target_angle = self._layout_drag["angle"] + angle_delta
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    target_angle = round(target_angle / 15.0) * 15.0
+                target_angle = float(round((target_angle + 180.0) % 360.0 - 180.0, 2))
+                self._layout_frame.setRotation(target_angle)
+                self._layout_frame.setPen(QPen(QColor("#37d3ff"), 2, Qt.PenStyle.DashLine))
+                self._position_text_layout_handles()
+                self._update_rotation_hud(center, current, target_angle)
+                event.accept()
+                return
             else:
                 rect = QRectF(base)
+                local_start = self._layout_frame.mapFromScene(start)
+                local_current = self._layout_frame.mapFromScene(current)
+                dx = local_current.x() - local_start.x()
+                dy = local_current.y() - local_start.y()
                 if "left" in role:
                     rect.setLeft(rect.left() + dx)
                 if "right" in role:
@@ -209,9 +360,14 @@ class CanvasView(QGraphicsView):
                 if "bottom" in role:
                     rect.setBottom(rect.bottom() + dy)
                 rect = rect.normalized()
-            self._set_text_layout_rect(self._clamp_layout_rect(rect))
+                self._layout_frame.setPen(QPen(QColor("#37d3ff"), 2, Qt.PenStyle.SolidLine))
+                self._set_text_layout_rect(self._clamp_layout_rect(rect))
             event.accept()
             return
+        if self._layout_frame is not None and self._layout_drag is None:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            hit = self._layout_corner_hit_test(scene_pos)
+            self._update_handle_hover_states(hit)
         if self._manual_mode == "polygon" and self._polygon_points and not self._polygon_handles:
             points = [*self._polygon_points, self._clamp_scene_point(self.mapToScene(event.position().toPoint()))]
             self._set_polygon_preview(points, closed=False)
@@ -220,6 +376,24 @@ class CanvasView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._manual_mode == "bubble_select" and self._selection_marquee_start is not None and event.button() == Qt.MouseButton.LeftButton:
+            end = self.mapToScene(event.position().toPoint())
+            rect = QRectF(self._selection_marquee_start, end).normalized().intersected(self._pixmap.boundingRect())
+            intersected = set(self._selection_marquee_base_selected)
+            for item in self._regions:
+                row = item.data(0)
+                if row is not None and rect.intersects(item.polygon().boundingRect()):
+                    intersected.add(int(row))
+            if self._selection_marquee_preview is not None:
+                self._scene.removeItem(self._selection_marquee_preview)
+                self._selection_marquee_preview = None
+            self._selection_marquee_start = None
+            self._selected_rows = intersected
+            self.update_region_highlights(self._selected_rows)
+            primary = next(iter(self._selected_rows)) if self._selected_rows else -1
+            self.batch_regions_selected.emit(primary, set(self._selected_rows))
+            event.accept()
+            return
         if self._manual_start is not None and event.button() == Qt.MouseButton.LeftButton:
             end = self.mapToScene(event.position().toPoint())
             start = (self._manual_start.x(), self._manual_start.y())
@@ -236,20 +410,44 @@ class CanvasView(QGraphicsView):
             return
         if self._layout_drag is not None and event.button() == Qt.MouseButton.LeftButton:
             self._layout_drag = None
+            self._hide_rotation_hud()
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
             if self._layout_frame is not None and self._layout_row >= 0:
+                self._layout_frame.setPen(QPen(QColor("#37d3ff"), 2, Qt.PenStyle.DashLine))
                 rect = self._layout_frame.rect()
-                self.text_layout_changed.emit(self._layout_row, {
+                data = {
                     "x": round(rect.left()),
                     "y": round(rect.top()),
                     "width": max(1, round(rect.width())),
                     "height": max(1, round(rect.height())),
-                })
+                }
+                angle = float(round(self._layout_frame.rotation(), 2))
+                data["angle"] = angle
+                self.text_layout_changed.emit(self._layout_row, data)
+            self._update_handle_hover_states(None)
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if self._layout_frame is not None and event.button() == Qt.MouseButton.LeftButton:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            hit = self._layout_corner_hit_test(scene_pos)
+            if hit is not None and hit[1] == "rotate":
+                self._layout_frame.setRotation(0.0)
+                self._position_text_layout_handles()
+                if self._layout_row >= 0:
+                    rect = self._layout_frame.rect()
+                    data = {
+                        "x": round(rect.left()),
+                        "y": round(rect.top()),
+                        "width": max(1, round(rect.width())),
+                        "height": max(1, round(rect.height())),
+                        "angle": 0.0,
+                    }
+                    self.text_layout_changed.emit(self._layout_row, data)
+                event.accept()
+                return
         if self._manual_mode == "polygon" and event.button() == Qt.MouseButton.LeftButton:
             if not self._polygon_handles:
                 point = self._clamp_scene_point(self.mapToScene(event.position().toPoint()))
@@ -272,6 +470,7 @@ class CanvasView(QGraphicsView):
         )
 
     def _clear_text_layout_transform(self) -> None:
+        self._hide_rotation_hud()
         if self._layout_frame is not None:
             self._scene.removeItem(self._layout_frame)
             self._layout_frame = None
@@ -280,6 +479,7 @@ class CanvasView(QGraphicsView):
         self._layout_handles.clear()
         self._layout_row = -1
         self._layout_drag = None
+        self._hovered_layout_handle = None
 
     def _show_text_layout_transform(self, row: int, group: dict) -> None:
         rect = self._layout_rect_for_group(group)
@@ -292,16 +492,31 @@ class CanvasView(QGraphicsView):
         self._layout_frame.setPen(QPen(QColor("#37d3ff"), 2, Qt.PenStyle.DashLine))
         self._layout_frame.setBrush(QColor(55, 211, 255, 18))
         self._layout_frame.setZValue(8)
+        self._layout_frame.setCursor(Qt.CursorShape.SizeAllCursor)
+        self._layout_frame.setTransformOriginPoint(rect.center())
         self._scene.addItem(self._layout_frame)
+        handle_cursors = {
+            "top-left": Qt.CursorShape.SizeFDiagCursor,
+            "bottom-right": Qt.CursorShape.SizeFDiagCursor,
+            "top-right": Qt.CursorShape.SizeBDiagCursor,
+            "bottom-left": Qt.CursorShape.SizeBDiagCursor,
+        }
         for role in ("top-left", "top-right", "bottom-left", "bottom-right"):
-            handle = QGraphicsRectItem()
+            handle = QGraphicsEllipseItem(-5, -5, 10, 10)
             handle.setData(0, row)
             handle.setData(1, role)
             handle.setPen(QPen(QColor("#081018"), 1))
             handle.setBrush(QColor("#37d3ff"))
             handle.setZValue(9)
+            handle.setCursor(handle_cursors[role])
             self._scene.addItem(handle)
             self._layout_handles.append(handle)
+        angle = group.get("text_layout", {}).get("angle") if isinstance(group.get("text_layout"), dict) else None
+        if angle is not None:
+            try:
+                self._layout_frame.setRotation(float(angle))
+            except (TypeError, ValueError):
+                pass
         self._position_text_layout_handles()
 
     def _layout_rect_for_group(self, group: dict) -> QRectF | None:
@@ -337,23 +552,119 @@ class CanvasView(QGraphicsView):
         if self._layout_frame is None:
             return
         self._layout_frame.setRect(rect)
+        self._layout_frame.setTransformOriginPoint(rect.center())
         self._position_text_layout_handles()
 
     def _position_text_layout_handles(self) -> None:
         if self._layout_frame is None:
             return
         rect = self._layout_frame.rect()
-        size = 8.0
-        positions = {
-            "top-left": rect.topLeft(),
-            "top-right": rect.topRight(),
-            "bottom-left": rect.bottomLeft(),
-            "bottom-right": rect.bottomRight(),
+        scene_positions = {
+            "top-left": self._layout_frame.mapToScene(rect.topLeft()),
+            "top-right": self._layout_frame.mapToScene(rect.topRight()),
+            "bottom-left": self._layout_frame.mapToScene(rect.bottomLeft()),
+            "bottom-right": self._layout_frame.mapToScene(rect.bottomRight()),
         }
         for handle in self._layout_handles:
-            point = positions.get(str(handle.data(1)))
+            role = str(handle.data(1))
+            point = scene_positions.get(role)
             if point is not None:
-                handle.setRect(point.x() - size / 2, point.y() - size / 2, size, size)
+                handle.setRect(-5, -5, 10, 10)
+                handle.setPos(point)
+
+    def _layout_corner_hit_test(self, scene_pos: QPointF) -> tuple[str, str] | None:
+        if self._layout_frame is None:
+            return None
+        rect = self._layout_frame.rect()
+        corners = {
+            "top-left": self._layout_frame.mapToScene(rect.topLeft()),
+            "top-right": self._layout_frame.mapToScene(rect.topRight()),
+            "bottom-left": self._layout_frame.mapToScene(rect.bottomLeft()),
+            "bottom-right": self._layout_frame.mapToScene(rect.bottomRight()),
+        }
+        best_role = None
+        best_zone = None
+        best_dist = float("inf")
+        for role, pt in corners.items():
+            dist = math.hypot(scene_pos.x() - pt.x(), scene_pos.y() - pt.y())
+            if dist <= 6.0:
+                if dist < best_dist:
+                    best_dist = dist
+                    best_role = role
+                    best_zone = "resize"
+            elif dist <= 18.0:
+                if best_zone != "resize" and dist < best_dist:
+                    best_dist = dist
+                    best_role = role
+                    best_zone = "rotate"
+        if best_role and best_zone:
+            return (best_role, best_zone)
+        return None
+
+    def _update_handle_hover_states(self, hit: tuple[str, str] | None) -> None:
+        if hit == self._hovered_layout_handle:
+            return
+        self._hovered_layout_handle = hit
+        cursors = {
+            "top-left": Qt.CursorShape.SizeFDiagCursor,
+            "bottom-right": Qt.CursorShape.SizeFDiagCursor,
+            "top-right": Qt.CursorShape.SizeBDiagCursor,
+            "bottom-left": Qt.CursorShape.SizeBDiagCursor,
+        }
+        for handle in self._layout_handles:
+            role = str(handle.data(1))
+            if hit is not None and hit[0] == role:
+                if hit[1] == "rotate":
+                    handle.setPen(QPen(QColor("#ffffff"), 2))
+                    handle.setBrush(QColor("#00f0ff"))
+                    handle.setCursor(Qt.CursorShape.PointingHandCursor)
+                else:
+                    handle.setPen(QPen(QColor("#ffffff"), 1))
+                    handle.setBrush(QColor("#00f0ff"))
+                    handle.setCursor(cursors.get(role, Qt.CursorShape.SizeAllCursor))
+            else:
+                handle.setPen(QPen(QColor("#081018"), 1))
+                handle.setBrush(QColor("#37d3ff"))
+                handle.setCursor(cursors.get(role, Qt.CursorShape.SizeAllCursor))
+
+    def _update_rotation_hud(self, center: QPointF, mouse_pos: QPointF, angle: float) -> None:
+        if self._rotation_pivot_item is None:
+            self._rotation_pivot_item = QGraphicsEllipseItem(-6, -6, 12, 12)
+            self._rotation_pivot_item.setPen(QPen(QColor("#00f0ff"), 2))
+            self._rotation_pivot_item.setBrush(QColor(55, 211, 255, 60))
+            self._rotation_pivot_item.setZValue(12)
+            self._scene.addItem(self._rotation_pivot_item)
+        self._rotation_pivot_item.setPos(center)
+        self._rotation_pivot_item.show()
+
+        if self._rotation_guide_line is None:
+            self._rotation_guide_line = QGraphicsLineItem()
+            self._rotation_guide_line.setPen(QPen(QColor("#37d3ff"), 1, Qt.PenStyle.DashLine))
+            self._rotation_guide_line.setZValue(11)
+            self._scene.addItem(self._rotation_guide_line)
+        self._rotation_guide_line.setLine(center.x(), center.y(), mouse_pos.x(), mouse_pos.y())
+        self._rotation_guide_line.show()
+
+        if self._rotation_angle_text is None:
+            self._rotation_angle_text = QGraphicsSimpleTextItem()
+            self._rotation_angle_text.setBrush(QColor("#ffffff"))
+            self._rotation_angle_text.setZValue(13)
+            self._rotation_angle_text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            self._scene.addItem(self._rotation_angle_text)
+        self._rotation_angle_text.setText(f"{angle:.1f}°")
+        self._rotation_angle_text.setPos(mouse_pos + QPointF(12, 12))
+        self._rotation_angle_text.show()
+
+    def _hide_rotation_hud(self) -> None:
+        if self._rotation_pivot_item is not None:
+            self._scene.removeItem(self._rotation_pivot_item)
+            self._rotation_pivot_item = None
+        if self._rotation_guide_line is not None:
+            self._scene.removeItem(self._rotation_guide_line)
+            self._rotation_guide_line = None
+        if self._rotation_angle_text is not None:
+            self._scene.removeItem(self._rotation_angle_text)
+            self._rotation_angle_text = None
 
     def _polygon_as_lists(self, points: list[QPointF] | None = None) -> list[list[int]]:
         values = points if points is not None else [handle.pos() for handle in self._polygon_handles]
