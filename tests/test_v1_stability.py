@@ -2098,6 +2098,33 @@ class V1StabilityTests(unittest.TestCase):
             WorkspaceManager._recover_interrupted_project(project)
         self.assertEqual(project.images[0].status, "ready")
 
+    def test_project_resume_config_accepts_injected_settings(self):
+        project = MangaProject(
+            "project",
+            "Recovery",
+            ".",
+            quality="Balanced",
+            images=[],
+        )
+        settings = AppSettings(
+            translation_engine="deepseek",
+            translation_fallback_engine="marian",
+            translation_memory_prefer_verified=False,
+            qwen_model_name="custom-model",
+            openai_compatible_base_url="https://router.test/v1",
+        )
+
+        config = _project_resume_config(project, settings=settings)
+
+        self.assertEqual("deepseek", config["translation_engine"])
+        self.assertEqual("marian", config["translation_fallback_engine"])
+        self.assertFalse(config["translation_memory_prefer_verified"])
+        self.assertEqual("custom-model", config["qwen_model_name"])
+        self.assertEqual(
+            "https://router.test/v1",
+            config["provider_base_urls"]["openai_compatible"],
+        )
+
     def test_unfingerprinted_done_manifest_is_not_trusted_after_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -2501,6 +2528,34 @@ class V1StabilityTests(unittest.TestCase):
             _translation_stage_fingerprint(page, config, "en"),
             _translation_stage_fingerprint(page, config, "fr"),
         )
+
+    def test_page_translation_cache_key_accepts_injected_cache_store(self):
+        class CacheStore:
+            def __init__(self):
+                self.calls = []
+
+            def page_translation_key(self, page, config, target):
+                self.calls.append((page, config, target))
+                return "cache-key"
+
+        page = PageDialogue(
+            source_language="Japanese",
+            target_language="en",
+            dialogue=[{"id": "r1", "text": "待て"}],
+        )
+        config = {"translation_engine": "groq"}
+        cache_store = CacheStore()
+
+        self.assertEqual(
+            "cache-key",
+            _page_translation_cache_key(
+                page,
+                config,
+                "en",
+                cache_store=cache_store,
+            ),
+        )
+        self.assertEqual([(page, config, "en")], cache_store.calls)
 
     def test_verified_translation_checkpoint_rerenders_without_provider_call(self):
         with tempfile.TemporaryDirectory() as folder:

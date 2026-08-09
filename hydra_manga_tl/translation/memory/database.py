@@ -4,19 +4,25 @@ from __future__ import annotations
 
 from dataclasses import fields
 from datetime import datetime, timezone
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import shutil
 import sqlite3
 import threading
 from typing import Any, Iterable
-import xml.etree.ElementTree as ET
 
 from hydra_manga_tl.core.paths import PATHS
 from hydra_manga_tl.core.region_types import normalize_region_type
 
 from .fingerprints import normalize_tm_source_text, source_text_hash
+from .io import (
+    read_json_entries,
+    read_sqlite_entries,
+    read_tmx_entries,
+    write_json_export,
+    write_tmx_export,
+)
 from .models import (
     TranslationMemoryEntry,
     TranslationMemoryMatch,
@@ -682,79 +688,29 @@ class TranslationMemory:
         entries = self.database.all_entries()
         destination.parent.mkdir(parents=True, exist_ok=True)
         if format_key == "json":
-            payload = {
-                "format": "hydra-translation-memory",
-                "version": SCHEMA_VERSION,
-                "entries": [entry.to_dict() for entry in entries],
-            }
-            destination.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            return destination
-        if format_key == "tmx":
-            root = ET.Element("tmx", {"version": "1.4"})
-            ET.SubElement(root, "header", {
-                "creationtool": "Hydra Manga TL",
-                "creationtoolversion": "1.0",
-                "segtype": "sentence",
-                "adminlang": "en",
-                "srclang": "*all*",
-                "datatype": "plaintext",
-            })
-            body = ET.SubElement(root, "body")
-            xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
-            for entry in entries:
-                unit = ET.SubElement(body, "tu", {"tuid": str(entry.id or "")})
-                for key in (
-                    "normalized_text", "source_text_hash", "source_region_hash",
-                    "region_type", "translation_provider", "provider_model",
-                    "verified", "user_edited", "quality_score", "origin",
-                    "series_id", "glossary_version", "project_id", "notes",
-                ):
-                    value = getattr(entry, key)
-                    if value is not None and value != "":
-                        prop = ET.SubElement(
-                            unit,
-                            "prop",
-                            {"type": f"x-hydra-{key.replace('_', '-')}"},
-                        )
-                        prop.text = str(value)
-                source_variant = ET.SubElement(
-                    unit,
-                    "tuv",
-                    {xml_lang: entry.source_language},
-                )
-                ET.SubElement(source_variant, "seg").text = entry.source_text
-                target_variant = ET.SubElement(
-                    unit,
-                    "tuv",
-                    {xml_lang: entry.target_language},
-                )
-                ET.SubElement(target_variant, "seg").text = entry.translated_text
-            ET.ElementTree(root).write(
+            return write_json_export(
                 destination,
-                encoding="utf-8",
-                xml_declaration=True,
+                entries,
+                schema_version=SCHEMA_VERSION,
             )
-            return destination
+        if format_key == "tmx":
+            return write_tmx_export(destination, entries)
         raise ValueError(f"Unsupported Translation Memory export format: {format_key}")
 
     def import_file(self, source: Path, format_name: str | None = None) -> int:
         source = Path(source)
         format_key = (format_name or source.suffix.lstrip(".")).casefold()
         if format_key == "json":
-            payload = json.loads(source.read_text(encoding="utf-8"))
-            raw_entries = payload.get("entries", []) if isinstance(payload, dict) else []
+            raw_entries = read_json_entries(source)
         elif format_key == "tmx":
-            raw_entries = list(self._read_tmx_entries(source))
+            raw_entries = list(read_tmx_entries(source))
         elif format_key in {"db", "sqlite", "sqlite3"}:
             if source.resolve() == self.path.resolve():
                 raise ValueError(
                     "The selected SQLite file is already the active "
                     "Translation Memory."
                 )
-            raw_entries = list(self._read_sqlite_entries(source))
+            raw_entries = list(read_sqlite_entries(source))
         else:
             raise ValueError(f"Unsupported Translation Memory import format: {format_key}")
         imported = 0
@@ -781,67 +737,6 @@ class TranslationMemory:
             )
             imported += int(entry is not None)
         return imported
-
-    @staticmethod
-    def _read_tmx_entries(source: Path) -> Iterable[dict[str, Any]]:
-        root = ET.parse(source).getroot()
-        xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
-        header = root.find("header")
-        declared_source = str(
-            header.get("srclang", "") if header is not None else ""
-        ).casefold()
-        for unit in root.findall(".//tu"):
-            props = {
-                str(prop.get("type", "")).removeprefix("x-hydra-").replace("-", "_"):
-                    str(prop.text or "")
-                for prop in unit.findall("prop")
-            }
-            variants = unit.findall("tuv")
-            if len(variants) < 2:
-                continue
-            source_variant = next(
-                (
-                    variant for variant in variants
-                    if declared_source not in {"", "*all*"}
-                    and str(variant.get(xml_lang, "")).casefold()
-                    == declared_source
-                ),
-                variants[0],
-            )
-            target_variant = next(
-                variant for variant in variants
-                if variant is not source_variant
-            )
-            source_segment = source_variant.find("seg")
-            target_segment = target_variant.find("seg")
-            if source_segment is None or target_segment is None:
-                continue
-            yield {
-                **props,
-                "source_text": "".join(source_segment.itertext()),
-                "translated_text": "".join(target_segment.itertext()),
-                "source_language": source_variant.get(xml_lang, ""),
-                "target_language": target_variant.get(xml_lang, ""),
-                "verified": props.get("verified", "true").casefold() in {"1", "true", "yes"},
-                "user_edited": props.get("user_edited", "false").casefold() in {"1", "true", "yes"},
-            }
-
-    @staticmethod
-    def _read_sqlite_entries(source: Path) -> Iterable[dict[str, Any]]:
-        with closing(sqlite3.connect(source)) as connection:
-            connection.row_factory = sqlite3.Row
-            columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(tm_entries)")
-            }
-            required = {
-                "source_text", "translated_text",
-                "source_language", "target_language",
-            }
-            if not required.issubset(columns):
-                raise ValueError("The selected SQLite file is not a Hydra Translation Memory.")
-            for row in connection.execute("SELECT * FROM tm_entries"):
-                yield dict(row)
 
 
 class TranslationMemoryMatcher:

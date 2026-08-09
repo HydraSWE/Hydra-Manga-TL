@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
+import inspect
 from pathlib import Path
 import time
 from typing import Any, Callable
@@ -259,9 +260,16 @@ class SmartOCRManager:
         quality: str = "Balanced",
         strict: bool = False,
     ) -> ManagedOCRResult:
-        ocr_result = self.ocr_engine.analyze_selection(
-            image_path, rect, preferred_language=preferred_language, strict=strict,
+        analyze_selection = self.ocr_engine.analyze_selection
+        parameters = inspect.signature(analyze_selection).parameters.values()
+        supports_strict = any(
+            parameter.name == "strict" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
         )
+        kwargs = {"preferred_language": preferred_language}
+        if supports_strict:
+            kwargs["strict"] = strict
+        ocr_result = analyze_selection(image_path, rect, **kwargs)
         final_regions = self._normalized_regions(ocr_result)
         attempts: list[OCRAttempt] = []
         # The user-drawn box is already a focused OCR request. Never turn it

@@ -323,7 +323,12 @@ class TranslationEngineManager:
                 return self._translate_with_memory(self._engine(selected), page)
             except Exception as error:
                 selected_error = error
-                self._failed_engines.add(selected)
+                status = getattr(error, "status", None)
+                transient_http_error = status in {408, 429} or (
+                    isinstance(status, int) and 500 <= status < 600
+                )
+                if not transient_http_error:
+                    self._failed_engines.add(selected)
         if self.fallback_engine:
             try:
                 return self._translate_with_memory(self._engine(self.fallback_engine), page)

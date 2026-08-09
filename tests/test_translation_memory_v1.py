@@ -419,6 +419,7 @@ class TranslationMemoryUiAndEditTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_clear_memory_requires_confirmation_and_reports_completion(self):
+        from hydra_manga_tl.core.settings import SETTINGS
         from hydra_manga_tl.ui.dialogs import SettingsDialog
         import hydra_manga_tl.ui.dialogs as dialogs
 
@@ -451,8 +452,8 @@ class TranslationMemoryUiAndEditTests(unittest.TestCase):
                     self.assertGreaterEqual(dialog.translation_fallback.findData("openai_compatible"), 0)
                     self.assertIn("openai", dialog.keys)
                     self.assertIn("openai_compatible", dialog.keys)
-                    self.assertEqual(dialog.openai_compatible_base_url.text(), "https://agentrouter.org/v1")
-                    self.assertEqual(dialog.openai_compatible_model.text(), "moonshotai/kimi-k3-free")
+                    self.assertEqual(dialog.openai_compatible_base_url.text(), SETTINGS.openai_compatible_base_url)
+                    self.assertEqual(dialog.openai_compatible_model.text(), SETTINGS.openai_compatible_model)
                     dialog._clear_translation_memory()
                 self.assertEqual(memory.statistics().total_entries, 1)
                 with (

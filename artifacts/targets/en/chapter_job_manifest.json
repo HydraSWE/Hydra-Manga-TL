@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "updated_at": "2026-08-08T05:02:56.498421+00:00",
+  "updated_at": "2026-08-09T08:52:53.333829+00:00",
   "pages": {
     "second": {
       "image_id": "second",
@@ -10,7 +10,7 @@
       "stage_records": {},
       "stage_errors": {},
       "error": "",
-      "updated_at": "2026-08-08T05:02:56.497419+00:00"
+      "updated_at": "2026-08-09T08:52:53.323908+00:00"
     },
     "first": {
       "image_id": "first",
@@ -20,7 +20,7 @@
       "stage_records": {},
       "stage_errors": {},
       "error": "",
-      "updated_at": "2026-08-08T05:02:56.498421+00:00"
+      "updated_at": "2026-08-09T08:52:53.323908+00:00"
     },
     "page": {
       "image_id": "page",
@@ -30,7 +30,17 @@
       "stage_records": {},
       "stage_errors": {},
       "error": "",
-      "updated_at": "2026-08-08T05:02:56.484033+00:00"
+      "updated_at": "2026-08-09T08:52:53.303682+00:00"
+    },
+    "page-1": {
+      "image_id": "page-1",
+      "source_path": "1.png",
+      "state": "partial",
+      "completed_stages": [],
+      "stage_records": {},
+      "stage_errors": {},
+      "error": "",
+      "updated_at": "2026-08-09T08:52:53.333829+00:00"
     }
   }
 }

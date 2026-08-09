@@ -113,6 +113,81 @@ class ParallelPageSchedulerTests(unittest.TestCase):
         self.assertIn("先輩=Senpai", context)
         self.assertNotIn("translated_text", context)
 
+    def test_pipeline_worker_paths_can_be_injected_or_patched_through_facade(self):
+        with TemporaryDirectory() as raw:
+            explicit_paths = AppPaths(Path(raw) / "explicit")
+            patched_paths = AppPaths(Path(raw) / "patched")
+            injected = PipelineWorker(
+                [],
+                Path("."),
+                "en",
+                threading.Event(),
+                {"quality": "Fast"},
+                paths=explicit_paths,
+            )
+            fallback = PipelineWorker([], Path("."), "en", threading.Event(), {"quality": "Fast"})
+
+            self.assertIs(injected.paths(), explicit_paths)
+            with patch("hydra_manga_tl.phase.pipeline.PATHS", patched_paths):
+                self.assertIs(fallback.paths(), patched_paths)
+
+    def test_pipeline_worker_translation_runtime_can_be_injected_or_patched_through_facade(self):
+        explicit_runtime = object()
+        patched_runtime = object()
+        injected = PipelineWorker(
+            [],
+            Path("."),
+            "en",
+            threading.Event(),
+            {"quality": "Fast"},
+            translation_runtime=explicit_runtime,
+        )
+        fallback = PipelineWorker([], Path("."), "en", threading.Event(), {"quality": "Fast"})
+
+        self.assertIs(injected.translation_runtime(), explicit_runtime)
+        with patch("hydra_manga_tl.phase.pipeline.TRANSLATION_RUNTIME", patched_runtime):
+            self.assertIs(fallback.translation_runtime(), patched_runtime)
+
+    def test_pipeline_worker_ocr_service_factory_can_be_injected_or_patched_through_facade(self):
+        explicit_factory = object()
+        patched_factory = object()
+        injected = PipelineWorker(
+            [],
+            Path("."),
+            "en",
+            threading.Event(),
+            {"quality": "Fast"},
+            ocr_service_factory=explicit_factory,
+        )
+        fallback = PipelineWorker([], Path("."), "en", threading.Event(), {"quality": "Fast"})
+
+        self.assertIs(injected.ocr_service_factory(), explicit_factory)
+        with patch("hydra_manga_tl.phase.pipeline.OCRService", patched_factory):
+            self.assertIs(fallback.ocr_service_factory(), patched_factory)
+
+    def test_pipeline_worker_scheduler_and_logger_can_be_injected_or_patched_through_facade(self):
+        explicit_scheduler = object()
+        explicit_logger = object()
+        patched_scheduler = object()
+        patched_logger = object()
+        injected = PipelineWorker(
+            [],
+            Path("."),
+            "en",
+            threading.Event(),
+            {"quality": "Fast"},
+            scheduler_factory=explicit_scheduler,
+            logger=explicit_logger,
+        )
+        fallback = PipelineWorker([], Path("."), "en", threading.Event(), {"quality": "Fast"})
+
+        self.assertIs(injected.scheduler_factory(), explicit_scheduler)
+        self.assertIs(injected.logger(), explicit_logger)
+        with patch("hydra_manga_tl.phase.pipeline.SmartTranslationScheduler", patched_scheduler), \
+                patch("hydra_manga_tl.phase.pipeline.LOGGER", patched_logger):
+            self.assertIs(fallback.scheduler_factory(), patched_scheduler)
+            self.assertIs(fallback.logger(), patched_logger)
+
     def test_fast_pipeline_schedules_then_commits_pages_in_order(self):
         with TemporaryDirectory() as raw:
             root = Path(raw)
@@ -838,6 +913,55 @@ class SmartTranslationSchedulerTests(unittest.TestCase):
         self.assertEqual("", image.ocr_result)
         self.assertEqual("", image.translation_result)
         self.assertEqual("", image.rendered_image)
+        self.assertEqual("queued", image.status)
+
+    def test_force_retranslate_uses_injected_service_paths_for_cache_cleanup(self):
+        class Event:
+            def connect(self, callback):
+                self.callback = callback
+
+        class Queue:
+            def __init__(self):
+                self.failed = Event()
+                self.requests = ()
+
+            def submit_group(self, requests, handler):
+                self.requests = tuple(requests)
+                self.handler = handler
+                return object()
+
+        class Paths:
+            def __init__(self, root: Path):
+                self.ocr_cache = root / "ocr-cache"
+                self.page_translation_cache = root / "page-cache"
+                self.ocr_cache.mkdir(parents=True)
+                self.page_translation_cache.mkdir(parents=True)
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "page.png"
+            source.write_bytes(b"source")
+            project = MangaProject(
+                "project",
+                "Chapter",
+                str(root),
+                images=[ImageRecord("page", str(source), source.name, status="ready")],
+            )
+            image = project.images[0]
+            queue = Queue()
+            injected_paths = Paths(root / "cache")
+            service = PipelineService(queue, paths=injected_paths)
+            service.set_force_retranslate(True)
+            ocr_cache = injected_paths.ocr_cache / "page_old.json"
+            page_cache = injected_paths.page_translation_cache / "page_old.json"
+            ocr_cache.write_bytes(b"cache")
+            page_cache.write_bytes(b"cache")
+
+            self.assertTrue(service.process_project(project, {image.id}))
+
+        self.assertEqual(1, len(queue.requests))
+        self.assertFalse(ocr_cache.exists())
+        self.assertFalse(page_cache.exists())
         self.assertEqual("queued", image.status)
 
     def test_smart_scheduler_honors_effective_provider_workers(self):
