@@ -9,11 +9,11 @@
 
 #define MyAppName      "Hydra Manga TL"
 #ifndef MyAppVersion
-#define MyAppVersion   "1.0.0"
+#define MyAppVersion   "1.1.0"
 #endif
 #define MyAppPublisher "Hydra"
 
-#define ManifestUrl    "https://hydramangatl.annomous.com/offline_installer/v1/manifest.json"
+#define ManifestUrl    "https://hydramangatl.annomous.com/offline_installer/v1.1.0/manifest.json"
 
 [Setup]
 AppId={{7A2F8C3D-E4B1-4D6A-9F52-1C3E7A8B9D0F}
@@ -223,9 +223,12 @@ var
   ResultCode: Integer;
   PS1Code: AnsiString;
   ProgStr: AnsiString;
+  LastProgStr: String;
   ProgVal: Integer;
   StrSplit: Integer;
   ProgText: String;
+  IdleLoops: Integer;
+  DownloadedHash: String;
 begin
   Result := True;
 
@@ -292,25 +295,34 @@ begin
         DeleteFile(ExpandConstant('{tmp}\progress.txt'));
         DeleteFile(ExpandConstant('{tmp}\done.txt'));
         DeleteFile(ExpandConstant('{tmp}\error.txt'));
+        LastProgStr := '';
+        IdleLoops := 0;
         
         // Generate the PowerShell script for chunked streaming, writing progress to a file
         PS1Code :=
           '[CmdletBinding()]' + #13#10 +
           'param()' + #13#10 +
+          '$fileStream = $null' + #13#10 +
+          '$stream = $null' + #13#10 +
           'try {' + #13#10 +
           '$url = "' + ManifestUrl_ + '"' + #13#10 +
           '$path = "' + CachedFilePath + '"' + #13#10 +
           '$progFile = "' + ExpandConstant('{tmp}\progress.txt') + '"' + #13#10 +
           '$doneFile = "' + ExpandConstant('{tmp}\done.txt') + '"' + #13#10 +
           '$errFile = "' + ExpandConstant('{tmp}\error.txt') + '"' + #13#10 +
+          '[System.IO.File]::WriteAllText($progFile, "0|Connecting...")' + #13#10 +
           '$request = [System.Net.HttpWebRequest]::Create($url)' + #13#10 +
+          '$request.Timeout = 60000' + #13#10 +
+          '$request.ReadWriteTimeout = 60000' + #13#10 +
           '$response = $request.GetResponse()' + #13#10 +
           '$total = $response.ContentLength' + #13#10 +
           '$stream = $response.GetResponseStream()' + #13#10 +
+          '$stream.ReadTimeout = 60000' + #13#10 +
           '$fileStream = [System.IO.File]::Create($path)' + #13#10 +
           '$buffer = New-Object byte[] 65536' + #13#10 +
           '$downloaded = 0' + #13#10 +
           '$lastUpdate = [DateTime]::Now' + #13#10 +
+          '[System.IO.File]::WriteAllText($progFile, "0|Starting download...")' + #13#10 +
           'while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {' + #13#10 +
           '    $fileStream.Write($buffer, 0, $read)' + #13#10 +
           '    $downloaded += $read' + #13#10 +
@@ -323,10 +335,12 @@ begin
           '}' + #13#10 +
           '$fileStream.Close()' + #13#10 +
           '$stream.Close()' + #13#10 +
+          'if ($total -gt 0 -and $downloaded -lt $total) { throw "Download ended early: $downloaded of $total bytes received." }' + #13#10 +
+          '[System.IO.File]::WriteAllText($progFile, "100|Download complete")' + #13#10 +
           '[System.IO.File]::WriteAllText($doneFile, "OK")' + #13#10 +
           '} catch {' + #13#10 +
-          '  if ($null -ne $fileStream) { $fileStream.Close() }' + #13#10 +
-          '  if ($null -ne $stream) { $stream.Close() }' + #13#10 +
+          '  if ($null -ne $fileStream) { try { $fileStream.Close() } catch {} }' + #13#10 +
+          '  if ($null -ne $stream) { try { $stream.Close() } catch {} }' + #13#10 +
           '  [System.IO.File]::WriteAllText($errFile, $_.Exception.Message)' + #13#10 +
           '}';
         
@@ -347,6 +361,12 @@ begin
           if FileExists(ExpandConstant('{tmp}\progress.txt')) then begin
             if LoadStringFromFile(ExpandConstant('{tmp}\progress.txt'), ProgStr) then begin
               ProgStr := Trim(String(ProgStr));
+              if String(ProgStr) <> LastProgStr then begin
+                LastProgStr := String(ProgStr);
+                IdleLoops := 0;
+              end else begin
+                IdleLoops := IdleLoops + 1;
+              end;
               StrSplit := Pos('|', String(ProgStr));
               if StrSplit > 0 then begin
                 ProgVal := StrToIntDef(Copy(String(ProgStr), 1, StrSplit - 1), 0);
@@ -355,6 +375,8 @@ begin
                 ProgressPage.SetText('Downloading files...', ManifestFileName + ' (' + ProgText + ')');
               end;
             end;
+          end else begin
+            IdleLoops := IdleLoops + 1;
           end;
           
           if FileExists(ExpandConstant('{tmp}\done.txt')) then Break;
@@ -364,10 +386,34 @@ begin
             Result := False;
             Exit;
           end;
+          if IdleLoops > 1200 then begin
+            MsgBox('Download did not report progress for 2 minutes.' + #13#10 + #13#10 +
+                   'Please check your network connection and try again.',
+                   mbError, MB_OK);
+            Result := False;
+            Exit;
+          end;
         end;
         
       finally
         ProgressPage.Hide;
+      end;
+
+      ProgressPage.SetText('Verifying installer...', ManifestFileName);
+      ProgressPage.SetProgress(100, 100);
+      ProgressPage.Show;
+      try
+        DownloadedHash := Lowercase(GetSHA256OfFile(CachedFilePath));
+      finally
+        ProgressPage.Hide;
+      end;
+      if DownloadedHash <> ManifestSHA256 then begin
+        DeleteFile(CachedFilePath);
+        MsgBox('The downloaded installer did not match the manifest SHA-256.' + #13#10 + #13#10 +
+               'Please try again.',
+               mbCriticalError, MB_OK);
+        Result := False;
+        Exit;
       end;
     end;
 

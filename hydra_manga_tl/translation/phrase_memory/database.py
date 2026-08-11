@@ -343,6 +343,7 @@ class PhraseMemoryDatabase:
             return PhraseMemoryStatistics(
                 total_entries=total_entries,
                 verified_entries=verified_entries,
+                pending_entries=max(total_entries - verified_entries, 0),
                 total_matches=total_matches,
                 learned_count=learned_count,
                 saved_api_cost=saved_api_cost,
@@ -402,6 +403,30 @@ class PhraseMemoryDatabase:
                 (now, entry_id),
             )
             return cursor.rowcount > 0
+
+    def approve_entries(self, entry_ids: Iterable[int]) -> int:
+        ids = sorted({int(entry_id) for entry_id in entry_ids if entry_id is not None})
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                f"""
+                UPDATE pm_entries
+                SET verified = 1, updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                (now, *ids),
+            )
+            row = connection.execute(
+                f"""
+                SELECT COUNT(*) FROM pm_entries
+                WHERE verified = 1 AND id IN ({placeholders})
+                """,
+                ids,
+            ).fetchone()
+            return int(row[0]) if row is not None else 0
 
     def get_entry(self, entry_id: int) -> PhraseMemoryEntry | None:
         with self._connection() as connection:

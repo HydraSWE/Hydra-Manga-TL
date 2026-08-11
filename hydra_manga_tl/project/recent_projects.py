@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 import shutil
 
+from hydra_manga_tl import __version__
+
 
 RECENT_PROJECT_LIMIT = 500
 
@@ -25,7 +27,7 @@ class RecentProjectSummary:
     schema: str = "v1"
     created_by: str = ""
     last_saved_by: str = ""
-    minimum_app_version: str = "1.0.0"
+    minimum_app_version: str = __version__
     compatibility_status: str = "compatible"
     compatibility_message: str = ""
     # Processing state derived from persisted ImageRecord.status values

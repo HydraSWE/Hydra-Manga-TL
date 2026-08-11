@@ -208,9 +208,11 @@ class PhraseMemory:
     def toggle_verified(self, entry_id: int) -> bool:
         return self.database.toggle_verified(entry_id)
 
+    def approve_entries(self, entry_ids: Iterable[int]) -> int:
+        return self.database.approve_entries(entry_ids)
+
     def all_entries(self) -> list[PhraseMemoryEntry]:
         return self.database.all_entries()
 
 
 PHRASE_MEMORY = PhraseMemory()
-

@@ -92,6 +92,7 @@ class FilmstripControllerMixin:
 
     def _reset_project_view_state(self) -> None:
         self.stop_thumbnail_loading()
+        self._filmstrip_build_generation += 1
         self._filmstrip_project_id = ""
         self._filmstrip_items = {}
         self._ignore_next_open_page_selection = False
@@ -187,9 +188,15 @@ class FilmstripControllerMixin:
         selected_ids = {
             str(item.data(Qt.ItemDataRole.UserRole)) for item in self.filmstrip.selectedItems()
         } if project_id == self._filmstrip_project_id else set()
+        self.stop_thumbnail_loading()
+        self._filmstrip_build_generation += 1
+        generation = self._filmstrip_build_generation
         self.filmstrip.blockSignals(True); self.filmstrip.clear(); self._filmstrip_items = {}
         thumbnail_inputs: list[tuple[str, str]] = []
-        for image_index, image in enumerate(project.images):
+        chunk_size = max(1, int(getattr(self, "_filmstrip_build_chunk_size", 24) or 24))
+
+        def append_page_item(image_index: int) -> None:
+            image = project.images[image_index]
             image_id = image_ids[image_index]
             item = QListWidgetItem(); item.setData(Qt.ItemDataRole.UserRole, image_id)
             item.setSizeHint(FILMSTRIP_CARD_SIZE); item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -199,6 +206,40 @@ class FilmstripControllerMixin:
             if Path(image.source_path).is_file():
                 thumbnail_inputs.append((image_id, image.source_path))
 
+        def finish() -> None:
+            if generation != self._filmstrip_build_generation:
+                return
+            self._append_add_pages_item()
+            self._filmstrip_project_id = project_id
+            if current >= 0:
+                self.filmstrip.setCurrentRow(current)
+                self.filmstrip.clearSelection()
+            for image_id in selected_ids:
+                if image_id in self._filmstrip_items:
+                    self._filmstrip_items[image_id].setSelected(True)
+            self.filmstrip.blockSignals(False); self._selection_changed()
+            if thumbnail_inputs:
+                self._queue_thumbnail_loading(project_id, thumbnail_inputs)
+
+        def build_chunk(start: int) -> None:
+            if generation != self._filmstrip_build_generation:
+                return
+            stop = min(len(project.images), start + chunk_size)
+            for image_index in range(start, stop):
+                append_page_item(image_index)
+            if stop < len(project.images):
+                QTimer.singleShot(0, lambda next_start=stop: build_chunk(next_start))
+                return
+            finish()
+
+        if len(project.images) > chunk_size:
+            build_chunk(0)
+            return
+        for image_index in range(len(project.images)):
+            append_page_item(image_index)
+        finish()
+
+    def _append_add_pages_item(self) -> None:
         add_item = QListWidgetItem()
         add_item.setData(Qt.ItemDataRole.UserRole, "__add_pages__")
         add_item.setSizeHint(FILMSTRIP_CARD_SIZE)
@@ -208,17 +249,6 @@ class FilmstripControllerMixin:
         add_item.setToolTip("Click to import additional manga pages or folders into this project")
         add_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
         self.filmstrip.addItem(add_item)
-
-        self._filmstrip_project_id = project_id
-        if current >= 0:
-            self.filmstrip.setCurrentRow(current)
-            self.filmstrip.clearSelection()
-        for image_id in selected_ids:
-            if image_id in self._filmstrip_items:
-                self._filmstrip_items[image_id].setSelected(True)
-        self.filmstrip.blockSignals(False); self._selection_changed()
-        if thumbnail_inputs:
-            self._start_thumbnail_loading(project_id, thumbnail_inputs)
 
     def _current_filmstrip_items(self) -> dict[str, QListWidgetItem]:
         return {

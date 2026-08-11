@@ -29,6 +29,7 @@ from hydra_manga_tl.project.artifacts import (
     target_manifest_path,
     target_translation_path,
 )
+from hydra_manga_tl.ocr.service import current_rss_mb
 from hydra_manga_tl.translation.queue import RequestCancelled
 
 

@@ -172,7 +172,8 @@ class V1StabilityTests(unittest.TestCase):
         try:
             with patch.object(screen, "_queue_thumbnail_loading") as thumbnails:
                 screen.refresh(project)
-                app.processEvents()
+                for _ in range(10):
+                    app.processEvents()
             self.assertEqual(
                 [f"page-{index}" for index in range(45)],
                 screen.filmstrip.ordered_ids(),
@@ -183,6 +184,118 @@ class V1StabilityTests(unittest.TestCase):
             screen.close()
             WORKSPACE.current = previous
             APP_STATE.reset()
+
+    def test_workspace_selection_coalesces_full_image_loads(self):
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.core.state import APP_STATE
+        from hydra_manga_tl.ui import WorkspaceScreen
+        from hydra_manga_tl.project.workspace import WORKSPACE
+
+        app = QApplication.instance() or QApplication([])
+        previous = WORKSPACE.current
+        project = MangaProject("project", "Pages", ".", images=[
+            ImageRecord("one", "one.png", "one.png"),
+            ImageRecord("two", "two.png", "two.png"),
+            ImageRecord("three", "three.png", "three.png"),
+        ])
+        WORKSPACE.current = project
+        APP_STATE.set_project(project)
+        screen = WorkspaceScreen()
+        try:
+            with patch.object(screen, "_queue_thumbnail_loading"):
+                screen.refresh(project)
+                app.processEvents()
+            with patch.object(screen, "_load_image") as load_image:
+                APP_STATE.select(0, -1)
+                APP_STATE.select(1, -1)
+                APP_STATE.select(2, -1)
+                app.processEvents()
+            load_image.assert_called_once_with(2, -1)
+        finally:
+            screen.stop_thumbnail_loading()
+            screen.close()
+            WORKSPACE.current = previous
+            APP_STATE.reset()
+
+    def test_translation_warmup_state_tracks_active_ready_and_duplicate_guard(self):
+        from hydra_manga_tl.translation import runtime as translation_runtime
+        from hydra_manga_tl.translation.runtime import TranslationRuntimeConfig
+
+        with tempfile.TemporaryDirectory() as folder:
+            model_path = Path(folder) / "model.gguf"
+            model_path.write_bytes(b"gguf")
+            config = TranslationRuntimeConfig(
+                preferred_engine="qwen",
+                qwen_model_path=str(model_path),
+            )
+            release = threading.Event()
+
+            def warm(_config):
+                release.wait(1.0)
+                return True
+
+            with translation_runtime._LOCK:
+                original_threads = list(translation_runtime._WARMUP_THREADS)
+                original_states = dict(translation_runtime._WARMUP_STATES)
+                translation_runtime._WARMUP_THREADS.clear()
+                translation_runtime._WARMUP_STATES.clear()
+            try:
+                with patch.object(translation_runtime.TRANSLATION_RUNTIME, "warm", side_effect=warm):
+                    translation_runtime.start_translation_warmup(
+                        translation_engine="qwen",
+                        config=config,
+                    )
+                    self.assertTrue(translation_runtime.active_warmup_matches(config))
+                    self.assertEqual("warming", translation_runtime.current_warmup_state(config).state)
+                    translation_runtime.start_translation_warmup(
+                        translation_engine="qwen",
+                        config=config,
+                    )
+                    with translation_runtime._LOCK:
+                        self.assertEqual(1, len(translation_runtime._WARMUP_THREADS))
+                    release.set()
+                    translation_runtime.wait_for_translation_warmup(2.0)
+                self.assertEqual("ready", translation_runtime.current_warmup_state(config).state)
+                self.assertFalse(translation_runtime.active_warmup_matches(config))
+            finally:
+                release.set()
+                translation_runtime.wait_for_translation_warmup(1.0)
+                with translation_runtime._LOCK:
+                    translation_runtime._WARMUP_THREADS[:] = original_threads
+                    translation_runtime._WARMUP_STATES.clear()
+                    translation_runtime._WARMUP_STATES.update(original_states)
+
+    def test_translation_warmup_missing_qwen_model_reports_skipped(self):
+        from hydra_manga_tl.translation import runtime as translation_runtime
+        from hydra_manga_tl.translation.runtime import TranslationRuntimeConfig
+
+        with tempfile.TemporaryDirectory() as folder:
+            config = TranslationRuntimeConfig(
+                preferred_engine="qwen",
+                qwen_model_path=str(Path(folder) / "missing.gguf"),
+            )
+            with translation_runtime._LOCK:
+                original_threads = list(translation_runtime._WARMUP_THREADS)
+                original_states = dict(translation_runtime._WARMUP_STATES)
+                translation_runtime._WARMUP_THREADS.clear()
+                translation_runtime._WARMUP_STATES.clear()
+            try:
+                translation_runtime.start_translation_warmup(
+                    translation_engine="qwen",
+                    config=config,
+                )
+                self.assertEqual(
+                    "skipped",
+                    translation_runtime.current_warmup_state(config).state,
+                )
+                self.assertFalse(translation_runtime.active_warmup_matches(config))
+                with translation_runtime._LOCK:
+                    self.assertEqual([], translation_runtime._WARMUP_THREADS)
+            finally:
+                with translation_runtime._LOCK:
+                    translation_runtime._WARMUP_THREADS[:] = original_threads
+                    translation_runtime._WARMUP_STATES.clear()
+                    translation_runtime._WARMUP_STATES.update(original_states)
 
     def test_workspace_image_updated_targets_one_item_without_full_refresh(self):
         from PySide6.QtWidgets import QApplication
@@ -3722,6 +3835,38 @@ class V1StabilityTests(unittest.TestCase):
             )
         self.assertEqual({"batch:img-1": None}, result)
 
+    def test_sequential_pipeline_passes_memory_probe_to_ocr(self):
+        class StubOcrService:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            artifacts = root / "artifacts"
+            source = root / "page.png"
+            source.write_bytes(b"image")
+            worker = PipelineWorker(
+                [{"id": "page-1", "source_path": str(source)}],
+                artifacts,
+                "en",
+                threading.Event(),
+                config={"quality": "Balanced", "source_language": "auto"},
+                paths=SimpleNamespace(cache=root / "cache"),
+                ocr_service_factory=StubOcrService,
+            )
+            finished = []
+            worker.finished.connect(finished.append)
+
+            with patch.object(worker, "_resume_verified_render", return_value=False), \
+                    patch.object(worker, "_run_sequential_ocr", return_value={"cancelled": True}) as run_ocr:
+                worker.run()
+
+            self.assertEqual([True], finished)
+            self.assertTrue(callable(run_ocr.call_args.kwargs["current_rss_mb"]))
+
     def test_real_worker_process_starts_and_responds(self):
         client = OCRWorkerClient()
         try:
@@ -3930,8 +4075,11 @@ class V1StabilityTests(unittest.TestCase):
             gpu_thread.start()
             test_thread.start()
 
-            dialog._stop_threads()
+            with patch("hydra_manga_tl.ui.dialogs.QMessageBox.information"):
+                self.assertFalse(dialog._stop_threads())
 
+            self.assertTrue(gpu_thread.wait(1000))
+            self.assertTrue(test_thread.wait(1000))
             self.assertFalse(gpu_thread.isRunning())
             self.assertFalse(test_thread.isRunning())
             dialog.close()
@@ -3943,12 +4091,304 @@ class V1StabilityTests(unittest.TestCase):
         QApplication.instance() or QApplication([])
 
         with patch.object(SettingsDialog, "_refresh_translation_memory_stats"), \
+                patch("hydra_manga_tl.ui.dialogs.settings_actions.scan_local_qwen_models") as scan_models, \
                 patch.object(SettingsDialog, "_start_gpu_probe") as start_gpu_probe:
             dialog = SettingsDialog()
             try:
                 start_gpu_probe.assert_not_called()
+                scan_models.assert_not_called()
                 self.assertEqual("Not checked", dialog.gpu_status.text())
                 self.assertIn("Click Test GPU runtime", dialog.gpu_details.toPlainText())
+            finally:
+                dialog.close()
+
+    def test_settings_qwen_download_visibility_rules(self):
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.translation.engines.model_manager import ModelPackage
+        from hydra_manga_tl.ui.dialogs import SettingsDialog
+
+        QApplication.instance() or QApplication([])
+
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(SettingsDialog, "_refresh_translation_memory_stats"), \
+                patch("hydra_manga_tl.ui.dialogs.settings_actions.scan_local_qwen_models", return_value=[]):
+            root = Path(folder)
+            installed = root / "installed.gguf"
+            installed.write_bytes(b"GGUFmodel")
+            local_pkg = ModelPackage(
+                key="local:installed.gguf",
+                label="Local installed",
+                description="Local file",
+                filename=str(installed),
+                estimated_size_gb=0.0,
+                quantization="Local",
+                recommended_for="Local File",
+            )
+            dialog = SettingsDialog()
+            try:
+                dialog.qwen_model.setCurrentIndex(dialog.qwen_model.findData("qwen3-4b"))
+                dialog.qwen_model_path.setText(str(root / "missing.gguf"))
+                dialog._refresh_qwen_metadata()
+                self.assertFalse(dialog._qwen_download_row.isHidden())
+
+                dialog.qwen_model_path.setText(str(installed))
+                dialog._refresh_qwen_metadata()
+                self.assertTrue(dialog._qwen_download_row.isHidden())
+
+                custom_index = dialog.qwen_model.findData("custom_gguf")
+                dialog.qwen_model.setCurrentIndex(custom_index)
+                dialog._refresh_qwen_metadata()
+                self.assertTrue(dialog._qwen_download_row.isHidden())
+
+                dialog._local_qwen_models = [local_pkg]
+                dialog.qwen_model.insertItem(custom_index, local_pkg.label, local_pkg.key)
+                dialog.qwen_model.setCurrentIndex(dialog.qwen_model.findData(local_pkg.key))
+                dialog._refresh_qwen_metadata()
+                self.assertTrue(dialog._qwen_download_row.isHidden())
+                self.assertTrue(dialog._qwen_download_label.isHidden())
+                self.assertTrue(dialog._qwen_progress_label.isHidden())
+                self.assertTrue(dialog.qwen_progress.isHidden())
+            finally:
+                dialog.close()
+
+    def test_settings_qwen_download_progress_accepts_large_model_sizes(self):
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.ui.dialogs import SettingsDialog
+
+        QApplication.instance() or QApplication([])
+
+        with patch.object(SettingsDialog, "_refresh_translation_memory_stats"), \
+                patch("hydra_manga_tl.ui.dialogs.settings_actions.scan_local_qwen_models", return_value=[]):
+            dialog = SettingsDialog()
+            try:
+                class RunningThread:
+                    def isRunning(self):
+                        return True
+
+                    def requestInterruption(self):
+                        pass
+
+                    def quit(self):
+                        pass
+
+                dialog._qwen_download_thread = RunningThread()
+                dialog.qwen_download.setText("Resume Download")
+                dialog._refresh_qwen_download_state()
+                self.assertTrue(dialog.qwen_download.isHidden())
+                self.assertEqual("Download Model", dialog.qwen_download.text())
+                self.assertFalse(dialog.qwen_pause.isHidden())
+                self.assertFalse(dialog.qwen_cancel.isHidden())
+                self.assertTrue(dialog.qwen_test.isHidden())
+
+                bytes_done = 4_683_073_952
+                total_bytes = 5_000_000_000
+                dialog._qwen_download_progress(bytes_done, total_bytes)
+
+                self.assertEqual(93, dialog.qwen_progress.value())
+                self.assertIn("4.4/4.7 GB", dialog.qwen_status.text())
+                dialog._qwen_download_thread = None
+            finally:
+                dialog.close()
+
+    def test_settings_qwen_partial_download_shows_resume_and_cancel(self):
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.ui.dialogs import SettingsDialog
+
+        QApplication.instance() or QApplication([])
+
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(SettingsDialog, "_refresh_translation_memory_stats"), \
+                patch("hydra_manga_tl.ui.dialogs.settings_actions.scan_local_qwen_models", return_value=[]):
+            root = Path(folder)
+            destination = root / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+            Path(f"{destination}.part").write_bytes(b"GGUFpartial")
+            dialog = SettingsDialog()
+            try:
+                dialog.qwen_model.setCurrentIndex(dialog.qwen_model.findData("qwen3-4b"))
+                dialog.qwen_model_path.setText(str(destination))
+                dialog._refresh_qwen_metadata()
+
+                self.assertEqual("Resume Download", dialog.qwen_download.text())
+                self.assertFalse(dialog.qwen_download.isHidden())
+                self.assertTrue(dialog.qwen_pause.isHidden())
+                self.assertFalse(dialog.qwen_cancel.isHidden())
+                self.assertIn("Paused", dialog.qwen_status.text())
+
+                dialog._cancel_qwen_download()
+                self.assertFalse(Path(f"{destination}.part").exists())
+                self.assertEqual("Download Model", dialog.qwen_download.text())
+                self.assertTrue(dialog.qwen_cancel.isHidden())
+            finally:
+                dialog.close()
+
+    def test_settings_qwen_pause_finish_switches_to_resume_even_before_thread_signal(self):
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.ui.dialogs import SettingsDialog
+
+        QApplication.instance() or QApplication([])
+
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(SettingsDialog, "_refresh_translation_memory_stats"), \
+                patch("hydra_manga_tl.ui.dialogs.settings_actions.scan_local_qwen_models", return_value=[]):
+            root = Path(folder)
+            destination = root / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+            Path(f"{destination}.part").write_bytes(b"GGUFpartial")
+
+            class RunningThread:
+                def isRunning(self):
+                    return True
+
+            dialog = SettingsDialog()
+            try:
+                dialog.qwen_model.setCurrentIndex(dialog.qwen_model.findData("qwen3-4b"))
+                dialog._qwen_download_thread = RunningThread()
+                dialog._qwen_download_worker = object()
+                dialog._qwen_download_destination = str(destination)
+                dialog._qwen_download_finished(False, "", "Model download was paused.")
+
+                self.assertIsNone(dialog._qwen_download_thread)
+                self.assertEqual(str(destination), dialog.qwen_model_path.text())
+                self.assertEqual("Resume Download", dialog.qwen_download.text())
+                self.assertFalse(dialog.qwen_download.isHidden())
+                self.assertTrue(dialog.qwen_pause.isHidden())
+                self.assertFalse(dialog.qwen_cancel.isHidden())
+                self.assertIn("Paused", dialog.qwen_status.text())
+            finally:
+                dialog._qwen_download_thread = None
+                dialog.close()
+
+    def test_settings_qwen_download_worker_signals_are_bridged_to_ui_signal(self):
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.ui.dialogs import SettingsDialog
+
+        QApplication.instance() or QApplication([])
+
+        with patch.object(SettingsDialog, "_refresh_translation_memory_stats"), \
+                patch("hydra_manga_tl.ui.dialogs.settings_actions.scan_local_qwen_models", return_value=[]):
+            dialog = SettingsDialog()
+            try:
+                captured = []
+                dialog.qwen_download_progress_changed.connect(
+                    lambda done, total: captured.append(("progress", done, total))
+                )
+                dialog.qwen_download_completed.connect(
+                    lambda ok, path, message: captured.append(("completed", ok, path, message))
+                )
+
+                class Emitter:
+                    def __init__(self):
+                        self._callback = None
+
+                    def connect(self, callback):
+                        self._callback = callback
+
+                    def emit(self, *args):
+                        self._callback(*args)
+
+                class FakeWorker:
+                    progress = Emitter()
+                    completed = Emitter()
+
+                class FakeThread:
+                    started = Emitter()
+                    finished = Emitter()
+
+                    def start(self):
+                        pass
+
+                dialog._qwen_download_worker = FakeWorker()
+                dialog._qwen_download_thread = FakeThread()
+                dialog._qwen_download_worker.progress.connect(
+                    dialog.qwen_download_progress_changed.emit
+                )
+                dialog._qwen_download_worker.completed.connect(
+                    dialog.qwen_download_completed.emit
+                )
+
+                dialog._qwen_download_worker.progress.emit(5_000_000_000, 6_000_000_000)
+                dialog._qwen_download_worker.completed.emit(False, "", "Model download was paused.")
+
+                self.assertEqual(("progress", 5_000_000_000, 6_000_000_000), captured[0])
+                self.assertEqual(("completed", False, "", "Model download was paused."), captured[1])
+            finally:
+                dialog._qwen_download_thread = None
+                dialog.close()
+
+    def test_settings_qwen_test_reuses_matching_startup_warmup(self):
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.ui.dialogs import SettingsDialog
+
+        QApplication.instance() or QApplication([])
+
+        with patch.object(SettingsDialog, "_refresh_translation_memory_stats"), \
+                patch("hydra_manga_tl.ui.dialogs.settings_actions.scan_local_qwen_models", return_value=[]), \
+                patch("hydra_manga_tl.translation.runtime.active_warmup_matches", return_value=True):
+            dialog = SettingsDialog()
+            try:
+                dialog._test_qwen_translation()
+                self.assertIsNone(dialog._test_thread)
+                self.assertFalse(dialog.qwen_test.isEnabled())
+                self.assertEqual("Local engine is still warming up", dialog.qwen_status.text())
+            finally:
+                dialog.close()
+
+    def test_settings_qwen_test_result_is_handled_on_ui_thread(self):
+        from PySide6.QtCore import QObject, QEventLoop, QThread, QTimer, Signal, Slot
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.ui.dialogs import SettingsDialog
+
+        app = QApplication.instance() or QApplication([])
+        captured = {}
+
+        class FakeTranslationTestWorker(QObject):
+            completed = Signal(bool, str)
+            finished = Signal()
+
+            def __init__(self, **_kwargs):
+                super().__init__()
+
+            @Slot()
+            def run(self):
+                self.completed.emit(
+                    False,
+                    "Requested engine: qwen\nBackend: llama.cpp\nNative load: Failed",
+                )
+                self.finished.emit()
+
+            def cancel(self):
+                pass
+
+        def warning(_parent, title, text):
+            captured["title"] = title
+            captured["text"] = text
+            captured["ui_thread"] = _parent.thread() == QThread.currentThread()
+            return None
+
+        with patch.object(SettingsDialog, "_refresh_translation_memory_stats"), \
+                patch("hydra_manga_tl.ui.dialogs.settings_actions.scan_local_qwen_models", return_value=[]), \
+                patch("hydra_manga_tl.translation.runtime.active_warmup_matches", return_value=False), \
+                patch("hydra_manga_tl.ui.dialogs.settings_actions.TranslationTestWorker", FakeTranslationTestWorker), \
+                patch("hydra_manga_tl.ui.dialogs.settings_actions.QMessageBox.warning", side_effect=warning):
+            dialog = SettingsDialog()
+            try:
+                dialog._test_qwen_translation()
+                loop = QEventLoop()
+
+                def poll():
+                    if captured or dialog._test_thread is None:
+                        loop.quit()
+                    else:
+                        QTimer.singleShot(10, poll)
+
+                QTimer.singleShot(10, poll)
+                QTimer.singleShot(1000, loop.quit)
+                loop.exec()
+
+                self.assertTrue(captured.get("ui_thread"))
+                self.assertEqual("Local engine diagnostics failed", captured.get("title"))
+                self.assertIn("Native load: Failed", captured.get("text", ""))
+                self.assertTrue(dialog.qwen_test.isEnabled())
+                self.assertEqual("Test local engine", dialog.qwen_test.text())
             finally:
                 dialog.close()
 
@@ -3970,6 +4410,7 @@ class V1StabilityTests(unittest.TestCase):
                 self.quit_requested = True
 
             def wait(self, _timeout):
+                self.wait_called = True
                 return False
 
         class Event:
@@ -3982,6 +4423,7 @@ class V1StabilityTests(unittest.TestCase):
         dialog._gpu_thread = RunningThread()
         dialog._test_thread = None
         event = Event()
+        dialog._gpu_thread.wait_called = False
 
         with patch("hydra_manga_tl.ui.dialogs.QMessageBox.information"):
             self.assertFalse(SettingsDialog._stop_threads(dialog))
@@ -3989,6 +4431,7 @@ class V1StabilityTests(unittest.TestCase):
 
         self.assertTrue(dialog._gpu_thread.interrupted)
         self.assertTrue(dialog._gpu_thread.quit_requested)
+        self.assertFalse(dialog._gpu_thread.wait_called)
         self.assertTrue(event.ignored)
 
 

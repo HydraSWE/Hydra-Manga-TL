@@ -187,6 +187,27 @@ class EditorControllerMixin(EditorHistoryMixin):
         self.translated.set_content(final, self._groups, block)
         if block >= 0: self._load_block(block)
 
+    def _schedule_image_load(self, index: int, block: int = -1) -> None:
+        self._pending_image_load = (index, block)
+        if self._image_load_pending:
+            return
+        self._image_load_pending = True
+        QTimer.singleShot(0, self._flush_pending_image_load)
+
+    def _flush_pending_image_load(self) -> None:
+        self._image_load_pending = False
+        pending = self._pending_image_load
+        self._pending_image_load = None
+        if pending is None:
+            return
+        index, block = pending
+        project = WORKSPACE.current
+        if project is None or not (0 <= index < len(project.images)):
+            return
+        if APP_STATE.selected_image != index:
+            return
+        self._load_image(index, block)
+
     def _load_block(self, row: int) -> None:
         if not (0 <= row < len(self._groups)): return
         group = self._groups[row]; image = WORKSPACE.current.images[APP_STATE.selected_image]
@@ -327,7 +348,7 @@ class EditorControllerMixin(EditorHistoryMixin):
             self._ignore_next_open_page_selection = 0
             if WORKSPACE.current is not None and WORKSPACE.current.selected_image != image:
                 WORKSPACE.current.selected_image = image; WORKSPACE.save()
-            self.filmstrip.blockSignals(True); self.filmstrip.setCurrentRow(image); self.filmstrip.blockSignals(False); self._load_image(image, block)
+            self.filmstrip.blockSignals(True); self.filmstrip.setCurrentRow(image); self.filmstrip.blockSignals(False); self._schedule_image_load(image, block)
 
     def _set_quality(self, quality: str) -> None:
         if WORKSPACE.current is not None and WORKSPACE.current.quality != quality:

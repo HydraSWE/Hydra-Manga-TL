@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import sys
+import threading
 
 from .common import *  # noqa: F401,F403
 from .gpu import GpuDiagnosticsWorker
 from .phrase_memory import PhraseMemoryManagerDialog
 from .translation_test import TranslationTestWorker
+from hydra_manga_tl.translation.engines.model_download import (
+    ModelDownloadCancelled,
+    download_model_file,
+    partial_model_download_size,
+    remove_partial_model_download,
+)
 
 
 def _translation_memory():
@@ -15,7 +22,79 @@ def _translation_memory():
     return getattr(package, "TRANSLATION_MEMORY", TRANSLATION_MEMORY)
 
 
+class QwenModelDownloadWorker(QObject):
+    progress = Signal(object, object)
+    completed = Signal(bool, str, str)
+    finished = Signal()
+
+    def __init__(self, package: ModelPackage, destination: Path) -> None:
+        super().__init__()
+        self._package = package
+        self._destination = destination
+        self._cancelled = threading.Event()
+        self._remove_partial = False
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            path = download_model_file(
+                url=self._package.download_url,
+                destination=self._destination,
+                min_size_bytes=self._package.min_download_size_bytes,
+                progress=self.progress.emit,
+                cancel_requested=self._cancelled.is_set,
+                remove_partial_on_cancel=self._remove_partial,
+            )
+        except ModelDownloadCancelled:
+            if self._remove_partial:
+                self.completed.emit(False, "", "Model download was cancelled.")
+            else:
+                self.completed.emit(False, "", "Model download was paused.")
+        except Exception as error:
+            self.completed.emit(False, "", str(error) or "Model download failed.")
+        else:
+            self.completed.emit(True, str(path), "")
+        finally:
+            self.finished.emit()
+
+    def cancel(self, *, remove_partial: bool = False) -> None:
+        self._remove_partial = bool(remove_partial)
+        self._cancelled.set()
+
+
 class SettingsActionsMixin:
+    def _deferred_settings_refresh(self) -> None:
+        self._load_local_qwen_models()
+        self._refresh_qwen_metadata()
+        self._refresh_translation_memory_stats()
+
+    def _load_local_qwen_models(self) -> None:
+        if getattr(self, "_local_qwen_models_loaded", False):
+            return
+        self._local_qwen_models_loaded = True
+        self._local_qwen_models = list(scan_local_qwen_models())
+        existing = {
+            str(self.qwen_model.itemData(index) or "")
+            for index in range(self.qwen_model.count())
+        }
+        custom_index = self.qwen_model.findData("custom_gguf")
+        for local_pkg in self._local_qwen_models:
+            if local_pkg.key in existing:
+                continue
+            insert_at = custom_index if custom_index >= 0 else self.qwen_model.count()
+            self.qwen_model.insertItem(insert_at, local_pkg.label, local_pkg.key)
+            if custom_index >= 0:
+                custom_index += 1
+            existing.add(local_pkg.key)
+        if SETTINGS.qwen_model_path:
+            filename = Path(SETTINGS.qwen_model_path).name
+            for index in range(self.qwen_model.count()):
+                data = str(self.qwen_model.itemData(index) or "")
+                if data == SETTINGS.qwen_model_path or filename in data:
+                    self.qwen_model.setCurrentIndex(index)
+                    break
+        self._refresh_qwen_download_state()
+
     def _apply_openai_compatible_preset(self) -> None:
         if self.openai_compatible_preset.currentData() != "kimi_tokenrouter":
             return
@@ -170,26 +249,30 @@ class SettingsActionsMixin:
         if not key:
             return
         if str(key).startswith("local:"):
-            for pkg in scan_local_qwen_models():
+            packages = list(getattr(self, "_local_qwen_models", [])) or scan_local_qwen_models()
+            for pkg in packages:
                 if pkg.key == key:
                     self.qwen_model_path.setText(pkg.filename)
                     self.qwen_status.setText("Installed" if Path(pkg.filename).exists() else "Not installed")
                     self._refresh_qwen_metadata()
+                    self._refresh_qwen_download_state()
                     break
         elif key == "custom_gguf":
             path = self.qwen_model_path.text().strip()
             self.qwen_status.setText("Installed" if path and Path(path).exists() else "Not installed")
             self._refresh_qwen_metadata()
+            self._refresh_qwen_download_state()
         else:
             package = KNOWN_MODEL_PACKAGES.get(key)
             if package:
-                default_path = Path.cwd() / "models" / "qwen" / package.filename
+                default_path = Path.cwd() / "models" / "qwen" / package.target_filename
+                self.qwen_model_path.setText(str(default_path))
                 if default_path.exists():
-                    self.qwen_model_path.setText(str(default_path))
                     self.qwen_status.setText("Installed")
                 else:
                     self.qwen_status.setText("Not installed")
                 self._refresh_qwen_metadata()
+                self._refresh_qwen_download_state()
 
     def _browse_qwen_model(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select Qwen GGUF model", "", "GGUF models (*.gguf);;All files (*.*)")
@@ -210,6 +293,7 @@ class SettingsActionsMixin:
                 if custom_idx >= 0:
                     self.qwen_model.setCurrentIndex(custom_idx)
             self._refresh_qwen_metadata()
+            self._refresh_qwen_download_state()
 
     def _browse_app_data_root(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -300,14 +384,195 @@ class SettingsActionsMixin:
         )
 
     def _download_qwen_model(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Save Qwen GGUF model", "", "GGUF models (*.gguf);;All files (*.*)")
-        if path:
-            self.qwen_model_path.setText(path)
-            self.qwen_status.setText("Ready to download")
+        if self._qwen_download_thread is not None and self._qwen_download_thread.isRunning():
+            return
+        package = self._selected_downloadable_qwen_package()
+        if package is None:
+            self._refresh_qwen_download_state()
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Qwen model download folder",
+            str(Path.cwd() / "models" / "qwen"),
+        )
+        if not folder:
+            return
+        destination = Path(folder) / package.target_filename
+        self._qwen_previous_path = self.qwen_model_path.text().strip()
+        self._qwen_download_destination = str(destination)
+        if destination.exists():
+            try:
+                from hydra_manga_tl.translation.engines.model_download import validate_gguf_model_file
+
+                validate_gguf_model_file(
+                    destination,
+                    min_size_bytes=package.min_download_size_bytes,
+                )
+            except Exception as error:
+                QMessageBox.warning(
+                    self,
+                    "Model download failed",
+                    str(error) or "The existing model file could not be used.",
+                )
+                self._refresh_qwen_download_state()
+                return
+            self.qwen_model_path.setText(str(destination))
+            self.qwen_status.setText("Installed")
             self._refresh_qwen_metadata()
+            self._refresh_qwen_download_state()
+            return
+
+        self.qwen_model_path.setText(str(destination))
+        self.qwen_status.setText("Downloading...")
+        self.qwen_progress.setValue(0)
+        self.qwen_progress.setVisible(True)
+        self.qwen_progress.setFormat("%p%")
+        self._set_qwen_download_controls_enabled(False)
+
+        self._qwen_download_thread = QThread(self)
+        self._qwen_download_worker = QwenModelDownloadWorker(package, destination)
+        self._qwen_download_worker.moveToThread(self._qwen_download_thread)
+        self._qwen_download_thread.started.connect(self._qwen_download_worker.run)
+        self._qwen_download_worker.progress.connect(self.qwen_download_progress_changed.emit)
+        self._qwen_download_worker.completed.connect(self.qwen_download_completed.emit)
+        self._qwen_download_worker.finished.connect(self._qwen_download_thread.quit)
+        self._qwen_download_worker.finished.connect(self._qwen_download_worker.deleteLater)
+        self._qwen_download_thread.finished.connect(self._clear_qwen_download_thread)
+        self._qwen_download_thread.start()
+        self._refresh_qwen_download_state()
+
+    def _pause_qwen_download(self) -> None:
+        worker = getattr(self, "_qwen_download_worker", None)
+        cancel = getattr(worker, "cancel", None)
+        if callable(cancel):
+            cancel(remove_partial=False)
+        self.qwen_status.setText("Pausing download...")
+
+    def _cancel_qwen_download(self) -> None:
+        worker = getattr(self, "_qwen_download_worker", None)
+        cancel = getattr(worker, "cancel", None)
+        if callable(cancel):
+            cancel(remove_partial=False)
+            self.qwen_status.setText("Stopping download...")
+            return
+        path = self.qwen_model_path.text().strip()
+        if path:
+            remove_partial_model_download(path)
+        self.qwen_status.setText("Download cancelled")
+        self._refresh_qwen_download_state()
+
+    @Slot(object, object)
+    def _qwen_download_progress(self, bytes_done: object, total_bytes: object) -> None:
+        try:
+            done = int(bytes_done)
+        except (TypeError, ValueError, OverflowError):
+            done = 0
+        try:
+            total = int(total_bytes)
+        except (TypeError, ValueError, OverflowError):
+            total = 0
+        if total > 0:
+            percent = max(0, min(100, int(done * 100 / total)))
+            self.qwen_progress.setRange(0, 100)
+            self.qwen_progress.setValue(percent)
+            self.qwen_progress.setFormat(f"{percent}%")
+        else:
+            self.qwen_progress.setRange(0, 0)
+            self.qwen_progress.setFormat("Downloading...")
+        downloaded_gb = done / (1024 ** 3)
+        if total > 0:
+            total_gb = total / (1024 ** 3)
+            self.qwen_status.setText(f"Downloading model... {downloaded_gb:.1f}/{total_gb:.1f} GB")
+        else:
+            self.qwen_status.setText(f"Downloading model... {downloaded_gb:.1f} GB")
+
+    @Slot(bool, str, str)
+    def _qwen_download_finished(self, ok: bool, path: str, message: str) -> None:
+        self.qwen_progress.setVisible(False)
+        self.qwen_progress.setRange(0, 100)
+        self._set_qwen_download_controls_enabled(True)
+        self._qwen_download_thread = None
+        self._qwen_download_worker = None
+        if ok:
+            self.qwen_model_path.setText(path)
+            self.qwen_status.setText("Installed")
+            self._refresh_qwen_metadata()
+            self._refresh_qwen_download_state()
+            return
+        previous_path = getattr(self, "_qwen_previous_path", "")
+        self.qwen_model_path.setText(previous_path)
+        current_destination = getattr(self, "_qwen_download_destination", "")
+        partial_size = partial_model_download_size(current_destination) if current_destination else 0
+        if "paused" in message.lower() and partial_size > 0:
+            self.qwen_model_path.setText(current_destination)
+            self.qwen_status.setText("Paused - ready to resume")
+        elif "cancelled" in message.lower():
+            self.qwen_status.setText("Download cancelled")
+        else:
+            self.qwen_status.setText(
+                "Installed" if previous_path and Path(previous_path).is_file() else "Download incomplete"
+            )
+        self._refresh_qwen_download_state()
+        if "paused" in message.lower() or "cancelled" in message.lower():
+            return
+        QMessageBox.warning(
+            self,
+            "Model download failed",
+            message or "Hydra could not download the selected Qwen model.",
+        )
+
+    @Slot()
+    def _clear_qwen_download_thread(self) -> None:
+        sender = self.sender()
+        if sender is None or sender is self._qwen_download_thread:
+            self._qwen_download_thread = None
+            self._qwen_download_worker = None
 
     def _test_qwen_translation(self) -> None:
         if self._test_thread is not None and self._test_thread.isRunning():
+            return
+        from hydra_manga_tl.translation.runtime import (
+            TranslationRuntimeConfig,
+            active_warmup_matches,
+        )
+
+        runtime_config = TranslationRuntimeConfig(
+            preferred_engine="qwen",
+            fallback_engine="",
+            qwen_model_path=self.qwen_model_path.text().strip(),
+            qwen_model_name=str(self.qwen_model.currentData() or "qwen3-4b"),
+            provider_models=tuple(sorted((
+                ("groq", self.groq_model.text().strip() or SETTINGS.groq_model),
+                ("gemini", self.gemini_model.text().strip() or SETTINGS.gemini_model),
+                ("deepseek", self.deepseek_model.text().strip() or SETTINGS.deepseek_model),
+                ("openai", self.openai_model.text().strip() or SETTINGS.openai_model),
+                (
+                    "openai_compatible",
+                    self.openai_compatible_model.text().strip()
+                    or SETTINGS.openai_compatible_model,
+                ),
+            ))),
+            provider_base_urls=tuple(sorted((
+                (
+                    "openai_compatible",
+                    self.openai_compatible_base_url.text().strip().rstrip("/")
+                    or SETTINGS.openai_compatible_base_url,
+                ),
+            ))),
+            allow_local_fallback_for_cloud=True,
+            translation_memory_enabled=False,
+        )
+        startup_config = TranslationRuntimeConfig.from_mapping({
+            "translation_engine": "qwen",
+            "translation_fallback_engine": SETTINGS.translation_fallback_engine,
+            "qwen_model_path": self.qwen_model_path.text().strip(),
+            "qwen_model_name": self.qwen_model.currentData() or "qwen3-4b",
+        })
+        if active_warmup_matches(runtime_config) or active_warmup_matches(startup_config):
+            self.qwen_status.setText("Local engine is still warming up")
+            self.qwen_test.setEnabled(False)
+            self.qwen_test.setText("Warmup in progress...")
+            QTimer.singleShot(1200, self._refresh_qwen_test_after_warmup)
             return
         self.qwen_test.setEnabled(False)
         self.qwen_test.setText("Testing local engine...")
@@ -336,11 +601,37 @@ class SettingsActionsMixin:
         )
         self._test_worker.moveToThread(self._test_thread)
         self._test_thread.started.connect(self._test_worker.run)
-        self._test_worker.completed.connect(self._translation_test_finished)
-        self._test_worker.completed.connect(self._test_thread.quit)
-        self._test_thread.finished.connect(self._test_worker.deleteLater)
+        self._test_worker.completed.connect(self.translation_test_completed.emit)
+        self._test_worker.finished.connect(self._test_thread.quit)
+        self._test_worker.finished.connect(self._test_worker.deleteLater)
         self._test_thread.finished.connect(self._clear_translation_test_thread)
         self._test_thread.start()
+
+    def _refresh_qwen_test_after_warmup(self) -> None:
+        from hydra_manga_tl.translation.runtime import (
+            TranslationRuntimeConfig,
+            active_warmup_matches,
+            current_warmup_state,
+        )
+
+        runtime_config = TranslationRuntimeConfig.from_mapping({
+            "translation_engine": "qwen",
+            "translation_fallback_engine": SETTINGS.translation_fallback_engine,
+            "qwen_model_path": self.qwen_model_path.text().strip(),
+            "qwen_model_name": self.qwen_model.currentData() or "qwen3-4b",
+        })
+        if active_warmup_matches(runtime_config):
+            QTimer.singleShot(1200, self._refresh_qwen_test_after_warmup)
+            return
+        state = current_warmup_state(runtime_config)
+        if state.state == "ready":
+            self.qwen_status.setText("Installed")
+        elif state.state == "failed":
+            self.qwen_status.setText("Warmup failed")
+        elif state.state == "skipped":
+            self.qwen_status.setText("Not installed")
+        self.qwen_test.setEnabled(True)
+        self.qwen_test.setText("Test local engine")
 
     @Slot(bool, str)
     def _translation_test_finished(self, ok: bool, message: str) -> None:
@@ -353,7 +644,11 @@ class SettingsActionsMixin:
                 message or "The engine returned an empty translation.",
             )
         else:
-            QMessageBox.warning(self, "Local engine diagnostics failed", manual_translation_error(message))
+            QMessageBox.warning(
+                self,
+                "Local engine diagnostics failed",
+                message or "Local engine diagnostics did not return details.",
+            )
 
     @Slot()
     def _clear_translation_test_thread(self) -> None:
@@ -365,12 +660,17 @@ class SettingsActionsMixin:
         package = KNOWN_MODEL_PACKAGES.get(key)
         if package is not None:
             self.qwen_estimate.setText(f"{package.label} · {package.quantization} · {package.estimated_download} · {package.recommended_for}")
+            self._refresh_qwen_download_state()
             return
         if str(key).startswith("local:"):
-            for pkg in scan_local_qwen_models():
+            for pkg in getattr(self, "_local_qwen_models", []):
                 if pkg.key == key:
                     self.qwen_estimate.setText(f"{pkg.label} · Local GGUF file · Size: {pkg.estimated_download}")
+                    self._refresh_qwen_download_state()
                     return
+            self.qwen_estimate.setText("Local GGUF model")
+            self._refresh_qwen_download_state()
+            return
         path_str = self.qwen_model_path.text().strip()
         if path_str and Path(path_str).is_file():
             try:
@@ -380,6 +680,90 @@ class SettingsActionsMixin:
                 self.qwen_estimate.setText(f"Custom Model · File: {Path(path_str).name}")
         else:
             self.qwen_estimate.setText("Custom GGUF model — specify file path via Browse button")
+        self._refresh_qwen_download_state()
+
+    def _selected_downloadable_qwen_package(self) -> ModelPackage | None:
+        key = str(self.qwen_model.currentData() or "")
+        package = KNOWN_MODEL_PACKAGES.get(key)
+        if package is None or not package.download_url:
+            return None
+        return package
+
+    def _refresh_qwen_download_state(self) -> None:
+        if not hasattr(self, "qwen_download"):
+            return
+        running = (
+            self._qwen_download_thread is not None
+            and self._qwen_download_thread.isRunning()
+        )
+        if running:
+            self._set_qwen_row_visible("download", True)
+            self._set_qwen_row_visible("progress", True)
+            self.qwen_download.setVisible(False)
+            self.qwen_download.setText("Download Model")
+            self.qwen_pause.setVisible(True)
+            self.qwen_cancel.setVisible(True)
+            self.qwen_progress.setVisible(True)
+            self.qwen_test.setVisible(False)
+            return
+        self.qwen_pause.setVisible(False)
+        self.qwen_cancel.setVisible(False)
+        self.qwen_test.setVisible(True)
+        package = self._selected_downloadable_qwen_package()
+        if package is None:
+            self._set_qwen_row_visible("download", False)
+            self._set_qwen_row_visible("progress", False)
+            path = Path(self.qwen_model_path.text().strip() or "")
+            self.qwen_test.setVisible(path.is_file())
+            return
+        path = Path(self.qwen_model_path.text().strip() or "")
+        installed = path.is_file()
+        if installed:
+            self.qwen_status.setText("Installed")
+            self._set_qwen_row_visible("download", False)
+            self._set_qwen_row_visible("progress", False)
+            self.qwen_test.setVisible(True)
+            return
+        partial_size = 0 if installed else partial_model_download_size(path)
+        if partial_size > 0:
+            self._set_qwen_row_visible("download", True)
+            self._set_qwen_row_visible("progress", True)
+            self.qwen_download.setText("Resume Download")
+            self.qwen_status.setText("Paused - ready to resume")
+            self.qwen_progress.setVisible(True)
+            self.qwen_progress.setRange(0, 100)
+            self.qwen_progress.setValue(0)
+            self.qwen_progress.setFormat(f"Partial: {partial_size / (1024 ** 3):.1f} GB")
+            self.qwen_cancel.setVisible(True)
+            self.qwen_test.setVisible(False)
+        else:
+            self._set_qwen_row_visible("download", True)
+            self._set_qwen_row_visible("progress", False)
+            self.qwen_download.setText("Download Model")
+            self.qwen_cancel.setVisible(False)
+            self.qwen_test.setVisible(False)
+        self.qwen_download.setVisible(not installed)
+        self.qwen_download.setEnabled(not installed)
+
+    def _set_qwen_download_controls_enabled(self, enabled: bool) -> None:
+        self.qwen_model.setEnabled(enabled)
+        self.qwen_model_path.setEnabled(enabled)
+        self.qwen_browse.setEnabled(enabled)
+        self.qwen_test.setEnabled(enabled)
+
+    def _set_qwen_row_visible(self, row_name: str, visible: bool) -> None:
+        if row_name == "download":
+            row_widget = getattr(self, "_qwen_download_row", None)
+            label = getattr(self, "_qwen_download_label", None)
+        elif row_name == "progress":
+            row_widget = self.qwen_progress
+            label = getattr(self, "_qwen_progress_label", None)
+        else:
+            return
+        if row_widget is not None:
+            row_widget.setVisible(visible)
+        if label is not None:
+            label.setVisible(visible)
 
     def _open_phrase_memory_manager(self) -> None:
         dialog = PhraseMemoryManagerDialog(self)
@@ -648,7 +1032,7 @@ class SettingsActionsMixin:
         if gpu_thread is not None and gpu_thread.isRunning():
             gpu_thread.requestInterruption()
             gpu_thread.quit()
-            stopped = gpu_thread.wait(5000) and stopped
+            stopped = False
         test_thread = getattr(self, "_test_thread", None)
         if test_thread is not None and test_thread.isRunning():
             test_worker = getattr(self, "_test_worker", None)
@@ -657,12 +1041,21 @@ class SettingsActionsMixin:
                 cancel()
             test_thread.requestInterruption()
             test_thread.quit()
-            stopped = test_thread.wait(5000) and stopped
+            stopped = False
+        download_thread = getattr(self, "_qwen_download_thread", None)
+        if download_thread is not None and download_thread.isRunning():
+            download_worker = getattr(self, "_qwen_download_worker", None)
+            cancel = getattr(download_worker, "cancel", None)
+            if callable(cancel):
+                cancel(remove_partial=False)
+            download_thread.requestInterruption()
+            download_thread.quit()
+            stopped = False
         if not stopped:
             QMessageBox.information(
                 self,
-                "Finishing diagnostics",
-                "Hydra is stopping Settings diagnostics. Please close Settings again in a moment.",
+                "Finishing Settings work",
+                "Hydra is stopping Settings background work. Please close Settings again in a moment.",
             )
         return stopped
 

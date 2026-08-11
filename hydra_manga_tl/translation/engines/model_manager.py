@@ -50,10 +50,17 @@ class ModelPackage:
     estimated_size_gb: float
     quantization: str = "4-bit"
     recommended_for: str = "Balanced"
+    download_url: str = ""
+    download_filename: str | None = None
+    min_download_size_bytes: int = 1024 * 1024
 
     @property
     def estimated_download(self) -> str:
         return f"{self.estimated_size_gb:.1f} GB"
+
+    @property
+    def target_filename(self) -> str:
+        return self.download_filename or self.filename
 
 
 KNOWN_MODEL_PACKAGES = {
@@ -61,19 +68,30 @@ KNOWN_MODEL_PACKAGES = {
         key="qwen3-4b",
         label="Qwen3 4B — Balanced",
         description="4-bit GGUF runtime for local page translation on mid-range hardware.",
-        filename="qwen3-4b-instruct-2507-q4_k_m.gguf",
-        estimated_size_gb=3.5,
+        filename="Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        estimated_size_gb=2.5,
         quantization="4-bit",
         recommended_for="Balanced",
+        download_url=(
+            "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF"
+            "/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+        ),
+        min_download_size_bytes=2 * 1024 * 1024 * 1024,
     ),
     "qwen2.5-7b": ModelPackage(
         key="qwen2.5-7b",
         label="Qwen2.5 7B — Quality",
         description="Higher-quality 4-bit GGUF option for systems with more RAM/VRAM.",
         filename="qwen2.5-7b-instruct-q4_k_m.gguf",
-        estimated_size_gb=4.8,
+        estimated_size_gb=4.7,
         quantization="4-bit",
         recommended_for="Quality",
+        download_url=(
+            "https://huggingface.co/paultimothymooney/"
+            "Qwen2.5-7B-Instruct-Q4_K_M-GGUF"
+            "/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf"
+        ),
+        min_download_size_bytes=4 * 1024 * 1024 * 1024,
     ),
 }
 

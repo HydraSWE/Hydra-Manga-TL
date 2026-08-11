@@ -10,16 +10,38 @@ from .settings_actions import SettingsActionsMixin
 class SettingsDialog(SettingsActionsMixin, QDialog):
     """Local-first provider preferences with secrets stored outside settings JSON."""
 
+    translation_test_completed = Signal(bool, str)
+    qwen_download_progress_changed = Signal(object, object)
+    qwen_download_completed = Signal(bool, str, str)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Hydra Settings")
         self.setMinimumWidth(820)
         self.resize(1080, 800)
+        self.translation_test_completed.connect(
+            self._translation_test_finished,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.qwen_download_progress_changed.connect(
+            self._qwen_download_progress,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.qwen_download_completed.connect(
+            self._qwen_download_finished,
+            Qt.ConnectionType.QueuedConnection,
+        )
         
         self._gpu_thread: QThread | None = None
         self._gpu_worker: GpuDiagnosticsWorker | None = None
         self._test_thread: QThread | None = None
         self._test_worker: TranslationTestWorker | None = None
+        self._qwen_download_thread: QThread | None = None
+        self._qwen_download_worker = None
+        self._qwen_previous_path = ""
+        self._qwen_download_destination = ""
+        self._local_qwen_models_loaded = False
+        self._local_qwen_models = []
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -201,8 +223,6 @@ class SettingsDialog(SettingsActionsMixin, QDialog):
         self.qwen_model = QComboBox()
         for package in KNOWN_MODEL_PACKAGES.values():
             self.qwen_model.addItem(package.label, package.key)
-        for local_pkg in scan_local_qwen_models():
-            self.qwen_model.addItem(local_pkg.label, local_pkg.key)
         self.qwen_model.addItem("Custom / External GGUF Model...", "custom_gguf")
         self.qwen_model.currentIndexChanged.connect(self._on_qwen_model_selected)
             
@@ -212,12 +232,35 @@ class SettingsDialog(SettingsActionsMixin, QDialog):
         self.qwen_status = QLabel(SETTINGS.qwen_model_status or "Not installed")
         self.qwen_estimate = QLabel("Estimated download: not available")
         self.qwen_estimate.setWordWrap(True)
+        self.qwen_estimate.setObjectName("Muted")
         
         self.qwen_browse = QPushButton("Browse")
         self.qwen_browse.clicked.connect(self._browse_qwen_model)
         
         self.qwen_download = QPushButton("Download Model")
         self.qwen_download.clicked.connect(self._download_qwen_model)
+
+        self.qwen_pause = QPushButton("Pause")
+        self.qwen_pause.clicked.connect(self._pause_qwen_download)
+        self.qwen_pause.setVisible(False)
+
+        self.qwen_cancel = QPushButton("Cancel")
+        self.qwen_cancel.clicked.connect(self._cancel_qwen_download)
+        self.qwen_cancel.setVisible(False)
+
+        qwen_download_layout = QHBoxLayout()
+        qwen_download_layout.setContentsMargins(0, 0, 0, 0)
+        qwen_download_layout.setSpacing(8)
+        qwen_download_layout.addWidget(self.qwen_download)
+        qwen_download_layout.addWidget(self.qwen_pause)
+        qwen_download_layout.addWidget(self.qwen_cancel)
+        self.qwen_download_widget = QWidget()
+        self.qwen_download_widget.setLayout(qwen_download_layout)
+
+        self.qwen_progress = QProgressBar()
+        self.qwen_progress.setRange(0, 100)
+        self.qwen_progress.setValue(0)
+        self.qwen_progress.setTextVisible(True)
         
         self.qwen_test = QPushButton("Test local engine")
         self.qwen_test.clicked.connect(self._test_qwen_translation)
@@ -360,6 +403,11 @@ class SettingsDialog(SettingsActionsMixin, QDialog):
             
             for label, widget in rows:
                 section_form.addRow(label, widget)
+                if isinstance(widget, QWidget):
+                    row = section_form.rowCount() - 1
+                    label_item = section_form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                    if label_item is not None and label_item.widget() is not None:
+                        widget._hydra_form_label = label_item.widget()
                 
             section_layout.addLayout(section_form)
             
@@ -402,10 +450,14 @@ class SettingsDialog(SettingsActionsMixin, QDialog):
             ("Model", self.qwen_model),
             ("GGUF model", qwen_layout),
             ("Status", self.qwen_status),
-            ("Download", self.qwen_estimate),
-            ("", self.qwen_download),
+            ("Details", self.qwen_estimate),
+            ("Download", self.qwen_download_widget),
+            ("Progress", self.qwen_progress),
             ("", self.qwen_test),
         ))
+        self._qwen_download_row = self.qwen_download_widget
+        self._qwen_download_label = getattr(self._qwen_download_row, "_hydra_form_label", None)
+        self._qwen_progress_label = getattr(self.qwen_progress, "_hydra_form_label", None)
         
         gpu_section = make_section(
             "GPU / Native Runtime",
@@ -577,7 +629,8 @@ class SettingsDialog(SettingsActionsMixin, QDialog):
         self.phrase_memory_auto_learn.setChecked(SETTINGS.phrase_memory_auto_learn)
         self.phrase_memory_prefer_verified.setChecked(SETTINGS.phrase_memory_prefer_verified)
         
-        self._refresh_translation_memory_stats()
+        self.translation_memory_stats.setText("Loading...")
+        self.phrase_memory_stats.setText("Loading...")
         
         filmstrip_index = max(0, self.filmstrip_collapse_mode.findData(SETTINGS.filmstrip_collapse_mode or "current"))
         self.filmstrip_collapse_mode.setCurrentIndex(filmstrip_index)
@@ -594,6 +647,7 @@ class SettingsDialog(SettingsActionsMixin, QDialog):
             model_index = self.qwen_model.findData("custom_gguf")
         self.qwen_model.setCurrentIndex(max(0, model_index))
         self._refresh_qwen_metadata()
+        QTimer.singleShot(0, self._deferred_settings_refresh)
         if (
             SETTINGS.openai_compatible_name == "Kimi / TokenRouter"
             and SETTINGS.openai_compatible_base_url.rstrip("/") == "https://api.tokenrouter.com/v1"

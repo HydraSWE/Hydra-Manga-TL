@@ -54,6 +54,7 @@ class PhraseMemoryMatch:
 class PhraseMemoryStatistics:
     total_entries: int = 0
     verified_entries: int = 0
+    pending_entries: int = 0
     total_matches: int = 0
     learned_count: int = 0
     saved_api_cost: float = 0.0

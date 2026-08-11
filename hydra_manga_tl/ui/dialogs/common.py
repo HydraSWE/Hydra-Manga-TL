@@ -6,7 +6,7 @@ from pathlib import Path
 import time
 import zipfile
 
-from PySide6.QtCore import QObject, QSize, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,

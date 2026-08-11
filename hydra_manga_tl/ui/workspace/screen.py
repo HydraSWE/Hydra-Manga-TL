@@ -65,6 +65,10 @@ class WorkspaceScreen(
         self._filmstrip_policy_mode = SETTINGS.filmstrip_collapse_mode or "current"
         self._filmstrip_items: dict[str, QListWidgetItem] = {}
         self._thumbnail_jobs: list[tuple[QThread, ThumbnailWorker]] = []
+        self._filmstrip_build_chunk_size = 24
+        self._filmstrip_build_generation = 0
+        self._pending_image_load: tuple[int, int] | None = None
+        self._image_load_pending = False
         self._page_progress_value = 0.0
         self._page_progress_ceiling = 0.0
         self._job_position = 0

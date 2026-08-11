@@ -19,6 +19,7 @@ from hydra_manga_tl.translation.engines.registry import TRANSLATION_PROVIDER_REG
 
 LOGGER = logging.getLogger(__name__)
 _WARMUP_THREADS: list[threading.Thread] = []
+_WARMUP_STATES: dict[tuple[Any, ...], "TranslationWarmupState"] = {}
 _LOCK = threading.RLock()
 
 
@@ -58,6 +59,15 @@ class TranslationRuntimeConfig:
                 values.get("translation_memory_prefer_verified", True)
             ),
         )
+
+
+@dataclass(frozen=True)
+class TranslationWarmupState:
+    state: str = "idle"
+    engine: str = ""
+    message: str = ""
+    started_at: float = 0.0
+    finished_at: float = 0.0
 
 
 class TranslationRuntime:
@@ -313,6 +323,89 @@ class FastTranslationSession:
 TRANSLATION_RUNTIME = TranslationRuntime()
 
 
+def _prune_warmup_threads_locked() -> None:
+    _WARMUP_THREADS[:] = [thread for thread in _WARMUP_THREADS if thread.is_alive()]
+
+
+def _set_warmup_state(
+    key: tuple[Any, ...],
+    state: str,
+    *,
+    engine: str,
+    message: str = "",
+    started_at: float | None = None,
+) -> None:
+    now = time.perf_counter()
+    with _LOCK:
+        previous = _WARMUP_STATES.get(key)
+        _WARMUP_STATES[key] = TranslationWarmupState(
+            state=state,
+            engine=engine,
+            message=message,
+            started_at=(
+                started_at
+                if started_at is not None
+                else previous.started_at
+                if previous is not None
+                else now
+            ),
+            finished_at=0.0 if state == "warming" else now,
+        )
+
+
+def _warmup_key_for_config(config: TranslationRuntimeConfig) -> tuple[Any, ...]:
+    return ("runtime", config)
+
+
+def current_warmup_state(
+    config: dict[str, Any] | TranslationRuntimeConfig | None = None,
+) -> TranslationWarmupState:
+    with _LOCK:
+        _prune_warmup_threads_locked()
+        if config is not None:
+            runtime_config = (
+                config if isinstance(config, TranslationRuntimeConfig)
+                else TranslationRuntimeConfig.from_mapping(config)
+            )
+            return _WARMUP_STATES.get(
+                _warmup_key_for_config(runtime_config),
+                TranslationWarmupState(),
+            )
+        active = [
+            state
+            for state in _WARMUP_STATES.values()
+            if state.state == "warming"
+        ]
+        if active:
+            return max(active, key=lambda state: state.started_at)
+        if _WARMUP_STATES:
+            return max(
+                _WARMUP_STATES.values(),
+                key=lambda state: state.finished_at or state.started_at,
+            )
+        return TranslationWarmupState()
+
+
+def active_warmup_matches(
+    config: dict[str, Any] | TranslationRuntimeConfig | None,
+) -> bool:
+    runtime_config = (
+        config if isinstance(config, TranslationRuntimeConfig)
+        else TranslationRuntimeConfig.from_mapping(config)
+    )
+    key = _warmup_key_for_config(runtime_config)
+    with _LOCK:
+        _prune_warmup_threads_locked()
+        state = _WARMUP_STATES.get(key)
+        if state is None or state.state != "warming":
+            return False
+        return any(
+            thread.is_alive()
+            and getattr(thread, "_hydra_translation_key", None) == key
+            for thread in _WARMUP_THREADS
+        )
+
+
 def start_translation_warmup(
     source_language: str = "Japanese",
     target_language: str = "en",
@@ -328,8 +421,14 @@ def start_translation_warmup(
         )
         if not runtime_config.qwen_model_path or not Path(runtime_config.qwen_model_path).exists():
             LOGGER.info("Skipping Qwen warmup because its configured model path is unavailable")
+            _set_warmup_state(
+                _warmup_key_for_config(runtime_config),
+                "skipped",
+                engine="qwen",
+                message="Qwen model path is unavailable",
+            )
             return
-        key = ("runtime", runtime_config)
+        key = _warmup_key_for_config(runtime_config)
         target = _warm_runtime
         args = (runtime_config,)
     elif engine == "marian":
@@ -342,9 +441,15 @@ def start_translation_warmup(
         return
 
     with _LOCK:
-        _WARMUP_THREADS[:] = [thread for thread in _WARMUP_THREADS if thread.is_alive()]
+        _prune_warmup_threads_locked()
         if any(thread.is_alive() and getattr(thread, "_hydra_translation_key", None) == key for thread in _WARMUP_THREADS):
             return
+        _WARMUP_STATES[key] = TranslationWarmupState(
+            state="warming",
+            engine=engine,
+            message="Starting translation warmup",
+            started_at=time.perf_counter(),
+        )
         thread = threading.Thread(
             target=target,
             args=args,
@@ -366,7 +471,7 @@ def wait_for_translation_warmup(timeout: float | None = None) -> None:
 def shutdown_translation_warmup(timeout: float = 1.0) -> None:
     wait_for_translation_warmup(timeout)
     with _LOCK:
-        _WARMUP_THREADS[:] = [thread for thread in _WARMUP_THREADS if thread.is_alive()]
+        _prune_warmup_threads_locked()
 
 
 def shutdown_translation_runtime() -> None:
@@ -375,6 +480,7 @@ def shutdown_translation_runtime() -> None:
 
 def _warm_runtime(config: TranslationRuntimeConfig) -> None:
     started = time.perf_counter()
+    key = _warmup_key_for_config(config)
     try:
         warmed = TRANSLATION_RUNTIME.warm(config)
         if not warmed:
@@ -384,14 +490,35 @@ def _warm_runtime(config: TranslationRuntimeConfig) -> None:
                 config.preferred_engine,
                 time.perf_counter() - started,
             )
+            _set_warmup_state(
+                key,
+                "failed",
+                engine=config.preferred_engine,
+                message="Runtime load returned unavailable",
+                started_at=started,
+            )
             return
         LOGGER.info(
             "Translation runtime warmup finished for %s in %.2fs",
             config.preferred_engine,
             time.perf_counter() - started,
         )
-    except Exception:
+        _set_warmup_state(
+            key,
+            "ready",
+            engine=config.preferred_engine,
+            message="Runtime ready",
+            started_at=started,
+        )
+    except Exception as error:
         LOGGER.exception("Translation runtime warmup failed for %s", config.preferred_engine)
+        _set_warmup_state(
+            key,
+            "failed",
+            engine=config.preferred_engine,
+            message=str(error) or type(error).__name__,
+            started_at=started,
+        )
 
 
 def _create_manager(config: TranslationRuntimeConfig) -> TranslationEngineManager:
@@ -413,6 +540,7 @@ def _create_manager(config: TranslationRuntimeConfig) -> TranslationEngineManage
 
 def _warm_marian(source_language: str, target_language: str) -> None:
     started = time.perf_counter()
+    key = ("marian", source_language, target_language)
     try:
         MarianTranslator().translate(["テスト"], source_language, target_language)
         LOGGER.info(
@@ -421,5 +549,19 @@ def _warm_marian(source_language: str, target_language: str) -> None:
             target_language,
             time.perf_counter() - started,
         )
-    except Exception:
+        _set_warmup_state(
+            key,
+            "ready",
+            engine="marian",
+            message="Runtime ready",
+            started_at=started,
+        )
+    except Exception as error:
         LOGGER.exception("Translation warmup failed for %s->%s", source_language, target_language)
+        _set_warmup_state(
+            key,
+            "failed",
+            engine="marian",
+            message=str(error) or type(error).__name__,
+            started_at=started,
+        )

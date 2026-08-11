@@ -62,11 +62,11 @@ Write-Host "Compiling: $IssFile"
 Write-Host ""
 
 $ManifestFile = Join-Path $ScriptDir "manifest.json"
-$AppVersion = "1.0.0"
+$AppVersion = "1.1.0"
 if (Test-Path $ManifestFile) {
     try {
         $manifest = Get-Content $ManifestFile -Raw | ConvertFrom-Json
-        if ($manifest.version) {
+        if ($manifest.version -and $manifest.version -ne "1.0.0") {
             $AppVersion = $manifest.version
         }
     } catch {

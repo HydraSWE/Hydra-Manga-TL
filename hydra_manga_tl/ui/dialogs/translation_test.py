@@ -7,6 +7,7 @@ from .common import *  # noqa: F401,F403
 
 class TranslationTestWorker(QObject):
     completed = Signal(bool, str)
+    finished = Signal()
 
     def __init__(
         self,
@@ -104,6 +105,7 @@ class TranslationTestWorker(QObject):
         finally:
             manager.unload()
             self._manager = None
+            self.finished.emit()
 
     def _diagnostic_message(
         self,

@@ -10,7 +10,7 @@ review decisions, and rendered output in a versioned project.
 
 ## Current version
 
-**Hydra Manga TL v1** is the current release line. It extends the
+**Hydra Manga TL v1.1.0** is the current release line. It extends the
 unified OCR/translation/render pipeline with verified stage-level resume,
 provider-safe Smart Translation, large-project responsiveness, multi-target
 output, generalized editor undo/redo, reading-order controls, expanded export
