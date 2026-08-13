@@ -9,11 +9,11 @@
 
 #define MyAppName      "Hydra Manga TL"
 #ifndef MyAppVersion
-#define MyAppVersion   "1.1.0"
+#define MyAppVersion   "1.1.1"
 #endif
 #define MyAppPublisher "Hydra"
 
-#define ManifestUrl    "https://hydramangatl.annomous.com/offline_installer/v1.1.0/manifest.json"
+#define ManifestUrl    "https://hydramangatl.annomous.com/offline_installer/v1.1.1/manifest.json"
 
 [Setup]
 AppId={{7A2F8C3D-E4B1-4D6A-9F52-1C3E7A8B9D0F}

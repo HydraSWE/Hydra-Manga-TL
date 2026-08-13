@@ -1,4 +1,4 @@
-# Hydra Manga TL — v1 Catalog
+# Hydra Manga TL — v1.1.1 Catalog
 
 ## Translate manga without giving up control
 
@@ -11,7 +11,7 @@ correction, review, and export without overwriting source images.
 
 | | |
 | --- | --- |
-| Current version | **v1 — Recoverability, Editing, Diagnostics, Multi-Target Output, Smart Translation, Large-Project Stability, and UI Refresh** |
+| Current version | **v1.1.1 — Export Stability, Safer Project Opening, Local Qwen Reliability, and Manual Overlay Fixes** |
 | Current status | **Current release** |
 | Pipeline status | **Manifest-v3 safe resume and planning foundation included in v1** |
 | Optional bridge | **HydraMangaAi private package** |
@@ -28,7 +28,19 @@ correction, review, and export without overwriting source images.
 | Project safety | Autosaved, reversible, source images untouched |
 | Installer | Complete offline package; selectable Cloud/Qwen/Marian downloads deferred |
 
-## v1 — Current Release
+## v1.1.1 — Current Release
+
+- Improves export stability and responsiveness during long background exports.
+- Keeps export completion on the normal workspace status/notification path
+  instead of opening a blocking completion popup.
+- Keeps project activation on the UI thread after background project loading.
+- Fixes manual translation overlay cleanup after completion or cancellation.
+- Improves Local Qwen handling for noisy existing pages where OCR creates
+  punctuation-only fragments, such as isolated Japanese quote marks.
+- Prevents one page-level local translation issue from stopping the rest of a
+  batch.
+
+## v1 — Release Line
 
 - Manifest-v3 source/input/output digests, policy identities, timestamps, and
   stage error summaries.

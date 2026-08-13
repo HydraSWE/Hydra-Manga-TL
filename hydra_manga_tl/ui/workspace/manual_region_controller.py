@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer
-
 from hydra_manga_tl.core.settings import SETTINGS
 from hydra_manga_tl.core.state import APP_STATE
 from hydra_manga_tl.project.manual_region import rect_to_polygon
@@ -150,10 +148,10 @@ class ManualRegionControllerMixin:
             overlay.update_stage(overlay.stage_names[2], "running")
         elif state == "done":
             overlay.show_success("✓ Complete" if request_id.startswith("title:") else "✓ Translation Complete")
-            QTimer.singleShot(800, lambda: overlay.start_fade_out())
+            overlay.schedule_fade_out(800)
         elif state == "cancelled":
             overlay.show_cancelled()
-            QTimer.singleShot(800, lambda: overlay.start_fade_out())
+            overlay.schedule_fade_out(800)
         elif state == "failed":
             overlay.show_failure(status_msg)
 

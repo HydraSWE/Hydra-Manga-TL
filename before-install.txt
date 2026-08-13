@@ -1,13 +1,14 @@
-Welcome to Hydra Manga TL v1.1.0
+Welcome to Hydra Manga TL v1.1.1
 
 Hydra Manga TL translates Japanese and Chinese manga pages into English using local OCR, translation, reconstruction, and review tools.
 
 Release track:
-- v1.1.0 is a backward-compatible update with Phrase Memory manager responsiveness and bulk approval, Qwen runtime safeguards against duplicate local engine loads, deferred Settings diagnostics, non-blocking diagnostics close behavior, chunked filmstrip rebuilds, coalesced rapid page-load refreshes, and a corrected Recent Projects landing layout.
+- v1.1.1 is a backward-compatible patch update with export stability fixes, safer project opening, manual translation overlay crash protection, and improved Local Qwen handling for punctuation-only OCR fragments.
+- The previous update added Phrase Memory manager responsiveness and bulk approval, Qwen runtime safeguards against duplicate local engine loads, deferred Settings diagnostics, non-blocking diagnostics close behavior, chunked filmstrip rebuilds, coalesced rapid page-load refreshes, and a corrected Recent Projects landing layout.
 - v1 added safer resumable processing, provider-safe Smart Translation, large-project responsiveness, refreshed Project Home and workspace UI, searchable recent projects, multi-target output, automated schema migration and backward compatibility, editor undo/redo, reading-order controls, batch-selection polish, PDF export, and detailed GPU/native diagnostics.
 - The unified OCR, translation, render, cache, cancellation, review, and manual-rerender pipeline is included in v1.
 - This release uses the complete offline installer. Selectable cloud/local runtime downloads are planned for a later release and are not active yet.
-- Translation output and Local Qwen configuration behavior are not intended to change in v1.1.0.
+- Existing project data and Local Qwen model files remain compatible with v1.1.1.
 - HydraMangaAi remains an optional private bridge layer when installed separately.
 
 Important:

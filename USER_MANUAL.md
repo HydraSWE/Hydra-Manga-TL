@@ -1,6 +1,6 @@
 # Hydra Manga TL User Manual
 
-This manual describes the current Hydra Manga TL v1.1.0 desktop workflow as it
+This manual describes the current Hydra Manga TL v1.1.1 desktop workflow as it
 exists in this repository. It is a user guide, not a developer architecture
 document. For source setup and commands, see `README.md`. For implementation
 and data contracts, see `project.md`.

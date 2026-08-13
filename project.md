@@ -1,4 +1,4 @@
-# Hydra Manga TL — v1 Project Guide
+# Hydra Manga TL — v1.1.1 Project Guide
 
 ## Project summary
 
@@ -6,7 +6,8 @@ Hydra Manga TL is a non-destructive Windows desktop pipeline for OCR,
 Japanese/Chinese manga translation, artwork reconstruction, typesetting,
 review, manual correction, and multi-format export.
 
-The v1 release line is the current runtime and documentation target.
+The v1.1.1 release is the current runtime and documentation target within the
+v1 release line.
 Batch, selected-page, manual-region, and review work share application-lifetime
 OCR and translation services, one serialized render queue, normalized progress
 states, cooperative cancellation, stable cache contracts, startup warmup,
@@ -18,7 +19,7 @@ layout. The current UI layer also includes the refreshed Project Home,
 searchable recent-project library, workspace chrome cleanup, and staged loading
 surfaces.
 
-Status: v1 is the current release line. v0.9.0 remains the completed
+Status: v1.1.1 is the current release. v0.9.0 remains the completed
 workspace/package foundation, v0.8.0-alpha remains the unified-pipeline
 baseline, and v0.7.0 remains the HydraMangaAi bridge milestone.
 
@@ -26,7 +27,8 @@ baseline, and v0.7.0 remains the HydraMangaAi bridge milestone.
 
 | Version | Status | Scope |
 | --- | --- | --- |
-| **v1 — Recoverability, Smart Translation, Large-Project Stability, Diagnostics, Multi-Target Output, and UI Refresh** | Current release | Manifest-v3 safe resume, centralized planning and validation foundation, verified OCR/translation/render reuse, automated schema migration and compatibility, provider-safe Fast worker limits, large-project workspace responsiveness, refreshed Project Home, searchable recent-project library, grouped workspace controls, loading-screen polish, generalized undo/redo, editable reading order, review filters, batch-selection polish, multi-target artifacts, PDF/CBZ/WebP export, diagnostics bundles, GPU/native-runtime details, configurable app-data storage, and the complete v0.9.0 foundation |
+| **v1.1.1 — Export Stability, Safer Project Opening, Local Qwen Reliability, and Manual Overlay Fixes** | Current release | Patch update for the v1 release line with background export responsiveness, safer Qt thread handoff for export/project opening, manual translation overlay cleanup, and Local Qwen recovery for punctuation-only OCR fragments on existing pages |
+| **v1 — Recoverability, Smart Translation, Large-Project Stability, Diagnostics, Multi-Target Output, and UI Refresh** | Current release line | Manifest-v3 safe resume, centralized planning and validation foundation, verified OCR/translation/render reuse, automated schema migration and compatibility, provider-safe Fast worker limits, large-project workspace responsiveness, refreshed Project Home, searchable recent-project library, grouped workspace controls, loading-screen polish, generalized undo/redo, editable reading order, review filters, batch-selection polish, multi-target artifacts, PDF/CBZ/WebP export, diagnostics bundles, GPU/native-runtime details, configurable app-data storage, and the complete v0.9.0 foundation |
 | **v0.9.0 — Startup, Region, Layout, Identity, and Package Layout** | Completed foundation | Branded startup warmup, core-ready handoff, collapsible filmstrip, pinned identity tile, polygon Region Tool, text-layout editing, shared normalization, lazy imports, and UI/OCR/translation/phase/project/core packages |
 | **v0.8.0-alpha — Unified Pipeline** | Completed baseline | Persistent OCR worker, SmartOCR retry budgets, typed requests, one translation manager, one render queue, grouped chapter execution, cancellation, normalized caches, exact manual bounds, rollback-safe rendering |
 | **v0.7.0 — HydraMangaAi** | Optional/private bridge milestone | Optional private correction capture, explicit approval queues, training snapshots, readiness gates, promotion metadata, rollback records, and AI Center |

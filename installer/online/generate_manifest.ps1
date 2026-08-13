@@ -8,10 +8,10 @@
     bootstrap installer to consume.
 
 .PARAMETER SetupExePath
-    Absolute path to the full offline setup EXE (e.g. "Hydra Manga TL V1.1.0 Setup.exe").
+    Absolute path to the full offline setup EXE (e.g. "Hydra Manga TL V1.1.1 Setup.exe").
 
 .PARAMETER Version
-    Semantic version string to embed in the manifest (e.g. "1.1.0").
+    Semantic version string to embed in the manifest (e.g. "1.1.1").
 
 .PARAMETER BaseUrl
     Base HTTPS URL where the setup EXE will be hosted.
@@ -23,8 +23,8 @@
 
 .EXAMPLE
     .\generate_manifest.ps1 `
-        -SetupExePath "D:\Tools\Hydra_EXE\Hydra Manga TL V1.1.0 Setup.exe" `
-        -Version "1.1.0" `
+        -SetupExePath "D:\Tools\Hydra_EXE\Hydra Manga TL V1.1.1 Setup.exe" `
+        -Version "1.1.1" `
         -BaseUrl "https://storage.example.com/releases"
 #>
 

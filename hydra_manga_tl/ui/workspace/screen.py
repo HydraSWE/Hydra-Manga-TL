@@ -49,6 +49,9 @@ class WorkspaceScreen(
     QWidget,
 ):
     close_requested = Signal()
+    export_progress_changed = Signal(int, int)
+    export_finished = Signal(str, object)
+    export_failed = Signal(str)
     _ART_APPEARANCE_TYPES = {"title", "sfx", "sign", "credit"}
     _HEADER_COMPACT_ENTER_WIDTH = 1340
     _HEADER_COMPACT_EXIT_WIDTH = 1440
@@ -120,6 +123,18 @@ class WorkspaceScreen(
         WORKSPACE.manual_region_busy_changed.connect(self._on_manual_region_busy)
         WORKSPACE.translation_request_state_changed.connect(
             self._on_translation_request_state,
+        )
+        self.export_progress_changed.connect(
+            self._on_export_progress,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.export_finished.connect(
+            self._on_export_finished,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.export_failed.connect(
+            self._on_export_failed,
+            Qt.ConnectionType.QueuedConnection,
         )
 
     def _build(self) -> None:

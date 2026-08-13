@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QThread, Signal
 
-from hydra_manga_tl.core.state import APP_STATE
 from hydra_manga_tl.core.user_errors import export_error
-from hydra_manga_tl.project.workspace import WORKSPACE
+from hydra_manga_tl.project.export import export_archive, export_images, export_pdf
 
 
 class ExportWorker(QObject):
@@ -23,6 +22,7 @@ class ExportWorker(QObject):
         *,
         image_format: str = "png",
         archive_format: str = "zip",
+        project=None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -30,36 +30,36 @@ class ExportWorker(QObject):
         self.destination = destination
         self.image_format = image_format
         self.archive_format = archive_format
+        self.project = project
 
     def run(self) -> None:
         try:
             def report_progress(current: int, total: int) -> None:
                 self.progress.emit(current, total)
+                QThread.msleep(1)
+
+            project = self.project
+            if project is None:
+                res = 0
+                self.finished.emit(self.output_type, res)
+                return
 
             if self.output_type == "folder":
-                res = WORKSPACE.export(
+                res = export_images(
+                    project,
                     self.destination,
                     image_format=self.image_format,
                     progress_callback=report_progress,
                 )
             elif self.output_type == "pdf":
-                from hydra_manga_tl.project.export import export_pdf
-
                 res = export_pdf(
-                    WORKSPACE.current,
+                    project,
                     self.destination,
                     progress_callback=report_progress,
                 )
-                APP_STATE.set_export(str(res.resolve()), 1)
-                WORKSPACE.record_export(
-                    export_type="pdf",
-                    path=res,
-                    count=len(WORKSPACE.current.images) if WORKSPACE.current else 0,
-                    mode="translated",
-                    image_format="pdf",
-                )
             else:
-                res = WORKSPACE.export_archive(
+                res = export_archive(
+                    project,
                     self.destination,
                     image_format=self.image_format,
                     archive_format=self.archive_format,

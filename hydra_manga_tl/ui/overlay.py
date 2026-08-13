@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPropertyAnimation, Qt, Signal, Slot
+from PySide6.QtCore import QPropertyAnimation, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QFrame,
@@ -35,6 +35,9 @@ class OverlayProgressWidget(QFrame):
         self.is_compact = is_compact
         self.stages_state: dict[str, str] = {stage: "waiting" for stage in self.stage_names}
         self.is_cancelled = False
+        self._fade_started = False
+        self._fade_timer: QTimer | None = None
+        self.anim: QPropertyAnimation | None = None
 
         self.setObjectName("OverlayProgressCard")
         self.setFixedWidth(240)
@@ -177,7 +180,25 @@ class OverlayProgressWidget(QFrame):
         self.retry_button.hide()
         self.adjustSize()
 
+    def schedule_fade_out(self, delay_ms: int = 800, duration_ms: int = 250) -> None:
+        if self._fade_started:
+            return
+        if self._fade_timer is None:
+            self._fade_timer = QTimer(self)
+            self._fade_timer.setSingleShot(True)
+            self._fade_timer.timeout.connect(lambda: self.start_fade_out(duration_ms))
+        if delay_ms <= 0:
+            self.start_fade_out(duration_ms)
+            return
+        if not self._fade_timer.isActive():
+            self._fade_timer.start(delay_ms)
+
     def start_fade_out(self, duration_ms: int = 250) -> None:
+        if self._fade_started:
+            return
+        self._fade_started = True
+        if self._fade_timer is not None and self._fade_timer.isActive():
+            self._fade_timer.stop()
         self.anim = QPropertyAnimation(self._opacity_effect, b"opacity")
         self.anim.setDuration(duration_ms)
         self.anim.setStartValue(1.0)

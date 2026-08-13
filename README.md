@@ -10,12 +10,14 @@ review decisions, and rendered output in a versioned project.
 
 ## Current version
 
-**Hydra Manga TL v1.1.0** is the current release line. It extends the
-unified OCR/translation/render pipeline with verified stage-level resume,
-provider-safe Smart Translation, large-project responsiveness, multi-target
-output, generalized editor undo/redo, reading-order controls, expanded export
-formats, runtime diagnostics, polished batch selection, a refreshed Project
-Home, a searchable recent-project library, and a cleaner workspace UI.
+**Hydra Manga TL v1.1.1** is the current release line. It is a patch update
+with improved export stability, safer project opening, manual
+translation overlay cleanup, and better Local Qwen handling for pages with
+punctuation-only OCR fragments. It keeps the v1 OCR/translation/render
+pipeline, provider-safe Smart Translation, large-project responsiveness,
+multi-target output, editor undo/redo, reading-order controls, expanded export
+formats, runtime diagnostics, polished batch selection, refreshed Project
+Home, searchable recent-project library, and cleaner workspace UI.
 HydraMangaAi remains an optional private bridge layer when the separate package
 is present.
 

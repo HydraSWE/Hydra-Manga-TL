@@ -453,10 +453,12 @@ class V1StabilityTests(unittest.TestCase):
             worker.failed.connect(failures.append)
             try:
                 WORKSPACE.current = None
-                worker.run()
+                with patch.object(WORKSPACE, "load_project") as load_project:
+                    worker.run()
+                load_project.assert_not_called()
                 self.assertFalse(failures)
                 self.assertEqual("Async Open", loaded[0].name)
-                self.assertIs(WORKSPACE.current, loaded[0])
+                self.assertIsNone(WORKSPACE.current)
             finally:
                 WORKSPACE.current = previous
 
@@ -3109,37 +3111,194 @@ class V1StabilityTests(unittest.TestCase):
         from hydra_manga_tl.project.workspace import WORKSPACE
         from hydra_manga_tl.ui.workspace import ExportWorker
 
-        worker = ExportWorker("folder", Path("export"), image_format="png")
+        project = object()
+        worker = ExportWorker("folder", Path("export"), image_format="png", project=project)
         emitted = []
         progress = []
         failed = []
         worker.finished.connect(lambda output_type, result: emitted.append((output_type, result)))
         worker.progress.connect(lambda current, total: progress.append((current, total)))
         worker.failed.connect(failed.append)
-        with patch.object(WORKSPACE, "export", return_value=400) as export:
+        with (
+            patch("hydra_manga_tl.ui.workspace.export_worker.export_images", return_value=400) as export,
+            patch.object(WORKSPACE, "export") as workspace_export,
+            patch.object(WORKSPACE, "record_export") as record_export,
+        ):
             worker.run()
         export.assert_called_once()
         args, kwargs = export.call_args
-        self.assertEqual((Path("export"),), args)
+        self.assertIs(args[0], project)
+        self.assertEqual(Path("export"), args[1])
         self.assertEqual("png", kwargs["image_format"])
         kwargs["progress_callback"](1, 4)
+        workspace_export.assert_not_called()
+        record_export.assert_not_called()
         self.assertFalse(failed)
         self.assertEqual([(1, 4)], progress)
         self.assertEqual([("folder", 400)], emitted)
 
     def test_export_worker_failure_uses_user_safe_message(self):
-        from hydra_manga_tl.project.workspace import WORKSPACE
         from hydra_manga_tl.ui.workspace import ExportWorker
 
-        worker = ExportWorker("folder", Path("export"), image_format="png")
+        worker = ExportWorker("folder", Path("export"), image_format="png", project=object())
         failed = []
         worker.failed.connect(failed.append)
-        with patch.object(WORKSPACE, "export", side_effect=PermissionError("PermissionError: access is denied")):
+        with patch(
+            "hydra_manga_tl.ui.workspace.export_worker.export_images",
+            side_effect=PermissionError("PermissionError: access is denied"),
+        ):
             worker.run()
         self.assertEqual(
             ["Hydra could not write to the export folder. Choose another folder or check permissions."],
             failed,
         )
+
+    def test_export_background_dialog_is_modeless(self):
+        from hydra_manga_tl.project.workspace import WORKSPACE
+        from hydra_manga_tl.ui.workspace.export_controller import ExportControllerMixin
+
+        class FakeSignal:
+            def __init__(self):
+                self.callbacks = []
+                self.emitted = []
+
+            def connect(self, callback, connection_type=None):
+                self.callbacks.append((callback, connection_type))
+
+            def emit(self, *args):
+                self.emitted.append(args)
+                for callback, _connection_type in self.callbacks:
+                    callback(*args)
+
+        class FakeThread:
+            def __init__(self, parent=None):
+                self.parent = parent
+                self.started = FakeSignal()
+                self.finished = FakeSignal()
+                self.started_called = False
+
+            def start(self):
+                self.started_called = True
+
+            def quit(self):
+                pass
+
+            def deleteLater(self):
+                pass
+
+        class FakeMessage:
+            def __init__(self):
+                self.text = ""
+
+            def setText(self, text):
+                self.text = text
+
+        class FakeDialog:
+            last = None
+
+            def __init__(self, parent=None):
+                self.parent = parent
+                self.message = FakeMessage()
+                self.shown = False
+                self.exec_called = False
+                FakeDialog.last = self
+
+            def setWindowTitle(self, title):
+                self.title = title
+
+            def set_progress_visible(self, visible):
+                self.progress_visible = visible
+
+            def set_progress_fraction(self, current, total):
+                self.progress = (current, total)
+
+            def show(self):
+                self.shown = True
+
+            def exec(self):
+                self.exec_called = True
+
+        class FakeWorker:
+            last = None
+
+            def __init__(self, output_type, destination, *, image_format="png", archive_format="zip", project=None):
+                self.output_type = output_type
+                self.destination = destination
+                self.image_format = image_format
+                self.archive_format = archive_format
+                self.project = project
+                self.progress = FakeSignal()
+                self.finished = FakeSignal()
+                self.failed = FakeSignal()
+                FakeWorker.last = self
+
+            def moveToThread(self, thread):
+                self.thread = thread
+
+            def run(self):
+                pass
+
+            def deleteLater(self):
+                pass
+
+        previous = WORKSPACE.current
+        project = object()
+        try:
+            WORKSPACE.current = project
+            screen = ExportControllerMixin()
+            screen.export_progress_changed = FakeSignal()
+            screen.export_finished = FakeSignal()
+            screen.export_failed = FakeSignal()
+            with (
+                patch("hydra_manga_tl.ui.workspace.export_controller.BackgroundWorkDialog", FakeDialog),
+                patch("hydra_manga_tl.ui.workspace.export_controller.QThread", FakeThread),
+                patch("hydra_manga_tl.ui.workspace.export_controller.ExportWorker", FakeWorker),
+            ):
+                screen._start_export_worker("folder", Path("export"), image_format="webp")
+            self.assertTrue(FakeDialog.last.shown)
+            self.assertFalse(FakeDialog.last.exec_called)
+            self.assertTrue(screen._export_thread.started_called)
+            self.assertIs(FakeWorker.last.project, project)
+            self.assertEqual("webp", FakeWorker.last.image_format)
+
+            FakeWorker.last.progress.callbacks[0][0](2, 5)
+            FakeWorker.last.finished.callbacks[0][0]("folder", 9)
+            FakeWorker.last.failed.callbacks[0][0]("failed")
+            self.assertEqual([(2, 5)], screen.export_progress_changed.emitted)
+            self.assertEqual([("folder", 9)], screen.export_finished.emitted)
+            self.assertEqual([("failed",)], screen.export_failed.emitted)
+            self.assertIs(FakeWorker.last.progress.callbacks[0][0].__self__, screen.export_progress_changed)
+            self.assertIs(FakeWorker.last.finished.callbacks[0][0].__self__, screen.export_finished)
+            self.assertIs(FakeWorker.last.failed.callbacks[0][0].__self__, screen.export_failed)
+            self.assertIsNone(FakeWorker.last.progress.callbacks[0][1])
+            self.assertIsNone(FakeWorker.last.finished.callbacks[0][1])
+            self.assertIsNone(FakeWorker.last.failed.callbacks[0][1])
+        finally:
+            WORKSPACE.current = previous
+
+    def test_export_finished_uses_inline_status_without_popup(self):
+        from hydra_manga_tl.ui.workspace.export_controller import ExportControllerMixin
+
+        class FakeStatus:
+            def __init__(self):
+                self.text = ""
+
+            def setText(self, text):
+                self.text = text
+
+        screen = ExportControllerMixin()
+        screen.status = FakeStatus()
+        screen._export_dialog = None
+        with (
+            patch.object(screen, "_record_successful_export") as record,
+            patch("hydra_manga_tl.ui.workspace.export_controller.QMessageBox.information") as info,
+            patch("hydra_manga_tl.core.notifications.NOTIFICATION_SERVICE.notify") as notify,
+        ):
+            screen._on_export_finished("folder", 3)
+        record.assert_called_once_with("folder", 3)
+        info.assert_not_called()
+        notify.assert_called_once()
+        self.assertEqual("Export complete. Exported 3 image(s).", screen.status.text)
 
     def test_archive_export_conversion_does_not_create_temp_files(self):
         with tempfile.TemporaryDirectory() as folder:

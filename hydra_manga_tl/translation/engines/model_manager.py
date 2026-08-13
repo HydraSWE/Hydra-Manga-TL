@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+import unicodedata
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,10 @@ LOGGER = logging.getLogger(__name__)
 
 class TranslationValidationError(RuntimeError):
     pass
+
+
+class TranslationContentValidationError(TranslationValidationError):
+    """Provider returned unusable text for the current page content."""
 
 
 def _load_dotenv_values() -> dict[str, str]:
@@ -251,7 +256,14 @@ class TranslationEngineManager:
                 pass
 
     @staticmethod
-    def _validate_page_translation(page: PageDialogue, result: PageTranslation) -> None:
+    def _is_symbol_only_source(text: str) -> bool:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return False
+        return not any(unicodedata.category(char)[0] in {"L", "N"} for char in stripped)
+
+    @classmethod
+    def _validate_page_translation(cls, page: PageDialogue, result: PageTranslation) -> None:
         input_ids = [str(item.get("id")) for item in page.dialogue]
         if len(set(input_ids)) != len(input_ids):
             raise TranslationValidationError("Duplicate ids in input")
@@ -264,10 +276,19 @@ class TranslationEngineManager:
         if out_ids != input_ids:
             # order mismatch is also an error for predictable mapping
             raise TranslationValidationError("translation ids/order mismatch")
+        source_by_id = {
+            str(item.get("id")): str(item.get("text", "")).strip()
+            for item in page.dialogue
+        }
         for item in result.translations:
             text = str(item.get("text", "")).strip()
             if not text:
-                raise TranslationValidationError("empty translation for id")
+                source_text = source_by_id.get(str(item.get("id")), "")
+                if cls._is_symbol_only_source(source_text):
+                    item["text"] = source_text
+                    item["translation_source"] = item.get("translation_source") or "source-symbol"
+                    continue
+                raise TranslationContentValidationError("empty translation for id")
 
     @staticmethod
     def _is_single_manual_selection(page: PageDialogue) -> bool:
@@ -345,7 +366,7 @@ class TranslationEngineManager:
                 transient_http_error = status in {408, 429} or (
                     isinstance(status, int) and 500 <= status < 600
                 )
-                if not transient_http_error:
+                if not transient_http_error and not isinstance(error, TranslationContentValidationError):
                     self._failed_engines.add(selected)
         if self.fallback_engine:
             try:
@@ -514,7 +535,7 @@ class TranslationEngineManager:
                 resolved = {
                     "id": entry_id,
                     "text": translated_text,
-                    "translation_source": "provider",
+                    "translation_source": str(translated.get("translation_source", "")).strip() or "provider",
                     "tm_match_type": "",
                     "tm_entry_id": None,
                     "provider_id": engine_id,

@@ -12,7 +12,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from hydra_manga_tl import __version__
 
-MANIFEST_URL = "https://hydramangatl.annomous.com/offline_installer/v1.1.0/manifest.json"
+MANIFEST_URL = "https://hydramangatl.annomous.com/offline_installer/v1.1.1/manifest.json"
 CHECK_INTERVAL = timedelta(hours=24)
 
 STATUS_IDLE = "idle"

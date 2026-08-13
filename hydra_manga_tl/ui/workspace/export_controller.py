@@ -10,6 +10,7 @@ from PySide6.QtCore import QThread, Slot
 from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
 from hydra_manga_tl.core.settings import SETTINGS
+from hydra_manga_tl.core.state import APP_STATE
 from hydra_manga_tl.project.workspace import WORKSPACE
 from hydra_manga_tl.ui.dialogs import BackgroundWorkDialog, ExportOptionsDialog
 
@@ -27,6 +28,9 @@ class ExportControllerMixin:
         return parent, name
 
     def _start_export_worker(self, output_type: str, destination: Path, *, image_format: str = "png", archive_format: str = "zip") -> None:
+        self._export_destination = destination
+        self._export_image_format = image_format
+        self._export_archive_format = archive_format
         self._export_dialog = BackgroundWorkDialog(self)
         self._export_dialog.setWindowTitle("Exporting")
         self._export_dialog.message.setText(f"Exporting files to:\n{destination}\n\nPlease wait...")
@@ -34,25 +38,30 @@ class ExportControllerMixin:
         self._export_dialog.set_progress_fraction(0, 1)
 
         self._export_thread = QThread(self)
-        worker = ExportWorker(output_type, destination, image_format=image_format, archive_format=archive_format)
-        worker.moveToThread(self._export_thread)
+        self._export_worker = ExportWorker(
+            output_type,
+            destination,
+            image_format=image_format,
+            archive_format=archive_format,
+            project=WORKSPACE.current,
+        )
+        self._export_worker.moveToThread(self._export_thread)
 
-        self._export_thread.started.connect(worker.run)
+        self._export_thread.started.connect(self._export_worker.run)
 
-        worker.progress.connect(self._on_export_progress)
-        worker.finished.connect(self._on_export_finished)
-        worker.failed.connect(self._on_export_failed)
+        self._export_worker.progress.connect(self.export_progress_changed.emit)
+        self._export_worker.finished.connect(self.export_finished.emit)
+        self._export_worker.failed.connect(self.export_failed.emit)
 
-        worker.finished.connect(self._export_thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(self._export_thread.quit)
-        worker.failed.connect(worker.deleteLater)
+        self._export_worker.finished.connect(self._export_thread.quit)
+        self._export_worker.finished.connect(self._export_worker.deleteLater)
+        self._export_worker.failed.connect(self._export_thread.quit)
+        self._export_worker.failed.connect(self._export_worker.deleteLater)
         self._export_thread.finished.connect(self._export_thread.deleteLater)
+        self._export_thread.finished.connect(self._clear_export_worker)
 
         self._export_thread.start()
-        self._export_dialog.exec()
-        self._export_dialog = None
-        self._export_thread = None
+        self._export_dialog.show()
 
     @Slot(int, int)
     def _on_export_progress(self, current: int, total: int) -> None:
@@ -63,18 +72,14 @@ class ExportControllerMixin:
     def _on_export_finished(self, ot: str, result):
         if hasattr(self, "_export_dialog") and self._export_dialog is not None:
             self._export_dialog.accept()
-        if ot == "folder":
-            QMessageBox.information(self, "Export complete", f"Exported {result} image(s).")
-        elif ot == "pdf":
-            QMessageBox.information(self, "Export complete", f"Exported PDF:\n{result}")
-        else:
-            QMessageBox.information(self, "Export complete", f"Exported archive:\n{result}")
+        self._record_successful_export(ot, result)
         from hydra_manga_tl.core.notifications import NOTIFICATION_SERVICE, NotificationEvent
         from pathlib import Path as _Path
         if ot == "folder":
             notif_msg = f"Exported {result} image(s)."
         else:
             notif_msg = f"Saved: {_Path(str(result)).name}"
+        self._set_export_status(f"Export complete. {notif_msg}")
         NOTIFICATION_SERVICE.notify(
             NotificationEvent.EXPORT_COMPLETED,
             "Export complete",
@@ -91,6 +96,53 @@ class ExportControllerMixin:
             NotificationEvent.EXPORT_FAILED,
             "Export failed",
             err[:120],
+        )
+
+    def _set_export_status(self, message: str) -> None:
+        status = getattr(self, "status", None)
+        if status is not None and hasattr(status, "setText"):
+            status.setText(message)
+
+    @Slot()
+    def _clear_export_worker(self) -> None:
+        self._export_thread = None
+        self._export_worker = None
+        self._export_dialog = None
+
+    def _record_successful_export(self, output_type: str, result) -> None:
+        if WORKSPACE.current is None:
+            return
+        if output_type == "folder":
+            path = self._export_destination
+            count = int(result)
+            APP_STATE.set_export(str(path.resolve()), count)
+            WORKSPACE.record_export(
+                export_type="folder",
+                path=path,
+                count=count,
+                mode="translated",
+                image_format=self._export_image_format,
+            )
+            return
+        path = Path(str(result))
+        count = len(WORKSPACE.current.images)
+        if output_type == "pdf":
+            APP_STATE.set_export(str(path.resolve()), 1)
+            WORKSPACE.record_export(
+                export_type="pdf",
+                path=path,
+                count=count,
+                mode="translated",
+                image_format="pdf",
+            )
+            return
+        APP_STATE.set_export(str(path.resolve()), 1)
+        WORKSPACE.record_export(
+            export_type="archive",
+            path=path,
+            count=count,
+            mode="translated",
+            image_format=self._export_archive_format,
         )
 
     def _export(self) -> None:

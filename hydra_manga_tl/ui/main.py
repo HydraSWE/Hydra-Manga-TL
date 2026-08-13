@@ -17,6 +17,7 @@ from hydra_manga_tl.project.compatibility import (
     ProjectMigrationRequired,
 )
 from hydra_manga_tl.project.migrations.manager import migration_message
+from hydra_manga_tl.project.model import MangaProject
 from hydra_manga_tl.core.user_errors import import_error, project_open_error
 from hydra_manga_tl.ui.landing import ImportProgressScreen, LandingScreen
 from hydra_manga_tl.ui.workspace import WorkspaceScreen
@@ -34,10 +35,7 @@ class ProjectOpenWorker(QObject):
 
     def run(self) -> None:
         try:
-            project = WORKSPACE.load_project(
-                self.path,
-                allow_migration=self.allow_migration,
-            )
+            project = MangaProject.load(self.path)
             self.finished.emit(project)
         except Exception as error:
             self.failed.emit(error)
