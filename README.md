@@ -124,8 +124,8 @@ active while adding recoverability, editor workflow, diagnostics, multi-target
 state, provider-safe scheduling, large-project responsiveness, and expanded
 export work.
 
-For a compact product listing, see [catalog.md](catalog.md). For architecture,
-data contracts, and contributor guidance, see [project.md](project.md).
+For a compact product listing, see [catalog.md](docs/catalog.md). For architecture,
+data contracts, and contributor guidance, see [project.md](docs/project.md).
 
 ## Requirements
 

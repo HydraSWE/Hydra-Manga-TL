@@ -209,8 +209,9 @@ class WorkspaceManager(
                     record.rendered_image = str(rendered.resolve()); break
         project.save(); self._set_current(project); return project
 
-    def _set_current(self, project: MangaProject) -> None:
-        self._recover_interrupted_project(project)
+    def _set_current(self, project: MangaProject, *, recover: bool = True) -> None:
+        if recover:
+            self._recover_interrupted_project(project)
         self.current = project
         APP_STATE.set_project(project)
         if project.images:
@@ -219,8 +220,8 @@ class WorkspaceManager(
         self._remember(project.project_file)
         self.project_opened.emit(project)
 
-    def activate_project(self, project: MangaProject) -> None:
-        self._set_current(project)
+    def activate_project(self, project: MangaProject, *, recover: bool = True) -> None:
+        self._set_current(project, recover=recover)
 
     @staticmethod
     def _recover_interrupted_project(project: MangaProject) -> None:

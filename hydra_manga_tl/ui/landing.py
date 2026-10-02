@@ -185,7 +185,7 @@ class RecentProjectsDialog(QDialog):
 
     def _grid_columns(self) -> int:
         viewport_width = self.scroll.viewport().width() if hasattr(self, "scroll") else 0
-        width = max(viewport_width, self.width() - 48)
+        width = max(viewport_width, self.width() - 36)
         three_columns = RECENT_DIALOG_CARD_WIDTH * 3 + RECENT_DIALOG_GRID_SPACING * 2
         two_columns = RECENT_DIALOG_CARD_WIDTH * 2 + RECENT_DIALOG_GRID_SPACING
         if width >= three_columns:

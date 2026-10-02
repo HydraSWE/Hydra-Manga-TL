@@ -364,30 +364,28 @@ def _post_chat_completion_stream(
                     if message_content:
                         parts.append(str(message_content))
     except HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")[:500]
+        # ponytail: omit untrusted response bodies/URLs; preserve HTTP status and Retry-After for recovery.
+        detail = "Provider request failed; check provider configuration and account limits"
         retry_after = (
             error.headers.get("Retry-After")
             if error.headers is not None
             else None
         )
         LOGGER.warning(
-            "OpenAI-compatible streaming request returned HTTP %s url=%s detail=%s",
+            "OpenAI-compatible streaming request returned HTTP %s",
             error.code,
-            url,
-            detail,
         )
         raise TranslationHTTPError(
             error.code,
             detail,
             retry_after=_retry_after_seconds(retry_after),
-        ) from error
+        ) from None
     except Exception as error:
         LOGGER.warning(
-            "OpenAI-compatible streaming request failed url=%s error=%s",
-            url,
-            error,
+            "OpenAI-compatible streaming request failed (%s)",
+            type(error).__name__,
         )
-        raise
+        raise RuntimeError(f"OpenAI-compatible streaming request failed ({type(error).__name__})") from None
     content = "".join(parts).strip()
     if not content:
         raise RuntimeError("OpenAI-compatible stream ended without message content")

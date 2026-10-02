@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -215,15 +216,17 @@ def _gradient_fill(size: tuple[int, int], profile: TitleStyleProfile, fallback: 
         return Image.new("RGBA", size, _with_opacity(fallback, profile.opacity))
     first, second = colors[0], colors[-1]
     width, height = size
-    angle = float(profile.gradient.angle or 90.0)
-    vertical = abs(angle) % 180 >= 45 and abs(angle) % 180 <= 135
+    angle = math.radians(float(profile.gradient.angle if profile.gradient.angle is not None else 90.0))
+    dx, dy = math.cos(angle), math.sin(angle)
+    projections = [x * dx + y * dy for x in (0, width - 1) for y in (0, height - 1)]
+    low, high = min(projections), max(projections)
     gradient = Image.new("RGBA", size, (0, 0, 0, 0))
     pixels = gradient.load()
-    span = max(1, height - 1 if vertical else width - 1)
+    span = high - low or 1
     for y in range(height):
         for x in range(width):
-            t = (y if vertical else x) / span
-            color = tuple(int(first[index] + (second[index] - first[index]) * t) for index in range(3))
+            t = max(0, min(1, (x * dx + y * dy - low) / span))
+            color = tuple(round(first[index] + (second[index] - first[index]) * t) for index in range(3))
             pixels[x, y] = (*color, _opacity(profile.opacity))
     return gradient
 

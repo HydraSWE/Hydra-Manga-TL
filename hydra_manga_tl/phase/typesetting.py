@@ -23,7 +23,7 @@ def review_rendered_group(group: dict, render_details: dict, page_size: tuple[in
     lines = list(render_details.get("lines", []))
     if font_size and font_size < 9:
         reasons.append("too_small_font")
-    if render_details.get("overflow"):
+    if render_details.get("overflow") or any(run.get("overflow") for run in render_details.get("art_runs", [])):
         reasons.append("text_overflow")
     if len(box) == 4:
         margin = min(box[0], box[1], page_size[0] - box[2], page_size[1] - box[3])

@@ -572,6 +572,34 @@ class V1StabilityTests(unittest.TestCase):
         self.assertEqual(constructed, ["groq", "marian"])
         self.assertTrue(result.translations[0]["text"])
 
+    def test_unchanged_non_latin_provider_output_uses_fallback(self):
+        class EchoEngine(_FakeTranslationEngine):
+            def translate_page(self, page):
+                return PageTranslation(page.source_language, page.target_language, [
+                    {"id": item["id"], "text": f"{item['text']}."} for item in page.dialogue
+                ])
+
+        class FallbackEngine(_FakeTranslationEngine):
+            def translate_page(self, page):
+                return PageTranslation(page.source_language, page.target_language, [
+                    {"id": item["id"], "text": "Nothing."} for item in page.dialogue
+                ])
+
+        replacements = {
+            "qwen": EngineRegistration("qwen", "Qwen", lambda **kwargs: EchoEngine()),
+            "marian": EngineRegistration("marian", "Marian", lambda **kwargs: FallbackEngine()),
+        }
+        page = PageDialogue("Japanese", "en", [{"id": "r1", "text": "何も"}])
+        with patch.dict(TRANSLATION_PROVIDER_REGISTRY, replacements, clear=True), tempfile.TemporaryDirectory() as folder:
+            manager = TranslationEngineManager(
+                preferred_engine="qwen",
+                fallback_engine="marian",
+                translation_memory=TranslationMemory(Path(folder) / "memory.json"),
+            )
+            result = manager.translate_page(page)
+
+        self.assertEqual("Nothing.", result.translations[0]["text"])
+
     def test_settings_translation_test_honors_local_fallback_selection(self):
         from hydra_manga_tl.ui import TranslationTestWorker
 
@@ -736,9 +764,10 @@ class V1StabilityTests(unittest.TestCase):
         coordinator = StartupCoordinator()
         emitted = []
         coordinator.progress_changed.connect(lambda stage, label, value: emitted.append((stage, label, value)))
-        coordinator.advance("core", "Core", 20)
-        coordinator.advance("late", "Late", 80)
-        coordinator.advance("stale", "Stale", 40)
+        with patch("hydra_manga_tl.core.startup.QApplication.instance", return_value=None):
+            coordinator.advance("core", "Core", 20)
+            coordinator.advance("late", "Late", 80)
+            coordinator.advance("stale", "Stale", 40)
         self.assertEqual([20, 80, 80], [item[2] for item in emitted])
         self.assertEqual(80, coordinator.progress)
 

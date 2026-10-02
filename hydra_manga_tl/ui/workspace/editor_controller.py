@@ -36,7 +36,8 @@ class EditorControllerMixin(EditorHistoryMixin):
     """Own editor state, text-block selection, and undo/redo operations."""
 
     def _application_focus_changed(self, _old, _new) -> None:
-        self._update_editor_shortcuts()
+        if self.isVisible():
+            self._update_editor_shortcuts()
 
     def _manual_shortcut_sequence(self) -> QKeySequence:
         sequence = QKeySequence(SETTINGS.manual_textbox_shortcut or "Ctrl+D")

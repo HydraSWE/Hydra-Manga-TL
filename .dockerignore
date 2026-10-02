@@ -1,0 +1,13 @@
+.git
+.venv
+.venv-inpaint
+__pycache__
+*.pyc
+hydramangatl-web/node_modules
+hydramangatl-web/.next
+hydra-data
+hydra-storage
+models
+dist
+build
+artifacts

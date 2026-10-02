@@ -68,13 +68,14 @@ class ManualRegionWorkspaceMixin:
             "translation_fallback_engine": SETTINGS.translation_fallback_engine,
             "allow_local_fallback_for_cloud": True,
             "qwen_model_path": SETTINGS.qwen_model_path,
-            "qwen_model_name": SETTINGS.qwen_model_name,
+            "qwen_model_name": (self.current.localization_model if manual_engine == "qwen" else "") or SETTINGS.qwen_model_name,
             "provider_models": {
                 "groq": SETTINGS.groq_model,
                 "gemini": SETTINGS.gemini_model,
                 "deepseek": SETTINGS.deepseek_model,
                 "openai": SETTINGS.openai_model,
                 "openai_compatible": SETTINGS.openai_compatible_model,
+                **({manual_engine: self.current.localization_model} if self.current.localization_model else {}),
             },
             "provider_base_urls": {
                 "openai_compatible": SETTINGS.openai_compatible_base_url,
@@ -140,13 +141,14 @@ class ManualRegionWorkspaceMixin:
             "translation_fallback_engine": SETTINGS.translation_fallback_engine,
             "allow_local_fallback_for_cloud": True,
             "qwen_model_path": SETTINGS.qwen_model_path,
-            "qwen_model_name": SETTINGS.qwen_model_name,
+            "qwen_model_name": (self.current.localization_model if manual_engine == "qwen" else "") or SETTINGS.qwen_model_name,
             "provider_models": {
                 "groq": SETTINGS.groq_model,
                 "gemini": SETTINGS.gemini_model,
                 "deepseek": SETTINGS.deepseek_model,
                 "openai": SETTINGS.openai_model,
                 "openai_compatible": SETTINGS.openai_compatible_model,
+                **({manual_engine: self.current.localization_model} if self.current.localization_model else {}),
             },
             "provider_base_urls": {
                 "openai_compatible": SETTINGS.openai_compatible_base_url,

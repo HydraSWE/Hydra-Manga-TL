@@ -418,7 +418,8 @@ def _post_json(url: str, body: dict, *, headers: dict[str, str] | None = None, t
         with urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")[:500]
+        # ponytail: omit untrusted response bodies; add allowlisted error codes if diagnostics need more detail.
+        detail = "Provider request failed; check provider configuration and account limits"
         retry_after = (
             error.headers.get("Retry-After")
             if error.headers is not None
@@ -428,7 +429,9 @@ def _post_json(url: str, body: dict, *, headers: dict[str, str] | None = None, t
             error.code,
             detail,
             retry_after=_retry_after_seconds(retry_after),
-        ) from error
+        ) from None
+    except (URLError, OSError) as error:
+        raise RuntimeError(f"Translation network request failed ({type(error).__name__})") from None
 
 
 def _localization_prompt(

@@ -1,0 +1,100 @@
+services:
+  runtime:
+    image: hydramangatl-runtime:local
+    build:
+      context: .
+      dockerfile: docker/hydra-runtime.Dockerfile
+    entrypoint: ["true"]
+  backend:
+    image: hydramangatl-backend:local
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    ports: ["${HYDRA_HOST_API_PORT:-18000}:${HYDRA_API_PORT:-8000}"]
+    environment:
+      HYDRA_DATA_DIR: /hydra-data
+      HYDRA_STORAGE_ROOT: /data/hydra
+      HYDRA_API_PORT: ${HYDRA_API_PORT:-8000}
+      REDIS_URL: redis://redis:6379/0
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      HYDRA_PIN: ${HYDRA_PIN:?HYDRA_PIN must be set in .env before starting the web stack}
+      HYDRA_ENV: ${HYDRA_ENV:-local}
+      HYDRA_COMPATIBLE_ENDPOINTS: ${HYDRA_COMPATIBLE_ENDPOINTS:-https://api.tokenrouter.com/v1}
+      QT_QPA_PLATFORM: offscreen
+    volumes:
+      - ./hydra-data:/hydra-data
+      - ${HYDRA_HOST_STORAGE:-./hydra-storage}:/data/hydra
+      - ./models:/app/models:ro
+    depends_on:
+      runtime:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/ready')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  worker:
+    image: hydramangatl-worker:local
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    environment:
+      HYDRA_DATA_DIR: /hydra-data
+      HYDRA_STORAGE_ROOT: /data/hydra
+      REDIS_URL: redis://redis:6379/0
+      HYDRA_PIN: ${HYDRA_PIN:-}
+      QT_QPA_PLATFORM: offscreen
+      GOOGLE_TRANSLATE_API_KEY: ${GOOGLE_TRANSLATE_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY:-}
+      TOKENROUTER_API_KEY: ${TOKENROUTER_API_KEY:-}
+      HYDRA_COMPATIBLE_ENDPOINTS: ${HYDRA_COMPATIBLE_ENDPOINTS:-https://api.tokenrouter.com/v1}
+    volumes:
+      - ./hydra-data:/hydra-data
+      - ${HYDRA_HOST_STORAGE:-./hydra-storage}:/data/hydra
+      - ./models:/models
+      - ./models:/app/models:ro
+    depends_on:
+      runtime:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [hydra-redis:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  frontend:
+    build:
+      context: ./hydramangatl-web
+      dockerfile: ../docker/frontend.Dockerfile
+      args:
+        NEXT_PUBLIC_API_PORT: ${HYDRA_HOST_API_PORT:-18000}
+    ports: ["3000:3000"]
+    environment:
+      NEXT_PUBLIC_API_PORT: ${HYDRA_HOST_API_PORT:-18000}
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  hydra-redis:

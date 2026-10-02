@@ -64,6 +64,8 @@ class QwenModelDownloadWorker(QObject):
 
 class SettingsActionsMixin:
     def _deferred_settings_refresh(self) -> None:
+        if not self.isVisible():
+            return
         self._load_local_qwen_models()
         self._refresh_qwen_metadata()
         self._refresh_translation_memory_stats()

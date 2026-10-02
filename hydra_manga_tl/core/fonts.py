@@ -27,6 +27,9 @@ def _font_roots() -> tuple[Path, ...]:
         *(root / "assets" / "fonts" for root in asset_roots()),
         Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
         Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts",
+        Path("/usr/share/fonts/truetype/dejavu"),
+        Path("/usr/share/fonts/truetype/liberation2"),
+        Path("/usr/share/fonts/truetype/freefont"),
     ]
     unique: list[Path] = []
     seen: set[str] = set()
@@ -74,9 +77,9 @@ def find_font_file(font_family: str) -> Path | None:
 
 def default_font_file(*, bold: bool = False) -> Path:
     preferred = (
-        ("Arial Bold", "Segoe UI", "Arial", "Yu Gothic")
+        ("Arial Bold", "Segoe UI", "Arial", "Yu Gothic", "DejaVu Sans Bold", "Liberation Sans Bold")
         if bold
-        else ("Arial", "Segoe UI", "Yu Gothic", "MS Gothic", "Meiryo")
+        else ("Arial", "Segoe UI", "Yu Gothic", "MS Gothic", "Meiryo", "DejaVu Sans", "Liberation Sans")
     )
     for family in preferred:
         candidate = find_font_file(family)

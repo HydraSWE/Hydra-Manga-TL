@@ -287,7 +287,12 @@ class MangaProject:
         payload.update(payload.pop("_extra_fields", {}))
         for image_payload in payload.get("images", []):
             image_payload.update(image_payload.pop("_extra_fields", {}))
-        self.project_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary = self.project_file.with_name(f"{self.project_file.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self.project_file)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @classmethod
     def load(cls, path: Path) -> "MangaProject":

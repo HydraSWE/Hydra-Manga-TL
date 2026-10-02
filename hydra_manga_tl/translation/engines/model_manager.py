@@ -262,6 +262,14 @@ class TranslationEngineManager:
             return False
         return not any(unicodedata.category(char)[0] in {"L", "N"} for char in stripped)
 
+    @staticmethod
+    def _semantic_text(text: str) -> str:
+        return "".join(
+            char.casefold()
+            for char in str(text or "")
+            if unicodedata.category(char)[0] in {"L", "N"}
+        )
+
     @classmethod
     def _validate_page_translation(cls, page: PageDialogue, result: PageTranslation) -> None:
         input_ids = [str(item.get("id")) for item in page.dialogue]
@@ -282,13 +290,20 @@ class TranslationEngineManager:
         }
         for item in result.translations:
             text = str(item.get("text", "")).strip()
+            source_text = source_by_id.get(str(item.get("id")), "")
             if not text:
-                source_text = source_by_id.get(str(item.get("id")), "")
                 if cls._is_symbol_only_source(source_text):
                     item["text"] = source_text
                     item["translation_source"] = item.get("translation_source") or "source-symbol"
                     continue
                 raise TranslationContentValidationError("empty translation for id")
+            if (
+                page.source_language.casefold() in {"japanese", "chinese", "korean"}
+                and page.target_language.casefold() in {"en", "english", "latin-script"}
+                and not cls._is_symbol_only_source(source_text)
+                and cls._semantic_text(text) == cls._semantic_text(source_text)
+            ):
+                raise TranslationContentValidationError("unchanged translation for id")
 
     @staticmethod
     def _is_single_manual_selection(page: PageDialogue) -> bool:

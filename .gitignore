@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.web.example
 *.local
 *.secret
 *.secrets
@@ -52,6 +53,9 @@ htmlcov/
 # Local app output, projects, and user data
 /outputs/
 /output/
+/hydra-data/
+/hydra-storage/
+/previews/
 /Translated_Manga/
 /projects/
 /project.json
@@ -112,9 +116,42 @@ desktop.ini
 !/tests/test_translation_memory_v1.py
 !/tests/test_pipeline_state_manager.py
 !/tests/test_intelligent_cleanup_geometry.py
-
+!/tests/test_web_jobs.py
+!/tests/test_web_engine_progress.py
+!/tests/test_web_page_images.py
+!/tests/test_web_region_edits.py
+!/tests/test_web_reading_order.py
+!/tests/test_web_manual_region.py
+!/tests/test_web_region_mutations.py
+!/tests/test_web_review_metadata.py
+!/tests/test_web_export.py
+!/tests/test_web_project_settings.py
+!/tests/test_web_runtime_settings.py
+!/tests/test_web_status.mjs
+!/tests/test_project_lease.py
+!/tests/test_web_download.mjs
+!/tests/test_web_download_auth.py
+!/tests/test_web_page_order.py
+!/tests/test_web_backups.py
+!/tests/test_web_page_drag.mjs
+docker
+worker
+tasks
+tests
+scripts
+docs
 # AI and Project Documentation
 AGENTS.md
 ARCHITECTURE.md
 DEVELOPMENT.md
 UI_GUIDELINES.md
+# Local web build/dependency output
+api
+graphify-out
+requirements-web.txt
+hydramangatl-web
+hydramangatl-web/node_modules/
+hydramangatl-web/.next/
+hydramangatl-web/out/
+.env.web.example
+.env.example
