@@ -13,7 +13,7 @@ from hydra_manga_tl.core.normalization import normalize_global_text
 from hydra_manga_tl.core.region_types import normalize_region_type
 from hydra_manga_tl.core.state import APP_STATE
 from hydra_manga_tl.project.editor import RegionEdit
-from hydra_manga_tl.project.manual_region import rect_to_polygon
+from hydra_manga_tl.project.manual_region import normalize_image_polygon, rect_to_polygon
 from hydra_manga_tl.project.model import ManualRegion
 
 
@@ -42,6 +42,32 @@ def _polygon_box(polygon: list) -> list[int] | None:
     except (TypeError, ValueError, IndexError):
         return None
     return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def transform_background_polygon(polygon: list, before: dict, after: dict) -> list[list[int]]:
+    before_width = max(1.0, float(before["width"]))
+    before_height = max(1.0, float(before["height"]))
+    before_center = (
+        float(before["x"]) + before_width / 2.0,
+        float(before["y"]) + before_height / 2.0,
+    )
+    after_width = max(1.0, float(after["width"]))
+    after_height = max(1.0, float(after["height"]))
+    after_center = (
+        float(after["x"]) + after_width / 2.0,
+        float(after["y"]) + after_height / 2.0,
+    )
+    angle = math.radians(float(after.get("angle", 0) or 0) - float(before.get("angle", 0) or 0))
+    cosine, sine = math.cos(angle), math.sin(angle)
+    transformed: list[list[int]] = []
+    for point in polygon:
+        x = (float(point[0]) - before_center[0]) * after_width / before_width
+        y = (float(point[1]) - before_center[1]) * after_height / before_height
+        transformed.append([
+            int(round(after_center[0] + x * cosine - y * sine)),
+            int(round(after_center[1] + x * sine + y * cosine)),
+        ])
+    return transformed
 
 
 def default_text_layout(group: dict, image_size: tuple[int, int] | None = None) -> dict | None:
@@ -187,6 +213,8 @@ def effective_translation_payload(project, image_index: int) -> dict:
             "selection_polygon": polygon,
             "cleanup_polygons": cleanup_polygons,
             "placement_polygon": placement_polygon,
+            "background_polygon": list(manual.background_polygon),
+            "background_linked": bool(manual.background_linked),
             "decorative_symbols": [dict(symbol) for symbol in manual.decorative_symbols],
             "preserved_marks": [dict(mark) for mark in manual.preserved_marks],
             "status": manual.status,
@@ -286,16 +314,74 @@ class WorkspaceEditorMixin:
         payload = self.effective_translation_payload(image_index)
         groups_by_id = {str(item["index"]): item for item in payload.get("translation_groups", [])}
         image = self.current.images[image_index]
+        manual_by_key = {region.key: region for region in image.manual_regions}
         for group_index, edit in edits_map.items():
             group_key = str(group_index)
             group = groups_by_id.get(group_key)
             if group is not None:
                 self._capture_edit_corrections(image_index, group, edit)
                 self._learn_user_translation_edit(image_index, group, edit)
+            manual = manual_by_key.get(group_key)
+            if manual is not None and manual.background_linked and all(
+                value is not None
+                for value in (edit.layout_x, edit.layout_y, edit.layout_width, edit.layout_height)
+            ):
+                before = default_text_layout(group or {})
+                if before is not None:
+                    after = {
+                        "x": edit.layout_x,
+                        "y": edit.layout_y,
+                        "width": edit.layout_width,
+                        "height": edit.layout_height,
+                        "angle": edit.layout_angle or 0.0,
+                    }
+                    manual.background_polygon = transform_background_polygon(
+                        manual.background_polygon,
+                        before,
+                        after,
+                    )
             image.edits[group_key] = edit
         APP_STATE.set_dirty(True)
         self.save()
         self.image_updated.emit(image_index)
+
+    def update_manual_background(
+        self,
+        image_index: int,
+        group_index: int | str,
+        polygon: list,
+        *,
+        linked: bool = False,
+        rerender: bool = True,
+    ) -> None:
+        if self.current is None:
+            raise ValueError("No project is open.")
+        image = self.current.images[image_index]
+        manual = next((region for region in image.manual_regions if region.key == str(group_index)), None)
+        if manual is None:
+            raise ValueError("Only manual regions have editable backgrounds.")
+        from PIL import Image
+        with Image.open(image.source_path) as opened:
+            normalized = normalize_image_polygon(polygon, opened.size)
+        if normalized is None:
+            raise ValueError("Background polygon must stay inside the page and have at least three valid points.")
+        manual.background_polygon = normalized
+        manual.background_linked = bool(linked)
+        APP_STATE.set_dirty(True)
+        self.save()
+        if rerender:
+            self.rerender_image(image_index)
+        self.image_updated.emit(image_index)
+
+    def reset_manual_background(self, image_index: int, group_index: int | str) -> None:
+        if self.current is None:
+            return
+        image = self.current.images[image_index]
+        manual = next((region for region in image.manual_regions if region.key == str(group_index)), None)
+        if manual is None:
+            return
+        manual.background_polygon = [list(point) for point in manual.selection_polygon]
+        manual.background_linked = True
 
     def restore_edit(
         self,

@@ -172,6 +172,9 @@ class EditorControllerMixin(EditorHistoryMixin):
             pending = self._pending_text_layouts.get((index, str(group.get("index"))))
             if pending is not None:
                 group["text_layout"] = dict(pending)
+            pending_background = self._pending_backgrounds.get((index, str(group.get("index"))))
+            if pending_background is not None:
+                group["background_polygon"] = [list(point) for point in pending_background]
         self.blocks.blockSignals(True); self.blocks.clear()
         for block_row, group in enumerate(self._groups, 1):
             ocr_reasons = WORKSPACE.ocr_review_reasons(group)
@@ -226,7 +229,38 @@ class EditorControllerMixin(EditorHistoryMixin):
         self._load_appearance_controls(group, edit)
         self.offset_x.setValue(edit.offset_x); self.offset_y.setValue(edit.offset_y)
         self.offset_angle.setValue(edit.layout_angle or 0.0)
+        is_manual = bool(group.get("manual")) and group.get("bubble_type") != "title"
+        self.translated.background_layer_button.setEnabled(is_manual)
+        if not is_manual and self.translated.background_layer_button.isChecked():
+            self.translated.set_layout_layer("text")
         self._update_ocr_queue_status()
+
+    def _background_polygon_changed(self, row: int, polygon: list[list[int]]) -> None:
+        if not (0 <= row < len(self._groups)):
+            return
+        group = self._groups[row]
+        if not group.get("manual"):
+            return
+        key = self._layout_key(APP_STATE.selected_image, group["index"])
+        before = self._pending_backgrounds.get(key) or group.get("background_polygon") or group.get("selection_polygon")
+        before_linked = self._pending_background_links.get(key, bool(group.get("background_linked", True)))
+        staged = [[int(point[0]), int(point[1])] for point in polygon]
+        if before == staged:
+            return
+        command = {
+            "kind": "background_polygon",
+            "image_index": APP_STATE.selected_image,
+            "group_index": group["index"],
+            "row": row,
+            "before": [list(point) for point in before],
+            "before_linked": before_linked,
+            "after": staged,
+            "after_linked": False,
+        }
+        if self._apply_background_command(command, staged, linked=False):
+            self._layout_undo.append(command)
+            del self._layout_undo[:-200]
+            self._layout_redo.clear()
 
     @staticmethod
     def _block_list_label(group: dict, row: int, has_ocr_review: bool) -> str:
@@ -394,11 +428,13 @@ class EditorControllerMixin(EditorHistoryMixin):
             working.set_message(f"Saving edits for {len(valid_rows)} bubble(s)...")
             is_single = (len(valid_rows) == 1)
             edits_map: dict[int | str, RegionEdit] = {}
+            backgrounds_map: dict[int | str, tuple[list[list[int]], bool]] = {}
             for row in valid_rows:
                 group = self._groups[row]
                 grp_index = group["index"]
                 existing = WORKSPACE.current.images[image_index].edits.get(str(grp_index), RegionEdit()) if WORKSPACE.current else RegionEdit()
                 pending_layout = self._pending_text_layouts.get(self._layout_key(image_index, grp_index))
+                pending_background = self._pending_backgrounds.get(self._layout_key(image_index, grp_index))
 
                 orig_text = self.original_text.toPlainText() if is_single else group.get("original_text", "")
                 trans_text = self.translation.toPlainText() if is_single else group.get("translated_text", "")
@@ -422,10 +458,28 @@ class EditorControllerMixin(EditorHistoryMixin):
                     layout_angle=self.offset_angle.value() if pending_layout is None and self.offset_angle.value() != (existing.layout_angle or 0.0) else (pending_layout.get("angle", existing.layout_angle or 0.0) if pending_layout else existing.layout_angle),
                 )
                 WORKSPACE.validate_edit(image_index, grp_index, edit)
+                if pending_background is not None:
+                    backgrounds_map[grp_index] = (
+                        pending_background,
+                        self._pending_background_links.get(
+                            self._layout_key(image_index, grp_index),
+                            False,
+                        ),
+                    )
                 edits_map[grp_index] = edit
                 self._pending_text_layouts.pop(self._layout_key(image_index, grp_index), None)
+                self._pending_backgrounds.pop(self._layout_key(image_index, grp_index), None)
+                self._pending_background_links.pop(self._layout_key(image_index, grp_index), None)
 
             WORKSPACE.update_edits_batch(image_index, edits_map)
+            for group_index, (polygon, linked) in backgrounds_map.items():
+                WORKSPACE.update_manual_background(
+                    image_index,
+                    group_index,
+                    polygon,
+                    linked=linked,
+                    rerender=False,
+                )
 
             working.set_message("Rendering the translated page...")
             WORKSPACE.rerender_image(image_index, log_callback=working.append_log)
@@ -551,6 +605,11 @@ class EditorControllerMixin(EditorHistoryMixin):
                 
             group = self._groups[row]
             project.images[APP_STATE.selected_image].edits.pop(str(group["index"]), None)
+            self._pending_text_layouts.pop(self._layout_key(APP_STATE.selected_image, group["index"]), None)
+            self._pending_backgrounds.pop(self._layout_key(APP_STATE.selected_image, group["index"]), None)
+            self._pending_background_links.pop(self._layout_key(APP_STATE.selected_image, group["index"]), None)
+            if group.get("manual"):
+                WORKSPACE.reset_manual_background(APP_STATE.selected_image, group["index"])
             WORKSPACE.save()
             
             try: 

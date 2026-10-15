@@ -480,6 +480,8 @@ class _ManualRegionProcessor(QObject):
                 "selection_polygon": selection_polygon,
                 "cleanup_polygons": cleanup_polygons,
                 "placement_polygon": placement_polygon,
+                "background_polygon": selection_polygon,
+                "background_linked": True,
                 "decorative_symbols": decorative_symbols,
                 "preserved_marks": [],
                 "ocr_recognition": recognition,

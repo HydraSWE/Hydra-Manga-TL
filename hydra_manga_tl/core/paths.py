@@ -8,7 +8,7 @@ import shutil
 
 
 VALID_PROFILES = {"stable", "development"}
-CURRENT_CACHE_SCHEMA = 11
+CURRENT_CACHE_SCHEMA = 12
 
 
 def default_profile() -> str:

@@ -22,6 +22,7 @@ from hydra_manga_tl.title import extract_title_glyph_mask
 from hydra_manga_tl.title.reconstruction import reconstruct_title_page
 # Updated imports to match the new layout engine in renderer.py
 from hydra_manga_tl.phase.renderer import (
+    apply_manual_backgrounds,
     clean_background,
     compute_safe_text_area,
     detect_bubble_box,
@@ -633,6 +634,7 @@ def run(
         preview_path = output / f"{stem}_preview.png"
         cleaned.save(cleaned_path)
         final = cleaned
+        apply_manual_backgrounds(final, eligible)
         rendered = []
         for group, fitted, group_font in render_jobs:
             safe_text = str(group["translated_text"]).encode("ascii", "backslashreplace").decode("ascii")

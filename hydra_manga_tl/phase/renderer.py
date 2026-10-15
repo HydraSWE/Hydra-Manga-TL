@@ -280,14 +280,14 @@ def clean_background(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, s
             ring_gray = gray[ring]
             light_ratio = float(np.mean(ring_gray >= 180))
             dark_ratio = float(np.mean(ring_gray <= 65))
-            if light_ratio >= 0.45 or float(np.percentile(ring_gray, 75)) >= 195:
+            if light_ratio >= 0.62 and dark_ratio < 0.15:
                 bright_pixels = ring_pixels[ring_gray >= 160]
                 fill = np.percentile(bright_pixels, 90, axis=0).astype(np.uint8) if len(bright_pixels) else np.array([255, 255, 255], dtype=np.uint8)
                 if float(fill.mean()) >= 225:
                     fill = np.array([255, 255, 255], dtype=np.uint8)
                 cleaned[component] = fill
                 method = "light-background-fill"
-            elif dark_ratio >= 0.50 or float(np.percentile(ring_gray, 25)) <= 70:
+            elif dark_ratio >= 0.62 and light_ratio < 0.15:
                 dark_pixels = ring_pixels[ring_gray <= 80]
                 fill = np.percentile(dark_pixels, 15, axis=0).astype(np.uint8) if len(dark_pixels) else np.array([0, 0, 0], dtype=np.uint8)
                 if float(fill.mean()) <= 25:
@@ -303,6 +303,23 @@ def clean_background(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, s
         methods.append(method)
     unique_methods = list(dict.fromkeys(methods))
     return cleaned, unique_methods[0] if len(unique_methods) == 1 else "+".join(unique_methods)
+
+
+def apply_manual_backgrounds(image: Image.Image, groups: list[dict]) -> int:
+    draw = ImageDraw.Draw(image)
+    rendered = 0
+    for group in groups:
+        is_title = str(group.get("bubble_type") or group.get("type") or "").casefold() == "title"
+        polygon = group.get("background_polygon") if group.get("manual") and not is_title else None
+        if not isinstance(polygon, list) or len(polygon) < 3:
+            continue
+        try:
+            points = [(int(point[0]), int(point[1])) for point in polygon]
+        except (TypeError, ValueError, IndexError):
+            continue
+        draw.polygon(points, fill=(255, 255, 255))
+        rendered += 1
+    return rendered
 
 
 def render_group(

@@ -223,6 +223,20 @@ def _schema_10_to_11(payload: dict) -> dict:
     return payload
 
 
+def _schema_11_to_12(payload: dict) -> dict:
+    payload = _ensure_project_defaults(payload)
+    for image in payload.get("images", []):
+        if not isinstance(image, dict):
+            continue
+        _default_manual_backgrounds(image.get("manual_regions", []))
+        target_states = image.get("target_states", {})
+        if isinstance(target_states, dict):
+            for state in target_states.values():
+                if isinstance(state, dict):
+                    _default_manual_backgrounds(state.get("manual_regions", []))
+    return payload
+
+
 def _default_preserved_marks(regions: object) -> None:
     if not isinstance(regions, list):
         return
@@ -239,6 +253,21 @@ def _default_decorative_symbols(regions: object) -> None:
             region.setdefault("decorative_symbols", [])
 
 
+def _default_manual_backgrounds(regions: object) -> None:
+    if not isinstance(regions, list):
+        return
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        selection = (
+            _normalize_polygon(region.get("selection_polygon"))
+            or _normalize_polygon(region.get("polygon"))
+            or _rect_to_polygon(region.get("rect", []))
+        )
+        region["background_polygon"] = _normalize_polygon(region.get("background_polygon")) or selection
+        region.setdefault("background_linked", True)
+
+
 MIGRATIONS = MigrationRegistry()
 MIGRATIONS.register(MigrationStep(4, 5, _schema_4_to_5, "Add provider and layout defaults"))
 MIGRATIONS.register(MigrationStep(5, 6, _schema_5_to_6, "Add manual-region state"))
@@ -247,6 +276,7 @@ MIGRATIONS.register(MigrationStep(7, 8, _schema_7_to_8, "Add reading order and t
 MIGRATIONS.register(MigrationStep(8, 9, _schema_8_to_9, "Add intelligent cleanup geometry"))
 MIGRATIONS.register(MigrationStep(9, 10, _schema_9_to_10, "Add manual preserved mark metadata"))
 MIGRATIONS.register(MigrationStep(10, 11, _schema_10_to_11, "Add redrawable decorative symbol metadata"))
+MIGRATIONS.register(MigrationStep(11, 12, _schema_11_to_12, "Add manual-region background layers"))
 
 
 class MigrationManager:

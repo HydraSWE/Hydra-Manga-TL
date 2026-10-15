@@ -17,7 +17,7 @@ from hydra_manga_tl.project.compatibility import (
 )
 
 
-PROJECT_VERSION = 11
+PROJECT_VERSION = 12
 STAGES = {
     "pending", "queued", "partial", "preprocessing", "analyzing", "OCR", "ocr", "translating",
     "localizing", "rendering", "reconstructing", "review", "done", "ready", "failed", "cancelled",
@@ -65,6 +65,8 @@ class ManualRegion:
     selection_polygon: list[list[int]] = field(default_factory=list)
     cleanup_polygons: list[list[list[int]]] = field(default_factory=list)
     placement_polygon: list[list[int]] = field(default_factory=list)
+    background_polygon: list[list[int]] = field(default_factory=list)
+    background_linked: bool = True
     bubble_type: str = "dialogue"
     render_mode: str = ""
     title_composition: dict = field(default_factory=dict)
@@ -90,6 +92,8 @@ class ManualRegion:
             or [self.selection_polygon]
         )
         self.placement_polygon = _normalize_polygon(self.placement_polygon) or self.selection_polygon
+        self.background_polygon = _normalize_polygon(self.background_polygon) or self.selection_polygon
+        self.background_linked = bool(self.background_linked)
         self.polygon = self.selection_polygon
         self.bubble_type = str(self.bubble_type or "dialogue")
         self.decorative_symbols = [

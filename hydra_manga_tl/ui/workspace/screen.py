@@ -97,6 +97,8 @@ class WorkspaceScreen(
         self._filmstrip_undo: list[dict] = []
         self._filmstrip_redo: list[dict] = []
         self._pending_text_layouts: dict[tuple[int, str], dict] = {}
+        self._pending_backgrounds: dict[tuple[int, str], list[list[int]]] = {}
+        self._pending_background_links: dict[tuple[int, str], bool] = {}
         self._pending_manual_history: dict[int, dict] = {}
         self._ignore_next_open_page_selection: int = 0  # countdown: absorbs N selection_changed signals after project open
         self._recent_manual_requests: dict[str, object] = {}
@@ -481,6 +483,7 @@ class WorkspaceScreen(
         self.original.region_selected.connect(self._select_block); self.translated.region_selected.connect(self._select_block)
         self.original.batch_regions_selected.connect(self._batch_blocks_selected)
         self.translated.text_layout_changed.connect(self._text_layout_changed)
+        self.translated.background_polygon_changed.connect(self._background_polygon_changed)
         self.original.manual_region_created.connect(self._manual_region_created)
         self.original.manual_region_message.connect(self.status.setText)
         self.original.manual_selection_finished.connect(self._reset_region_tool)
@@ -545,6 +548,8 @@ class WorkspaceScreen(
             self._filmstrip_undo.clear()
             self._filmstrip_redo.clear()
             self._pending_text_layouts.clear()
+            self._pending_backgrounds.clear()
+            self._pending_background_links.clear()
             self._pending_manual_history.clear()
             self._reset_project_view_state()
             return
@@ -576,6 +581,8 @@ class WorkspaceScreen(
             self._filmstrip_undo.clear()
             self._filmstrip_redo.clear()
             self._pending_text_layouts.clear()
+            self._pending_backgrounds.clear()
+            self._pending_background_links.clear()
             self._pending_manual_history.clear()
         show_identity_on_open = project_changed and self.identity_thumbnail_path is not None
         identity_active = self._identity_workspace_active()

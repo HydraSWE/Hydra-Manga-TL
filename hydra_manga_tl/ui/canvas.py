@@ -37,6 +37,7 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
     region_selected = Signal(int)
     batch_regions_selected = Signal(int, object)
     text_layout_changed = Signal(int, object)
+    background_polygon_changed = Signal(int, object)
     manual_rect_created = Signal(object)
     manual_region_created = Signal(object)
     manual_region_message = Signal(str)
@@ -60,6 +61,9 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
         self._rotation_guide_line: QGraphicsLineItem | None = None
         self._rotation_angle_text: QGraphicsSimpleTextItem | None = None
         self._hovered_layout_handle: tuple[str, str] | None = None
+        self._layout_layer = "text"
+        self._content_groups: list[dict] = []
+        self._background_original: list[list[int]] = []
         self._manual_mode = ""
         self._manual_start: QPointF | None = None
         self._manual_preview: QGraphicsRectItem | None = None
@@ -73,7 +77,7 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
         self._polygon_confirm = QPushButton("Confirm", self.viewport())
         self._polygon_cancel = QPushButton("Cancel", self.viewport())
         self._polygon_confirm.clicked.connect(self._confirm_polygon_selection)
-        self._polygon_cancel.clicked.connect(self.cancel_manual_selection)
+        self._polygon_cancel.clicked.connect(self._cancel_polygon_action)
         for button in (self._polygon_confirm, self._polygon_cancel):
             button.setObjectName("CanvasOverlayButton")
             button.hide()
@@ -90,6 +94,21 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
         self.badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.badge.adjustSize()
         self.badge.raise_()
+        self.text_layer_button: QPushButton | None = None
+        self.background_layer_button: QPushButton | None = None
+        if title == "Translated":
+            self.text_layer_button = QPushButton("Text", self.viewport())
+            self.background_layer_button = QPushButton("Backing", self.viewport())
+            for button in (self.text_layer_button, self.background_layer_button):
+                button.setObjectName("CanvasOverlayButton")
+                button.setCheckable(True)
+                button.adjustSize()
+                button.raise_()
+            self.text_layer_button.setChecked(True)
+            self.background_layer_button.setEnabled(False)
+            self.text_layer_button.clicked.connect(lambda: self.set_layout_layer("text"))
+            self.background_layer_button.clicked.connect(lambda: self.set_layout_layer("background"))
+            self._position_layer_buttons()
         self._manual_overlays: dict[str, OverlayProgressWidget] = {}
         self.horizontalScrollBar().valueChanged.connect(self.reposition_overlays)
         self.verticalScrollBar().valueChanged.connect(self.reposition_overlays)
@@ -104,6 +123,7 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
         self.cancel_manual_selection()
         self.clear_manual_overlays()
         self._clear_text_layout_transform()
+        self._content_groups = groups
         for item in self._regions: self._scene.removeItem(item)
         self._regions.clear()
         for item in self._reading_order_labels:
@@ -118,6 +138,8 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
         pixmap = QPixmap(str(image_path)) if image_path and image_path.is_file() else QPixmap()
         self._pixmap.setPixmap(pixmap); self._scene.setSceneRect(self._pixmap.boundingRect())
         self._update_pixmap_filter()
+        if self.background_layer_button is not None:
+            self.background_layer_button.setEnabled(False)
         for row, group in enumerate(groups):
             polygon = QPolygonF([QPointF(point[0], point[1]) for point in group.get("polygon", [])])
             item = QGraphicsPolygonItem(polygon)
@@ -146,8 +168,96 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
                 self._scene.addItem(label)
                 self._reading_order_labels.append(label)
         if self.title == "Translated" and 0 <= selected < len(groups):
-            self._show_text_layout_transform(selected, groups[selected])
+            self._show_active_layout_transform(selected, groups[selected])
+            can_edit_background = bool(groups[selected].get("manual")) and groups[selected].get("bubble_type") != "title"
+            self.background_layer_button.setEnabled(can_edit_background)
+            self.text_layer_button.setChecked(self._layout_layer == "text")
+            self.background_layer_button.setChecked(self._layout_layer == "background")
         if not pixmap.isNull() and self._zoom == 1.0: self.fit_image()
+
+    def set_layout_layer(self, layer: str) -> bool:
+        layer = "background" if layer == "background" else "text"
+        row = self._layout_row if self._layout_row >= 0 else next(iter(self._selected_rows), -1)
+        if not (0 <= row < len(self._content_groups)):
+            return False
+        group = self._content_groups[row]
+        if layer == "background" and (
+            not group.get("manual") or group.get("bubble_type") == "title"
+        ):
+            return False
+        self.cancel_manual_selection()
+        self._clear_text_layout_transform()
+        self._layout_layer = layer
+        self._show_active_layout_transform(row, group)
+        if self.text_layer_button is not None and self.background_layer_button is not None:
+            self.text_layer_button.setChecked(layer == "text")
+            self.background_layer_button.setChecked(layer == "background")
+        return True
+
+    def _position_layer_buttons(self) -> None:
+        if self.text_layer_button is None or self.background_layer_button is None:
+            return
+        self.text_layer_button.adjustSize()
+        self.background_layer_button.adjustSize()
+        width = self.text_layer_button.width() + self.background_layer_button.width() + 6
+        x = max(8, self.viewport().width() - width - 10)
+        self.text_layer_button.move(x, 8)
+        self.background_layer_button.move(x + self.text_layer_button.width() + 6, 8)
+
+    def _show_active_layout_transform(self, row: int, group: dict) -> None:
+        if self._layout_layer == "background" and group.get("manual") and group.get("bubble_type") != "title":
+            self._show_background_transform(row, group)
+        else:
+            self._layout_layer = "text"
+            self._show_text_layout_transform(row, group)
+
+    @staticmethod
+    def _rectangle_layout(polygon: list) -> dict | None:
+        if len(polygon) != 4:
+            return None
+        points = [QPointF(float(point[0]), float(point[1])) for point in polygon]
+        first = points[1] - points[0]
+        second = points[2] - points[1]
+        width = math.hypot(first.x(), first.y())
+        height = math.hypot(second.x(), second.y())
+        if width < 1 or height < 1 or abs(first.x() * second.x() + first.y() * second.y()) > width * height * 0.02:
+            return None
+        center = sum((point.x() for point in points), 0.0) / 4.0, sum((point.y() for point in points), 0.0) / 4.0
+        return {
+            "x": center[0] - width / 2.0,
+            "y": center[1] - height / 2.0,
+            "width": width,
+            "height": height,
+            "angle": math.degrees(math.atan2(first.y(), first.x())),
+        }
+
+    def _show_background_transform(self, row: int, group: dict) -> None:
+        polygon = group.get("background_polygon") or group.get("selection_polygon") or []
+        if len(polygon) < 3:
+            return
+        self._layout_row = row
+        self._background_original = [[int(point[0]), int(point[1])] for point in polygon]
+        rectangle = self._rectangle_layout(polygon)
+        if rectangle is not None:
+            self._show_text_layout_transform(row, {
+                "text_layout": rectangle,
+            })
+            if self._layout_frame is not None:
+                self._layout_frame.setPen(QPen(QColor("#ff9f43"), 2, Qt.PenStyle.DashLine))
+            return
+        self._manual_mode = "background_polygon"
+        self._polygon_points = [QPointF(point[0], point[1]) for point in polygon]
+        self._set_polygon_preview(self._polygon_points, closed=True)
+        self._polygon_handles = [
+            PolygonVertexHandle(self, index, point)
+            for index, point in enumerate(self._polygon_points)
+        ]
+        for handle in self._polygon_handles:
+            self._scene.addItem(handle)
+        self._position_polygon_buttons()
+        self._polygon_confirm.show()
+        self._polygon_cancel.show()
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
 
     def set_reading_order_visible(self, visible: bool) -> None:
         self._reading_order_visible = bool(visible)
@@ -414,8 +524,19 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
                     "height": max(1, round(rect.height())),
                 }
                 angle = float(round(self._layout_frame.rotation(), 2))
-                data["angle"] = angle
-                self.text_layout_changed.emit(self._layout_row, data)
+                if self._layout_layer == "background":
+                    rect = self._layout_frame.rect()
+                    polygon = [
+                        self._layout_frame.mapToScene(point)
+                        for point in (rect.topLeft(), rect.topRight(), rect.bottomRight(), rect.bottomLeft())
+                    ]
+                    self.background_polygon_changed.emit(
+                        self._layout_row,
+                        [[round(point.x()), round(point.y())] for point in polygon],
+                    )
+                else:
+                    data["angle"] = angle
+                    self.text_layout_changed.emit(self._layout_row, data)
             self._update_handle_hover_states(None)
             event.accept()
             return
@@ -430,14 +551,21 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
                 self._position_text_layout_handles()
                 if self._layout_row >= 0:
                     rect = self._layout_frame.rect()
-                    data = {
-                        "x": round(rect.left()),
-                        "y": round(rect.top()),
-                        "width": max(1, round(rect.width())),
-                        "height": max(1, round(rect.height())),
-                        "angle": 0.0,
-                    }
-                    self.text_layout_changed.emit(self._layout_row, data)
+                    if self._layout_layer == "background":
+                        polygon = [rect.topLeft(), rect.topRight(), rect.bottomRight(), rect.bottomLeft()]
+                        self.background_polygon_changed.emit(
+                            self._layout_row,
+                            [[round(point.x()), round(point.y())] for point in polygon],
+                        )
+                    else:
+                        data = {
+                            "x": round(rect.left()),
+                            "y": round(rect.top()),
+                            "width": max(1, round(rect.width())),
+                            "height": max(1, round(rect.height())),
+                            "angle": 0.0,
+                        }
+                        self.text_layout_changed.emit(self._layout_row, data)
                 event.accept()
                 return
         if self._manual_mode == "polygon" and event.button() == Qt.MouseButton.LeftButton:
@@ -525,8 +653,22 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
         if polygon is None:
             self.manual_region_message.emit("Polygon must have 3+ points, non-zero area, and no crossing edges.")
             return
+        if self._manual_mode == "background_polygon":
+            self._background_original = polygon
+            self.background_polygon_changed.emit(self._layout_row, polygon)
+            self.manual_region_message.emit("Backing polygon staged; click Apply & Rerender.")
+            return
         self.cancel_manual_selection()
         self.manual_region_created.emit(polygon)
+
+    def _cancel_polygon_action(self) -> None:
+        if self._manual_mode != "background_polygon":
+            self.cancel_manual_selection()
+            return
+        points = [QPointF(point[0], point[1]) for point in self._background_original]
+        for handle, point in zip(self._polygon_handles, points):
+            handle.setPos(point)
+        self._set_polygon_preview(points, closed=True)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
@@ -556,6 +698,8 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.reposition_overlays()
+        self._position_polygon_buttons()
+        self._position_layer_buttons()
 
     def add_manual_overlay(
         self,

@@ -21,6 +21,7 @@ from hydra_manga_tl.phase.phase3 import (
 )
 from hydra_manga_tl.phase.pipeline import _text_group_without_preserved_marks
 from hydra_manga_tl.phase.renderer import (
+    apply_manual_backgrounds,
     clean_background,
     fit_text_avoiding_preserved,
     make_mask,
@@ -37,6 +38,7 @@ from hydra_manga_tl.title.reconstruction.models import (
 from hydra_manga_tl.project.migrations.manager import MigrationManager
 from hydra_manga_tl.project.manual_region import split_manual_source_regions
 from hydra_manga_tl.project.model import ManualRegion, PROJECT_VERSION
+from hydra_manga_tl.project.workspace_editor import transform_background_polygon
 
 
 SELECTION = [[5, 5], [115, 5], [115, 75], [5, 75]]
@@ -47,6 +49,42 @@ CENTER_HEART = [[58, 34], [82, 34], [82, 62], [58, 62]]
 
 
 class IntelligentCleanupGeometryTests(unittest.TestCase):
+    def test_linked_background_follows_text_translation_and_resize(self) -> None:
+        polygon = [[10, 10], [50, 10], [50, 30], [10, 30]]
+
+        transformed = transform_background_polygon(
+            polygon,
+            {"x": 10, "y": 10, "width": 40, "height": 20, "angle": 0},
+            {"x": 20, "y": 5, "width": 80, "height": 40, "angle": 0},
+        )
+
+        self.assertEqual(transformed, [[20, 5], [100, 5], [100, 45], [20, 45]])
+
+    def test_linked_background_follows_text_rotation(self) -> None:
+        polygon = [[10, 10], [50, 10], [50, 30], [10, 30]]
+
+        transformed = transform_background_polygon(
+            polygon,
+            {"x": 10, "y": 10, "width": 40, "height": 20, "angle": 0},
+            {"x": 10, "y": 10, "width": 40, "height": 20, "angle": 90},
+        )
+
+        self.assertEqual(transformed, [[40, 0], [40, 40], [20, 40], [20, 0]])
+
+    def test_manual_background_uses_its_polygon_without_affecting_automatic_groups(self) -> None:
+        image = Image.new("RGB", (140, 100), (30, 30, 30))
+        polygon = [[20, 10], [100, 20], [85, 80], [30, 70]]
+
+        count = apply_manual_backgrounds(image, [
+            {"manual": True, "background_polygon": polygon},
+            {"manual": False, "background_polygon": [[0, 0], [10, 0], [10, 10], [0, 10]]},
+            {"manual": True, "bubble_type": "title", "background_polygon": [[0, 0], [10, 0], [10, 10], [0, 10]]},
+        ])
+
+        self.assertEqual(count, 1)
+        self.assertEqual(image.getpixel((50, 40)), (255, 255, 255))
+        self.assertEqual(image.getpixel((5, 5)), (30, 30, 30))
+
     def test_light_dialogue_render_has_no_white_halo(self) -> None:
         image = Image.new("RGB", (120, 80), "white")
         rendered = render_group(
@@ -86,6 +124,17 @@ class IntelligentCleanupGeometryTests(unittest.TestCase):
         self.assertLess(float(cleaned[30:50, 110:130].mean()), 35)
         self.assertIn("light-background-fill", method)
         self.assertIn("dark-background-fill", method)
+
+    def test_cleanup_does_not_flatten_mixed_manga_art_to_white(self) -> None:
+        image = np.full((120, 160, 3), 245, dtype=np.uint8)
+        image[:, 80:] = 25
+        mask = np.zeros((120, 160), dtype=np.uint8)
+        mask[10:110, 55:105] = 255
+
+        cleaned, method = clean_background(image, mask)
+
+        self.assertEqual(method, "opencv-inpaint")
+        self.assertLess(float(cleaned[20:100, 90:100].mean()), 200)
 
     def test_dark_caption_segmentation_records_dark_surface(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -477,6 +526,8 @@ class IntelligentCleanupGeometryTests(unittest.TestCase):
             self.assertEqual(region["selection_polygon"], SELECTION)
             self.assertEqual(region["cleanup_polygons"], [SELECTION])
             self.assertEqual(region["placement_polygon"], SELECTION)
+            self.assertEqual(region["background_polygon"], SELECTION)
+            self.assertTrue(region["background_linked"])
             self.assertEqual(region["decorative_symbols"], [])
             self.assertEqual(region["preserved_marks"], [])
 

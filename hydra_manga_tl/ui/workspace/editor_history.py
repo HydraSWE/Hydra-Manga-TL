@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox, QTextEdit
 from hydra_manga_tl.core.state import APP_STATE
 from hydra_manga_tl.core.user_errors import workspace_action_error
 from hydra_manga_tl.project.workspace import WORKSPACE
+from hydra_manga_tl.project.workspace_editor import transform_background_polygon
 
 
 class EditorHistoryMixin:
@@ -90,11 +91,17 @@ class EditorHistoryMixin:
             if key[0] == int(image_index)
         ]:
             self._pending_text_layouts.pop(key, None)
+        for key in [
+            key for key in self._pending_backgrounds
+            if key[0] == int(image_index)
+        ]:
+            self._pending_backgrounds.pop(key, None)
+            self._pending_background_links.pop(key, None)
 
     def _discard_text_layout_history(self, image_index: int, group_indices: set[str]) -> None:
         def keep(command: dict) -> bool:
             return not (
-                command.get("kind") == "text_layout"
+                command.get("kind") in {"text_layout", "background_polygon"}
                 and int(command.get("image_index", -1)) == int(image_index)
                 and str(command.get("group_index")) in group_indices
             )
@@ -183,12 +190,41 @@ class EditorHistoryMixin:
                 staged["angle"] = float(layout["angle"])
             except (TypeError, ValueError):
                 pass
+        key = self._layout_key(image_index, group_index)
+        current_layout = None
+        if image_index == APP_STATE.selected_image and 0 <= row < len(self._groups):
+            current_layout = self._layout_from_group(self._groups[row])
+            group = self._groups[row]
+            linked = self._pending_background_links.get(key, bool(group.get("background_linked", True)))
+            polygon = self._pending_backgrounds.get(key) or group.get("background_polygon")
+            if group.get("manual") and linked and polygon and current_layout is not None:
+                transformed = transform_background_polygon(polygon, current_layout, staged)
+                self._pending_backgrounds[key] = transformed
+                self._pending_background_links[key] = True
+                group["background_polygon"] = [list(point) for point in transformed]
         self._pending_text_layouts[self._layout_key(image_index, group_index)] = staged
         if image_index == APP_STATE.selected_image and 0 <= row < len(self._groups):
             self._groups[row]["text_layout"] = dict(staged)
             if row == APP_STATE.selected_block:
                 self.translated._set_text_layout_rect(QRectF(staged["x"], staged["y"], staged["width"], staged["height"]))
         self.status.setText("Text layout staged; click Apply & Rerender")
+        return True
+
+    def _apply_background_command(self, command: dict, polygon: list | None, *, linked: bool) -> bool:
+        if not isinstance(polygon, list) or len(polygon) < 3:
+            return False
+        image_index = int(command["image_index"])
+        group_index = command["group_index"]
+        row = int(command.get("row", APP_STATE.selected_block))
+        staged = [[int(point[0]), int(point[1])] for point in polygon]
+        self._pending_backgrounds[self._layout_key(image_index, group_index)] = staged
+        self._pending_background_links[self._layout_key(image_index, group_index)] = bool(linked)
+        if image_index == APP_STATE.selected_image and 0 <= row < len(self._groups):
+            self._groups[row]["background_polygon"] = [list(point) for point in staged]
+            self._groups[row]["background_linked"] = bool(linked)
+            if row == APP_STATE.selected_block and self.translated.background_layer_button.isChecked():
+                self.translated.set_layout_layer("background")
+        self.status.setText("White backing staged; click Apply & Rerender")
         return True
 
     @staticmethod
@@ -208,6 +244,14 @@ class EditorHistoryMixin:
             if self._restore_editor_history_command(command, "before"):
                 self._layout_redo.append(command)
             return
+        if command.get("kind") == "background_polygon":
+            if self._apply_background_command(
+                command,
+                command.get("before"),
+                linked=bool(command.get("before_linked", True)),
+            ):
+                self._layout_redo.append(command)
+            return
         if self._apply_text_layout_command(command, command.get("before")):
             self._layout_redo.append(command)
 
@@ -221,6 +265,14 @@ class EditorHistoryMixin:
         command = self._layout_redo.pop()
         if command.get("kind") == "editor_state":
             if self._restore_editor_history_command(command, "after"):
+                self._layout_undo.append(command)
+            return
+        if command.get("kind") == "background_polygon":
+            if self._apply_background_command(
+                command,
+                command.get("after"),
+                linked=bool(command.get("after_linked", False)),
+            ):
                 self._layout_undo.append(command)
             return
         if self._apply_text_layout_command(command, command.get("after")):

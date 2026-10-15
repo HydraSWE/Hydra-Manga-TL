@@ -126,6 +126,85 @@ class _FakeTranslationEngine:
 
 
 class V1StabilityTests(unittest.TestCase):
+    def test_manual_rectangle_backing_uses_transform_frame(self):
+        from PySide6.QtGui import QImage
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.ui.canvas import CanvasView
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "page.png"
+            image = QImage(120, 80, QImage.Format.Format_RGB32)
+            image.fill(Qt.GlobalColor.black)
+            image.save(str(path))
+            view = CanvasView("Translated")
+            view.set_content(path, [{
+                "manual": True,
+                "polygon": [[10, 10], [70, 10], [70, 60], [10, 60]],
+                "selection_polygon": [[10, 10], [70, 10], [70, 60], [10, 60]],
+                "background_polygon": [[10, 10], [70, 10], [70, 60], [10, 60]],
+                "text_layout": {"x": 15, "y": 15, "width": 50, "height": 40},
+            }], selected=0)
+
+            self.assertTrue(view.set_layout_layer("background"))
+            self.assertIsNotNone(view._layout_frame)
+            self.assertEqual(len(view._layout_handles), 9)
+            view.close()
+            app.processEvents()
+
+    def test_manual_polygon_backing_uses_vertex_handles(self):
+        from PySide6.QtGui import QImage
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.ui.canvas import CanvasView
+
+        app = QApplication.instance() or QApplication([])
+        polygon = [[10, 10], [75, 15], [65, 60], [20, 70], [5, 40]]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "page.png"
+            image = QImage(120, 80, QImage.Format.Format_RGB32)
+            image.fill(Qt.GlobalColor.black)
+            image.save(str(path))
+            view = CanvasView("Translated")
+            view.set_content(path, [{
+                "manual": True,
+                "polygon": polygon,
+                "selection_polygon": polygon,
+                "background_polygon": polygon,
+                "text_layout": {"x": 15, "y": 15, "width": 50, "height": 40},
+            }], selected=0)
+
+            self.assertTrue(view.set_layout_layer("background"))
+            self.assertIsNone(view._layout_frame)
+            self.assertEqual(len(view._polygon_handles), len(polygon))
+            view.close()
+            app.processEvents()
+
+    def test_rotated_manual_rectangle_backing_keeps_transform_frame(self):
+        from PySide6.QtGui import QImage
+        from PySide6.QtWidgets import QApplication
+        from hydra_manga_tl.ui.canvas import CanvasView
+
+        app = QApplication.instance() or QApplication([])
+        polygon = [[30, 10], [70, 30], [60, 50], [20, 30]]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "page.png"
+            image = QImage(120, 80, QImage.Format.Format_RGB32)
+            image.fill(Qt.GlobalColor.black)
+            image.save(str(path))
+            view = CanvasView("Translated")
+            view.set_content(path, [{
+                "manual": True,
+                "polygon": polygon,
+                "background_polygon": polygon,
+                "text_layout": {"x": 20, "y": 10, "width": 50, "height": 40},
+            }], selected=0)
+
+            self.assertTrue(view.set_layout_layer("background"))
+            self.assertIsNotNone(view._layout_frame)
+            self.assertAlmostEqual(view._layout_frame.rotation(), 26.565, places=2)
+            view.close()
+            app.processEvents()
+
     def make_image(self, folder: str) -> Path:
         path = Path(folder) / "page.png"
         Image.new("RGB", (480, 320), "white").save(path)
@@ -2881,6 +2960,57 @@ class V1StabilityTests(unittest.TestCase):
             self.assertEqual(2, save.call_count)
             self.assertEqual(2, rerender.call_count)
             learn.assert_not_called()
+
+    def test_workspace_manual_background_updates_detach_and_linked_text_transforms(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "source.png"
+            Image.new("RGB", (200, 160), "white").save(source)
+            selection = [[10, 10], [90, 10], [90, 90], [10, 90]]
+            manual = ManualRegion(
+                id="manual-1",
+                rect=[10, 10, 90, 90],
+                source_polygons=[selection],
+                polygon=selection,
+                original_text="待て",
+                translated_text="Wait!",
+                ocr_confidence=0.9,
+                source_language="ja",
+                direction="vertical",
+                status="translated",
+            )
+            image = ImageRecord("page-1", str(source), source.name, manual_regions=[manual])
+            manager = WorkspaceManager()
+            manager.current = MangaProject("project", "Background", str(root), images=[image])
+
+            with (
+                patch.object(manager, "save"),
+                patch.object(manager, "_capture_edit_corrections"),
+                patch.object(manager, "_learn_user_translation_edit"),
+            ):
+                manager.update_edits_batch(0, {
+                    manual.key: RegionEdit(
+                        layout_x=20,
+                        layout_y=20,
+                        layout_width=160,
+                        layout_height=120,
+                    ),
+                })
+                self.assertEqual(manual.background_polygon, [[20, 20], [180, 20], [180, 140], [20, 140]])
+                manager.update_manual_background(
+                    0,
+                    manual.key,
+                    [[30, 30], [100, 25], [110, 100], [25, 110]],
+                    linked=False,
+                    rerender=False,
+                )
+
+            self.assertFalse(manual.background_linked)
+            self.assertEqual(manual.background_polygon[0], [30, 30])
+
+            manager.reset_manual_background(0, manual.key)
+            self.assertTrue(manual.background_linked)
+            self.assertEqual(manual.background_polygon, selection)
 
     def test_editor_state_round_trip_preserves_geometry_title_and_review_data(self):
         with tempfile.TemporaryDirectory() as folder:
