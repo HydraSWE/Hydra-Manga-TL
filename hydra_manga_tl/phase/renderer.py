@@ -410,7 +410,7 @@ def render_group(
         "positions": positions,
         "text_color": "#%02x%02x%02x" % fill_rgb,
         "stroke_color": None if stroke_fill is None else "#%02x%02x%02x" % stroke_fill[:3],
-        "stroke_width": stroke_width // SCALE,
+        "stroke_width": stroke_width / SCALE,
         "overflow": overflow,
         "preserved_content_aware": bool(fitted.preserved_content_aware),
         "preserved_overlap_pixels": int(fitted.preserved_overlap_pixels),

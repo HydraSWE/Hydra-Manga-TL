@@ -137,11 +137,6 @@ class CanvasTextLayoutMixin:
             if role == "rotate":
                 if math.hypot(scene_pos.x() - handle.pos().x(), scene_pos.y() - handle.pos().y()) <= 10.0:
                     return ("rotate", "rotate")
-                continue
-            if role in {"left", "right", "top", "bottom"} and math.hypot(
-                scene_pos.x() - handle.pos().x(), scene_pos.y() - handle.pos().y()
-            ) <= 10.0:
-                return (role, "resize")
         rect = self._layout_frame.rect()
         corners = {
             "top-left": self._layout_frame.mapToScene(rect.topLeft()),
@@ -166,6 +161,12 @@ class CanvasTextLayoutMixin:
                     best_zone = "rotate"
         if best_role and best_zone:
             return (best_role, best_zone)
+        for handle in self._layout_handles:
+            role = str(handle.data(1))
+            if role in {"left", "right", "top", "bottom"} and math.hypot(
+                scene_pos.x() - handle.pos().x(), scene_pos.y() - handle.pos().y()
+            ) <= 10.0:
+                return (role, "resize")
         return None
 
     def _update_handle_hover_states(self, hit: tuple[str, str] | None) -> None:
