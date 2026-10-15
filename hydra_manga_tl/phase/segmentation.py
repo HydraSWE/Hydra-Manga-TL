@@ -52,14 +52,22 @@ def _rect_mask(size: tuple[int, int], box: list[int]) -> np.ndarray:
     return mask
 
 
-def _component_mask(image: Image.Image, polygon: list[list[int]]) -> tuple[np.ndarray, list[int], float, dict[str, Any]] | None:
+def _component_mask(
+    image: Image.Image,
+    polygon: list[list[int]],
+    *,
+    surface: str = "light",
+) -> tuple[np.ndarray, list[int], float, dict[str, Any]] | None:
     gray = np.asarray(image.convert("L"))
     height, width = gray.shape
     x1, y1, x2, y2 = bbox_from_polygon(polygon)
     source_area = max(1, (x2 - x1) * (y2 - y1))
     source_cx, source_cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    binary = cv2.adaptiveThreshold(blurred, 1, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 10)
+    if surface == "light":
+        binary = cv2.adaptiveThreshold(blurred, 1, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 10)
+    else:
+        _, binary = cv2.threshold(blurred, 0, 1, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
 
@@ -74,6 +82,9 @@ def _component_mask(image: Image.Image, polygon: list[list[int]]) -> tuple[np.nd
         coverage = (max(0, ix2 - ix1) * max(0, iy2 - iy1)) / source_area
         if coverage < 0.65:
             continue
+        component_luma = float(gray[labels == label].mean())
+        if (surface == "light" and component_luma < 130) or (surface == "dark" and component_luma > 125):
+            continue
         cx, cy = centroids[label]
         distance = ((cx - source_cx) ** 2 + (cy - source_cy) ** 2) / max(1, source_area)
         area_ratio = area / max(1, source_area)
@@ -85,6 +96,7 @@ def _component_mask(image: Image.Image, polygon: list[list[int]]) -> tuple[np.nd
                 "centroid_distance": round(float(distance), 4),
                 "area_ratio": round(float(area_ratio), 4),
                 "page_area_ratio": round(float(area / max(1, width * height)), 4),
+                "surface": surface,
             }
     if best is None:
         return None
@@ -98,13 +110,46 @@ def _component_mask(image: Image.Image, polygon: list[list[int]]) -> tuple[np.nd
 def _component_failure_reason(confidence: float, quality: dict[str, Any]) -> str:
     page_ratio = float(quality.get("page_area_ratio", 0.0) or 0.0)
     area_ratio = float(quality.get("area_ratio", 0.0) or 0.0)
-    if page_ratio > 0.45:
+    page_limit = 0.50 if quality.get("surface") == "dark" else 0.45
+    if page_ratio > page_limit:
         return "page_size_rejection"
     if area_ratio > 55.0:
         return "area_ratio_rejection"
     if confidence < 0.62:
         return "low_mask_confidence"
     return ""
+
+
+def _fallback_surface(image: Image.Image, polygon: list[list[int]]) -> dict[str, Any]:
+    gray = np.asarray(image.convert("L"))
+    x1, y1, x2, y2 = _clip_box(bbox_from_polygon(polygon), image.size)
+    crop = gray[y1:y2, x1:x2]
+    if not crop.size:
+        return {"surface": "unknown", "surface_confidence": 0.0}
+    deviation = float(np.std(crop))
+    edges = cv2.Canny(crop, 55, 150)
+    edge_density = float(np.count_nonzero(edges) / crop.size)
+    median = float(np.median(crop))
+    bright_fraction = float(np.count_nonzero(crop >= 200) / crop.size)
+    dark_fraction = float(np.count_nonzero(crop <= 100) / crop.size)
+    if median >= 170 and bright_fraction >= 0.65 and dark_fraction <= 0.30:
+        surface = "light"
+    elif median <= 85 and dark_fraction >= 0.65:
+        surface = "dark"
+    elif edge_density >= 0.18 or (edge_density >= 0.10 and deviation >= 45.0):
+        surface = "art"
+    else:
+        surface = "art"
+    return {
+        "surface": surface,
+        "surface_confidence": round(min(0.69, 0.55 + abs(median - 127.5) / 510.0), 3),
+        "surface_source": "fallback",
+        "surface_luma": round(median, 2),
+        "surface_std": round(deviation, 2),
+        "surface_edge_density": round(edge_density, 4),
+        "surface_bright_fraction": round(bright_fraction, 4),
+        "surface_dark_fraction": round(dark_fraction, 4),
+    }
 
 
 def segment_bubble(
@@ -125,7 +170,12 @@ def segment_bubble(
     failure_reason = ""
 
     if kind in {"dialogue", "speech", "thought", "narration"}:
-        component = _component_mask(image, polygon)
+        candidates = [
+            candidate
+            for surface in ("light", "dark")
+            if (candidate := _component_mask(image, polygon, surface=surface)) is not None
+        ]
+        component = max(candidates, key=lambda item: item[2], default=None)
     else:
         component = None
 
@@ -134,7 +184,7 @@ def segment_bubble(
         rejected_reason = _component_failure_reason(candidate_confidence, candidate_quality)
         if not rejected_reason:
             mask, bbox, confidence, mask_quality = candidate_mask, candidate_bbox, candidate_confidence, candidate_quality
-            method = "light_component"
+            method = f"{mask_quality.get('surface', 'light')}_component"
         else:
             component = None
             failure_reason = rejected_reason
@@ -150,6 +200,7 @@ def segment_bubble(
             "centroid_distance": 0.0,
             "area_ratio": round(((x2 - x1) * (y2 - y1)) / max(1, (bbox_from_polygon(polygon)[2] - bbox_from_polygon(polygon)[0]) * (bbox_from_polygon(polygon)[3] - bbox_from_polygon(polygon)[1])), 4),
             "page_area_ratio": round(((x2 - x1) * (y2 - y1)) / max(1, page_size[0] * page_size[1]), 4),
+            **_fallback_surface(image, polygon),
         }
 
     safe_area = compute_safe_text_area(image, polygon, padding) if method == "light_component" else None

@@ -10,7 +10,7 @@ review decisions, and rendered output in a versioned project.
 
 ## Current version
 
-**Hydra Manga TL v1.1.1** is the current release line. It is a patch update
+**Hydra Manga TL v1.1.2** is the current release line. It is a patch update
 with improved export stability, safer project opening, manual
 translation overlay cleanup, and better Local Qwen handling for pages with
 punctuation-only OCR fragments. It keeps the v1 OCR/translation/render

@@ -17,6 +17,7 @@ from hydra_manga_tl.phase.pipeline import (
     _bubble_display_id,
     _stable_bubble_id,
 )
+from hydra_manga_tl.phase import pipeline_worker_fast_commit, pipeline_worker_fast_prep
 from hydra_manga_tl.project.artifacts import (
     rendered_filename,
     target_render_dir,
@@ -65,6 +66,12 @@ def _job(root: Path, index: int) -> ParallelPageJob:
 
 
 class ParallelPageSchedulerTests(unittest.TestCase):
+    def test_fast_preparation_has_stage_completion_recorder(self):
+        self.assertTrue(hasattr(pipeline_worker_fast_prep, "_record_stage_completion"))
+
+    def test_fast_commit_has_region_type_normalizer(self):
+        self.assertTrue(hasattr(pipeline_worker_fast_commit, "normalize_region_type"))
+
     def test_stable_bubble_identity_uses_project_image_and_ordinal(self):
         self.assertEqual(
             "workspace-1:image-2:b0003",

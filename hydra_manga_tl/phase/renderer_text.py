@@ -468,6 +468,11 @@ def _preserve_polygons(group: dict) -> list[list[list[int]]]:
             polygon = mark.get("polygon")
             if polygon:
                 polygons.append(polygon)
+    for symbol in group.get("decorative_symbols", []) or []:
+        if isinstance(symbol, dict) and symbol.get("render_policy") == "preserve_original":
+            polygon = symbol.get("polygon")
+            if polygon:
+                polygons.append(polygon)
     return polygons
 
 

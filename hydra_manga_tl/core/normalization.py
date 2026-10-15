@@ -497,12 +497,13 @@ class MangaStyleRewriter:
             "様": "sama",
         }[self.features.honorific]
         styled = f"{self.features.subject}-{romanized}"
+        name = r"[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*)?(?:-(?:senpai|sensei|san|kun|chan|sama))*"
         if self.features.asks_if_okay and re.search(r"\b(okay|alright|all right|fine)\b", self.text, re.IGNORECASE):
-            self.text = re.sub(r"(?i)^[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*)?", styled, self.text)
+            self.text = re.sub(rf"(?i)^{name}", styled, self.text)
             if not self.text.lower().startswith(("is ", "are ", "will ", "can ", "does ", "do ")):
                 self.text = f"Is {styled} okay"
             return
-        self.text = re.sub(r"^[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*)?\b", styled, self.text)
+        self.text = re.sub(rf"^{name}\b", styled, self.text)
 
     def _match_source_punctuation(self) -> None:
         self.text = self.text.strip()

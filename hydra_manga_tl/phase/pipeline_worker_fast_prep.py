@@ -26,6 +26,7 @@ from hydra_manga_tl.phase.pipeline_helpers import (
     _ocr_settings_fingerprint,
     _preprocessing_settings_fingerprint,
     _preprocessing_stage_fingerprint,
+    _record_stage_completion,
     _source_text_color,
     _stable_bubble_id,
     _stable_json_hash,

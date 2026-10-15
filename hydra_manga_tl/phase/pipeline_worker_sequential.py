@@ -131,12 +131,17 @@ class PipelineWorkerSequentialMixin:
                     job_manifest.mark(image_id, "translating", stage="OCR")
                     self.stage.emit(image_id, "translating", position, total, f"Translating {source.name}")
                     stage_started = time.perf_counter()
+                    if quality != "Fast" and source_language == "Japanese":
+                        self.stage.emit(image_id, "ocr", position, total, "Checking Japanese bubbles with Manga OCR")
                     group_state = self._build_sequential_groups(
                         source=source,
                         image_id=image_id,
                         source_regions=source_regions,
                         ocr_result=ocr_result,
                         timing=timing,
+                        ocr_service=ocr_service,
+                        quality=quality,
+                        source_language=source_language,
                     )
                     source_image = group_state["source_image"]
                     page_size = group_state["page_size"]

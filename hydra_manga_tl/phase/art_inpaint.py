@@ -101,6 +101,11 @@ def is_art_text_group(group: dict, image_size: tuple[int, int]) -> bool:
     """Detect text printed directly on art, rather than normal speech bubbles."""
     if group.get("art_text") is True or group.get("render_mode") == "art_text":
         return True
+    surface = str(
+        (group.get("bubble_segmentation") or {}).get("mask_quality", {}).get("surface", "")
+    )
+    if surface == "art":
+        return True
     if group.get("manual"):
         return group.get("art_text") is True or group.get("render_mode") == "art_text"
 

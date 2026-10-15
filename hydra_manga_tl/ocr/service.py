@@ -10,6 +10,7 @@ import threading
 import time
 from typing import Any
 
+from hydra_manga_tl.core.paths import PATHS
 from hydra_manga_tl.ocr.core import OCRResult
 from hydra_manga_tl.ocr.manager import SmartOCRManager
 from hydra_manga_tl.ocr.runtime import OCRWorkerCrashed, get_ocr_engine, get_ocr_engine_for_language, get_ocr_runtime_client
@@ -217,6 +218,28 @@ class OCRService:
         return OCRServiceResult(
             result, final_regions, False, "", self._telemetry(time.perf_counter() - started),
         )
+
+    def recognize_manga_groups(
+        self,
+        image_path: Path,
+        groups: list[dict[str, Any]],
+        *,
+        quality: str,
+    ) -> list[dict[str, Any]]:
+        if quality == "Fast" or not groups:
+            return []
+        request = {
+            "image_path": str(image_path),
+            "groups": groups,
+            "model_cache": str(PATHS.manga_ocr_models),
+        }
+        if self.worker is not None:
+            response = self._worker_request_with_retry("recognize_manga_groups", request)
+            return list(response["recognitions"])
+        from hydra_manga_tl.ocr.hybrid import MangaOCRRuntime
+        if not hasattr(self, "_manga_runtime"):
+            self._manga_runtime = MangaOCRRuntime(PATHS.manga_ocr_models)
+        return self._manga_runtime.recognize_groups(image_path, groups)
 
     def close(self) -> None:
         # The subprocess worker is application-owned. Services borrow it and

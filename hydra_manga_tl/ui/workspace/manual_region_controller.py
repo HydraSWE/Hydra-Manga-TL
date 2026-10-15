@@ -176,7 +176,7 @@ class ManualRegionControllerMixin:
     def _on_manual_region_failed(self, image_index: int, message: str) -> None:
         self._pending_manual_history.pop(image_index, None)
         if image_index == APP_STATE.selected_image:
-            self.status.setText("Manual translation failed")
+            self.status.setText(message or "Manual translation failed")
         # Do not show QMessageBox popup window to satisfy Option C "No popup windows"
 
     def _cancel_manual_draw(self) -> None:

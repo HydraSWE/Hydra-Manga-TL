@@ -15,6 +15,7 @@ from PIL import Image
 from hydra_manga_tl.phase.art_inpaint import InpaintRuntimeUnavailable, clean_art_text_background
 from hydra_manga_tl.phase.renderer import clean_background
 from ..background_plate import apply_title_background_plates
+from ..mask_extractor import _mask_from_polygons, _normalize_polygons
 from .analysis import (
     apply_analysis_to_group,
     build_reconstruction_request,
@@ -343,6 +344,22 @@ def reconstruct_title_page(
             and report.validation.get("provider_cleaned_image", {}).get("passed")
         ):
             provider_cleaned_images.append(result.cleaned_image.convert("RGB"))
+        elif group.get("art_dialogue") and group.get("art_cleanup_fallback") == "outlined-review":
+            polygons = _normalize_polygons(
+                group.get("cleanup_polygons")
+                or group.get("source_polygons")
+                or [group.get("polygon", [])]
+            )
+            conservative_mask = _mask_from_polygons(image_size, polygons, dilation=2)
+            if np.count_nonzero(conservative_mask):
+                combined_title_mask = np.maximum(combined_title_mask, conservative_mask)
+                report_dict["title_reconstruction_status"] = "review"
+                report_dict["title_reconstruction_warning"] = "art_dialogue_conservative_mask"
+                report_dict["reconstruction_trace"] = [
+                    *list(report_dict.get("reconstruction_trace", [])),
+                    {"stage": "art_dialogue_fallback", "status": "review", "method": "conservative-mask"},
+                ]
+                group["title_reconstruction_report"] = report_dict
 
     mask = np.maximum(normal_mask, combined_title_mask)
     inpaint_warning = ""

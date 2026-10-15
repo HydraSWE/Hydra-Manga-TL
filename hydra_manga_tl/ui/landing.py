@@ -538,22 +538,12 @@ class LandingScreen(QWidget):
         self.refresh_recent()
 
     def _confirm_clear_history(self) -> None:
-        recent = WORKSPACE.recent_projects()
-        deletable = [
-            root
-            for root in (WORKSPACE.recent_project_data_root(path) for path in recent)
-            if root is not None
-        ]
-        folder_list = "\n".join(str(root) for root in deletable) or "No Hydra project data folders found."
-        
         answer = QMessageBox.question(
             self,
             "Clear Recent Projects?",
             (
-                "Remove all recent-project shortcuts and delete Hydra project "
-                f"data for {len(deletable)} project(s)?\n\n"
-                f"{folder_list}\n\n"
-                "Exported files outside Hydra project data will not be deleted."
+                "Remove all projects from recent history?\n\n"
+                "No project files or exported files will be deleted."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
@@ -562,14 +552,12 @@ class LandingScreen(QWidget):
             return
             
         try:
-            for path in recent:
-                WORKSPACE.delete_recent_project_data(path)
             WORKSPACE.clear_recent_projects()
         except OSError as error:
             QMessageBox.warning(
                 self,
-                "Project data delete failed",
-                workspace_action_error(error, action="delete project data"),
+                "Recent history clear failed",
+                workspace_action_error(error, action="clear recent history"),
             )
             return
         self.refresh_recent()

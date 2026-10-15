@@ -234,15 +234,21 @@ class TitleComposition:
             and len(polygons) > 1
             and len(str(group.get("translated_text") or "").split()) >= max(5, len(polygons) * 2)
         )
+        preserve_case = bool(group.get("preserve_translation_case"))
+
+        def translated_case(value: Any) -> str:
+            text = str(value)
+            return text if preserve_case else text.upper()
+
         for index, polygon in enumerate(polygons):
             text = str(source_texts[index]) if index < len(source_texts) else str(group.get("original_text") or "")
             rank = ranks.get(index, index)
             if isinstance(explicit_layer_texts, list):
-                translated = str(explicit_layer_texts[index]).upper() if index < len(explicit_layer_texts) else ""
+                translated = translated_case(explicit_layer_texts[index]) if index < len(explicit_layer_texts) else ""
             elif use_ranked_single_title:
-                translated = str(group.get("translated_text") or "").upper() if rank == 0 else ""
+                translated = translated_case(group.get("translated_text") or "") if rank == 0 else ""
             else:
-                translated = str(chunks[index]).upper() if index < len(chunks) else ""
+                translated = translated_case(chunks[index]) if index < len(chunks) else ""
             layer_style = TitleStyleProfile.from_dict(style_profile.to_dict())
             color = _color_tuple(source_text_colors[index]) if index < len(source_text_colors) else None
             if color is not None:

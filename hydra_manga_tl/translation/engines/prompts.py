@@ -50,7 +50,7 @@ def build_page_prompt(
         f"- Translate names cleanly with their natural titles. Do not attach titles or honorific suffixes to pronouns or words like \"I\" or \"you\".\n"
         f"- Use concise manga-style phrasing: contractions, natural reactions, and bubble-friendly rhythm.\n"
         f"- Use ellipses for pauses or abrupt dialogue turns; avoid em dashes and en dashes between English dialogue clauses.\n"
-        f"- Pay attention to spatial metadata (source_direction, ocr_review_reasons, source_member_texts, decorative_symbols, preserved_marks) if present. If OCR flags exist, use sub-member texts and surrounding context carefully without inventing missing dialogue. Treat decorative_symbols as hearts, music notes, stars, or similar bubble symbols: do not translate them as words, but reproduce them naturally as symbols in the returned text when they carry tone or emotion. Treat preserved_marks as protected artwork already present on the page; do not translate or redraw preserved_marks.\n"
+        f"- Pay attention to spatial metadata (source_direction, ocr_review_reasons, source_member_texts, decorative_symbols, preserved_marks) if present. If OCR flags exist, use sub-member texts and surrounding context carefully without inventing missing dialogue. Decorative symbols are rendered separately: do not translate, reproduce, or add hearts, notes, stars, or emoji. Treat preserved_marks as protected artwork already present on the page; do not translate or redraw preserved_marks.\n"
         f"- Preserve jokes/wordplay where possible.\n"
         f"- Do not merge entries; keep one translation per provided id.\n"
         f"- Treat protected entity placeholders as fixed names that must stay unchanged.\n"

@@ -253,6 +253,21 @@ class _ManualRegionProcessor(QObject):
             source_language = source_language or ocr_result.language
             bubble_type = str(request.get("bubble_type") or "dialogue")
             detected_regions = list(source_regions)
+            recognition: dict = {}
+            if quality != "Fast" and preferred == "japan" and bubble_type != "title":
+                if self._ocr is None:
+                    self._ocr = OCRService(
+                        (preferred,),
+                        use_subprocess=bool(request.get("ocr_subprocess_enabled", False)),
+                        recycle_pages=int(request.get("ocr_worker_recycle_pages", 25)),
+                        memory_limit_mb=int(request.get("ocr_worker_memory_limit_mb", 2048)),
+                    )
+                paddle_text = compose_manual_region(source_regions).text
+                recognition = self._ocr.recognize_manga_groups(
+                    source_path,
+                    [{"bbox": rect, "paddle_text": paddle_text}],
+                    quality=quality,
+                )[0]
             decorative_symbols: list[dict] = []
             if bubble_type != "title":
                 source_regions, decorative_symbols = split_manual_source_regions(source_regions)
@@ -262,6 +277,17 @@ class _ManualRegionProcessor(QObject):
                         len(decorative_symbols),
                     )
             composed = compose_manual_region(source_regions)
+            if recognition.get("text"):
+                composed.text = str(recognition["text"])
+            for symbol_index, symbol in enumerate(recognition.get("inline_symbols", []) or [], 1):
+                decorative_symbols.append({
+                    "id": f"inline:manual:{symbol_index}",
+                    "kind": "decorative_symbol",
+                    "text": str(symbol),
+                    "render_policy": "redraw_semantic",
+                    "anchor": "bottom",
+                    "source": "manga-ocr",
+                })
             title_members: list[dict] = []
             title_polygons: list[list[list[int]]] = []
             if bubble_type == "title":
@@ -280,6 +306,7 @@ class _ManualRegionProcessor(QObject):
                 for reason in region.get("ocr_review_reasons", [])
                 if str(reason)
             ))
+            review_reasons.extend(str(reason) for reason in recognition.get("review_reasons", []))
             if (
                 source_language == "Japanese"
                 and sum(char.isascii() and char.isdigit() for char in composed.text) >= 3
@@ -302,8 +329,7 @@ class _ManualRegionProcessor(QObject):
                 if bubble_type == "title"
                 else (
                     "Manual user-selected text box. Translate only the selected manga text. "
-                    "Any decorative_symbols metadata describes hearts, music notes, stars, or similar bubble symbols. "
-                    "Do not translate those symbols as words; reproduce them naturally as symbols in the returned text when they carry tone or emotion."
+                    "Decorative symbols are rendered separately. Translate only the Japanese text and do not add hearts, notes, stars, or emoji."
                 )
             )
             dialogue = (
@@ -456,6 +482,7 @@ class _ManualRegionProcessor(QObject):
                 "placement_polygon": placement_polygon,
                 "decorative_symbols": decorative_symbols,
                 "preserved_marks": [],
+                "ocr_recognition": recognition,
                 "source_polygons": title_polygons if title_polygons else [selection_polygon],
                 "original_text": composed.text,
                 "source_member_texts": (

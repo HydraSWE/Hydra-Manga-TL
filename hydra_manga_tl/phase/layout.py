@@ -150,7 +150,8 @@ def decorative_symbols_from_regions(regions: list[dict]) -> list[dict]:
             "confidence": float(region.get("confidence", 0.0) or 0.0),
             "polygon": polygon,
             "bbox": _region_bbox(polygon),
-            "render_policy": "redraw_semantic",
+            "render_policy": "preserve_original",
+            "preserve_policy": "preserve_original",
             "source": "ocr",
         })
     return symbols

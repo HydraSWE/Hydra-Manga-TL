@@ -60,6 +60,7 @@ def run_ocr_worker(connection: Connection, warmup_languages: tuple[str, ...] = (
 
     engines: dict[tuple[str, ...], Any] = {}
     managers: dict[tuple[str, ...], Any] = {}
+    manga_runtime = None
     try:
         warmup_started = time.perf_counter()
         _send_state(connection, "LOADING_MODEL")
@@ -84,10 +85,22 @@ def run_ocr_worker(connection: Connection, warmup_languages: tuple[str, ...] = (
             if command == "metrics":
                 connection.send({"ok": True, "state": "READY", "rss_mb": _rss_mb()})
                 continue
-            if command not in {"analyze_page", "analyze_selection"}:
+            if command not in {"analyze_page", "analyze_selection", "recognize_manga_groups"}:
                 connection.send({"ok": False, "error": f"Unknown OCR worker command: {command}"})
                 continue
             try:
+                if command == "recognize_manga_groups":
+                    if manga_runtime is None:
+                        from hydra_manga_tl.ocr.hybrid import MangaOCRRuntime
+                        manga_runtime = MangaOCRRuntime(Path(request["model_cache"]))
+                    connection.send({
+                        "ok": True,
+                        "recognitions": manga_runtime.recognize_groups(
+                            Path(request["image_path"]), list(request.get("groups", []))
+                        ),
+                        "rss_mb": _rss_mb(),
+                    })
+                    continue
                 languages = tuple(request.get("languages") or ("japan",))
                 engine = engines.get(languages)
                 if engine is None:

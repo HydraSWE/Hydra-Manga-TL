@@ -1696,19 +1696,23 @@ class V1StabilityTests(unittest.TestCase):
                     "manual_reconstruction": True,
                     "cleanup_polygons": [[[12, 12], [88, 12], [88, 48], [12, 48]]],
                 },
+                "ocr_recognition": {"text": "タイトル", "review_reasons": []},
                 "style_profile": None,
             }
 
             with patch.object(manager, "_start_manual_region_render") as render:
                 manager._on_manual_region_succeeded(result)
             payload = manager.effective_translation_payload(0)
+            saved_manual = MangaProject.load(project.project_file).images[0].manual_regions[0]
 
         self.assertEqual(len(project.images[0].manual_regions), 1)
         manual = project.images[0].manual_regions[0]
         self.assertEqual(manual.original_text, "タイトル")
         self.assertEqual(manual.translated_text, "TITLE")
+        self.assertEqual(saved_manual.ocr_recognition, result["ocr_recognition"])
         self.assertEqual(manual.bubble_type, "title")
         self.assertEqual(manual.render_mode, "art_text")
+        self.assertEqual(manual.ocr_recognition, result["ocr_recognition"])
         self.assertTrue(manual.title_reconstruction["manual_reconstruction"])
         self.assertTrue(render.called)
         group = payload["translation_groups"][0]
@@ -3631,6 +3635,40 @@ class V1StabilityTests(unittest.TestCase):
         self.assertEqual(default_paths.root, custom_root.resolve())
         self.assertEqual(default_paths.projects, custom_root.resolve() / "projects")
 
+    def test_bootstrap_pointer_wins_over_stale_default_profile_after_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            default_root = base / "default"
+            custom_root = base / "custom-data"
+            export_root = base / "exports"
+            project_import_root = base / "project-imports"
+            manga_import_root = base / "manga-imports"
+
+            stale_paths = AppPaths(default_root)
+            stale_paths.profile_root.mkdir(parents=True, exist_ok=True)
+            AppSettings(app_data_root=str(default_root)).save(stale_paths)
+
+            selected_paths = AppPaths(custom_root)
+            AppSettings(
+                app_data_root=str(custom_root),
+                export_root=str(export_root),
+                project_import_root=str(project_import_root),
+                manga_import_root=str(manga_import_root),
+            ).save(selected_paths)
+            stale_paths.settings.write_text(
+                json.dumps({"app_data_root": str(custom_root)}),
+                encoding="utf-8",
+            )
+
+            restarted_paths = AppPaths(default_root)
+            loaded = AppSettings.load(restarted_paths)
+
+        self.assertEqual(restarted_paths.root, custom_root.resolve())
+        self.assertEqual(loaded.app_data_root, str(custom_root.resolve()))
+        self.assertEqual(loaded.export_root, str(export_root))
+        self.assertEqual(loaded.project_import_root, str(project_import_root))
+        self.assertEqual(loaded.manga_import_root, str(manga_import_root))
+
     def test_settings_saved_to_explicit_paths_round_trip_that_root(self):
         with tempfile.TemporaryDirectory() as folder:
             paths = AppPaths(Path(folder))
@@ -3682,6 +3720,25 @@ class V1StabilityTests(unittest.TestCase):
             self.assertTrue(export_root.is_dir())
             self.assertTrue((export_root / "translated.png").is_file())
             self.assertTrue(external_project.root_path.is_dir())
+
+    def test_clear_history_only_removes_recent_entries(self):
+        from PySide6.QtWidgets import QMessageBox
+        from hydra_manga_tl.ui.landing import LandingScreen
+
+        screen = SimpleNamespace(refresh_recent=Mock())
+        with (
+            patch(
+                "hydra_manga_tl.ui.landing.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("hydra_manga_tl.ui.landing.WORKSPACE.clear_recent_projects") as clear,
+            patch("hydra_manga_tl.ui.landing.WORKSPACE.delete_recent_project_data") as delete,
+        ):
+            LandingScreen._confirm_clear_history(screen)
+
+        clear.assert_called_once_with()
+        delete.assert_not_called()
+        screen.refresh_recent.assert_called_once_with()
 
     def test_filmstrip_collapse_mode_round_trips_through_settings_json(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -4621,6 +4678,116 @@ class V1StabilityTests(unittest.TestCase):
         self.assertTrue(dialog._gpu_thread.quit_requested)
         self.assertFalse(dialog._gpu_thread.wait_called)
         self.assertTrue(event.ignored)
+
+    def test_normalizer_keeps_exactly_one_honorific(self):
+        from hydra_manga_tl.core.normalization import normalize_page_translation
+
+        page = PageDialogue(
+            "Japanese",
+            "en",
+            [{"id": "r1", "text": "瑞葉ちゃん・・・本逆だよ"}],
+        )
+        for translated in (
+            "Mizuha... it's backwards.",
+            "Mizuha-chan... it's backwards.",
+            "Mizuha-chan-chan... it's backwards.",
+        ):
+            with self.subTest(translated=translated):
+                result = PageTranslation(
+                    "Japanese",
+                    "en",
+                    [{"id": "r1", "text": translated}],
+                )
+                normalized = normalize_page_translation(page, result)
+                self.assertEqual(
+                    "Mizuha-chan... it's backwards.",
+                    normalized.translations[0]["text"],
+                )
+
+    def test_manual_render_report_distinguishes_rendered_and_skipped_groups(self):
+        from hydra_manga_tl.project.manual_region_workspace import _manual_render_skip_reason
+
+        with tempfile.TemporaryDirectory() as temporary:
+            render_dir = Path(temporary)
+            (render_dir / "page_render.json").write_text(
+                json.dumps({
+                    "rendered_groups": [{"group": "manual:rendered"}],
+                    "skipped_groups": [
+                        {"group": "manual:skipped", "reason": "text_does_not_fit"},
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            self.assertIsNone(
+                _manual_render_skip_reason(render_dir, Path("page.png"), "manual:rendered")
+            )
+            self.assertEqual(
+                "text_does_not_fit",
+                _manual_render_skip_reason(render_dir, Path("page.png"), "manual:skipped"),
+            )
+
+    def test_skipped_manual_render_is_retained_and_reported_as_failed(self):
+        from hydra_manga_tl.project.manual_region_workspace import ManualRegionWorkspaceMixin
+
+        class Harness(ManualRegionWorkspaceMixin):
+            def save(self):
+                self.saved = True
+
+            def _update_image_review_status(self, _image_index):
+                self.review_updated = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            render_dir = Path(temporary)
+            (render_dir / "page_render.json").write_text(
+                json.dumps({
+                    "rendered_groups": [],
+                    "skipped_groups": [
+                        {"group": "manual:one", "reason": "text_does_not_fit"},
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            manual = SimpleNamespace(id="one", status="translated", review_reasons=[])
+            image = SimpleNamespace(
+                id="image-one",
+                source_path=str(render_dir / "page.png"),
+                rendered_image="existing.png",
+                preview_image="existing-preview.png",
+                manual_regions=[manual],
+            )
+            workspace = Harness()
+            workspace.current = SimpleNamespace(id="project-one", images=[image])
+            workspace._manual_render_contexts = {
+                "request-one": {
+                    "project_id": "project-one",
+                    "image_id": "image-one",
+                    "image_index": 0,
+                    "manual_id": "one",
+                    "manual_key": "manual:one",
+                    "source_path": image.source_path,
+                    "render_dir": str(render_dir),
+                },
+            }
+            workspace.manual_region_busy_changed = Mock()
+            workspace.manual_region_failed = Mock()
+            workspace.manual_region_finished = Mock()
+            workspace.translation_request_state_changed = Mock()
+            workspace.image_updated = Mock()
+
+            workspace._on_render_queue_completed(
+                "request-one",
+                {"render_dir": str(render_dir)},
+            )
+
+            self.assertEqual("existing.png", image.rendered_image)
+            self.assertEqual("review", manual.status)
+            self.assertIn("text_does_not_fit", manual.review_reasons)
+            workspace.manual_region_finished.emit.assert_not_called()
+            workspace.manual_region_failed.emit.assert_called_once()
+            self.assertEqual(
+                "failed",
+                workspace.translation_request_state_changed.emit.call_args.args[1],
+            )
 
 
 if __name__ == "__main__":

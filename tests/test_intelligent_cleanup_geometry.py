@@ -4,17 +4,35 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import numpy as np
 from PIL import Image
 
 from hydra_manga_tl.core.fonts import default_font_file
 from hydra_manga_tl.phase.layout import TextGroup
-from hydra_manga_tl.phase.phase3 import placement_candidates, run as render_phase3
+from hydra_manga_tl.phase.phase3 import (
+    _render_text_color,
+    _surface_report,
+    _title_render_group,
+    placement_candidates,
+    renderer_for_region,
+    run as render_phase3,
+)
 from hydra_manga_tl.phase.pipeline import _text_group_without_preserved_marks
 from hydra_manga_tl.phase.renderer import (
+    clean_background,
     fit_text_avoiding_preserved,
     make_mask,
     preserved_constraint_mask,
+    render_group,
+)
+from hydra_manga_tl.phase.renderer_text import FittedText
+from hydra_manga_tl.phase.segmentation import _fallback_surface, segment_bubble
+from hydra_manga_tl.title.reconstruction.models import (
+    ProviderCapabilities,
+    TitleReconstructionReport,
+    TitleReconstructionResult,
 )
 from hydra_manga_tl.project.migrations.manager import MigrationManager
 from hydra_manga_tl.project.manual_region import split_manual_source_regions
@@ -29,6 +47,175 @@ CENTER_HEART = [[58, 34], [82, 34], [82, 62], [58, 62]]
 
 
 class IntelligentCleanupGeometryTests(unittest.TestCase):
+    def test_light_dialogue_render_has_no_white_halo(self) -> None:
+        image = Image.new("RGB", (120, 80), "white")
+        rendered = render_group(
+            image,
+            FittedText(["Hello"], 20, [10, 10, 110, 70], 24),
+            "Hello",
+            default_font_file(),
+        )
+
+        self.assertEqual(rendered["text_color"], "#0a0a0a")
+        self.assertEqual(rendered["stroke_width"], 0)
+        self.assertIsNone(rendered["stroke_color"])
+
+    def test_dark_dialogue_render_keeps_contrast_stroke(self) -> None:
+        image = Image.new("RGB", (120, 80), "black")
+        rendered = render_group(
+            image,
+            FittedText(["Hello"], 20, [10, 10, 110, 70], 24),
+            "Hello",
+            default_font_file(),
+        )
+
+        self.assertEqual(rendered["text_color"], "#ffffff")
+        self.assertGreater(rendered["stroke_width"], 0)
+        self.assertEqual(rendered["stroke_color"], "#000000")
+
+    def test_cleanup_classifies_light_and_dark_regions_independently(self) -> None:
+        image = np.full((80, 160, 3), 245, dtype=np.uint8)
+        image[:, 80:] = 10
+        mask = np.zeros((80, 160), dtype=np.uint8)
+        mask[25:55, 25:55] = 255
+        mask[25:55, 105:135] = 255
+
+        cleaned, method = clean_background(image, mask)
+
+        self.assertGreater(float(cleaned[30:50, 30:50].mean()), 220)
+        self.assertLess(float(cleaned[30:50, 110:130].mean()), 35)
+        self.assertIn("light-background-fill", method)
+        self.assertIn("dark-background-fill", method)
+
+    def test_dark_caption_segmentation_records_dark_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            image = Image.new("RGB", (180, 120), "white")
+            pixels = np.asarray(image).copy()
+            pixels[15:105, 35:145] = 8
+            image = Image.fromarray(pixels)
+            result = segment_bubble(
+                image,
+                [[55, 30], [125, 30], [125, 90], [55, 90]],
+                mask_path=Path(folder) / "mask.png",
+            )
+
+        self.assertEqual(result.method, "dark_component")
+        self.assertEqual(result.mask_quality["surface"], "dark")
+
+    def test_surface_metadata_controls_contrast_without_overriding_manual_color(self) -> None:
+        dark = {"bubble_segmentation": {"mask_quality": {"surface": "dark"}}}
+        light = {"bubble_segmentation": {"mask_quality": {"surface": "light"}}}
+
+        self.assertEqual(_render_text_color(dark), "#ffffff")
+        self.assertEqual(_render_text_color(light), "#0a0a0a")
+        self.assertEqual(_render_text_color({**dark, "text_color": "#123456"}), "#123456")
+
+    def test_dialogue_surface_never_selects_title_typography(self) -> None:
+        for surface in ("light", "dark", "art", "unknown"):
+            with self.subTest(surface=surface):
+                group = {
+                    "type": "dialogue",
+                    "bubble_type": "dialogue",
+                    "bubble_segmentation": {
+                        "failure_reason": "low_mask_confidence",
+                        "mask_quality": {"surface": surface},
+                    },
+                }
+                self.assertEqual(renderer_for_region(group), "dialogue")
+                confidence, review_reason = _surface_report(group)
+                self.assertLessEqual(confidence, 0.69)
+                self.assertEqual(review_reason, "surface_fallback:low_mask_confidence")
+
+    def test_manual_art_text_override_remains_authoritative(self) -> None:
+        group = {
+            "type": "dialogue",
+            "bubble_type": "dialogue",
+            "manual": True,
+            "render_mode": "art_text",
+        }
+
+        self.assertEqual(renderer_for_region(group), "title")
+
+    def test_fallback_surface_prioritizes_bright_bubble_over_text_edges(self) -> None:
+        pixels = np.full((100, 120, 3), 245, dtype=np.uint8)
+        pixels[8:92, 8:11] = 0
+        pixels[8:92, 109:112] = 0
+        pixels[8:11, 8:112] = 0
+        pixels[89:92, 8:112] = 0
+        for x in range(25, 96, 12):
+            pixels[22:78, x:x + 3] = 0
+
+        result = _fallback_surface(Image.fromarray(pixels), [[8, 8], [112, 8], [112, 92], [8, 92]])
+
+        self.assertEqual(result["surface"], "light")
+        self.assertGreater(result["surface_bright_fraction"], 0.65)
+
+    def test_fallback_surface_recognizes_uniform_dark_caption(self) -> None:
+        pixels = np.full((100, 120, 3), 12, dtype=np.uint8)
+        for x in range(30, 91, 15):
+            pixels[22:78, x:x + 2] = 245
+
+        result = _fallback_surface(Image.fromarray(pixels), [[8, 8], [112, 8], [112, 92], [8, 92]])
+
+        self.assertEqual(result["surface"], "dark")
+        self.assertGreater(result["surface_dark_fraction"], 0.65)
+
+    def test_fallback_surface_keeps_varied_background_as_art(self) -> None:
+        values = np.indices((100, 120)).sum(axis=0) % 2
+        pixels = np.repeat(np.where(values[..., None] == 0, 35, 220).astype(np.uint8), 3, axis=2)
+
+        result = _fallback_surface(Image.fromarray(pixels), [[8, 8], [112, 8], [112, 92], [8, 92]])
+
+        self.assertEqual(result["surface"], "art")
+
+    def test_rejected_art_dialogue_uses_conservative_mask_without_background_plate(self) -> None:
+        from hydra_manga_tl.title.reconstruction.engine import reconstruct_title_page
+
+        image = Image.new("RGB", (120, 80), (150, 150, 150))
+        group = {
+            "index": 1,
+            "art_dialogue": True,
+            "art_cleanup_fallback": "outlined-review",
+            "cleanup_polygons": [[[35, 15], [55, 15], [55, 65], [35, 65]]],
+            "source_polygons": [[[35, 15], [55, 15], [55, 65], [35, 65]]],
+        }
+        rejected = TitleReconstructionResult(
+            provider="opencv",
+            capabilities=ProviderCapabilities(),
+        )
+        report = TitleReconstructionReport(
+            group=1,
+            provider="opencv",
+            capabilities=ProviderCapabilities(),
+            status="review",
+            confidence=0.0,
+            mask_quality=0.0,
+            background_quality=0.0,
+            cleanup_quality=0.0,
+            cleanup_method="",
+            warning="mask_not_safe",
+        )
+
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "hydra_manga_tl.title.reconstruction.engine.reconstruct_title_group",
+            return_value=(rejected, report),
+        ):
+            result = reconstruct_title_page(
+                image,
+                [group],
+                np.zeros((80, 120), dtype=np.uint8),
+                output_dir=Path(folder),
+                stem="page",
+                configured_inpaint_python=str(Path(folder) / "missing.exe"),
+            )
+
+        self.assertGreater(int(np.count_nonzero(result.mask)), 0)
+        self.assertEqual(result.background_plate_reports, [])
+        self.assertTrue(result.needs_review)
+        self.assertIn("opencv-inpaint", result.cleaning_method)
+        self.assertEqual(group["title_reconstruction_report"]["title_reconstruction_status"], "review")
+        self.assertEqual(group["title_reconstruction_report"]["title_reconstruction_warning"], "art_dialogue_conservative_mask")
+
     def test_manual_region_keeps_selection_cleanup_and_placement_separate(self) -> None:
         region = ManualRegion(
             id="manual-1",
@@ -60,8 +247,8 @@ class IntelligentCleanupGeometryTests(unittest.TestCase):
         self.assertEqual(len(decorative_symbols), 1)
         self.assertEqual(decorative_symbols[0]["text"], "♥")
         self.assertEqual(decorative_symbols[0]["polygon"], HEART)
-        self.assertEqual(decorative_symbols[0]["render_policy"], "redraw_semantic")
-        self.assertNotIn("preserve_policy", decorative_symbols[0])
+        self.assertEqual(decorative_symbols[0]["render_policy"], "preserve_original")
+        self.assertEqual(decorative_symbols[0]["preserve_policy"], "preserve_original")
 
     def test_auto_group_split_removes_marks_from_translation_text(self) -> None:
         group, member_indices, decorative_symbols = _text_group_without_preserved_marks(
@@ -75,7 +262,7 @@ class IntelligentCleanupGeometryTests(unittest.TestCase):
         self.assertEqual(group.text, "あ")
         self.assertEqual(member_indices, [1])
         self.assertEqual(len(decorative_symbols), 1)
-        self.assertEqual(decorative_symbols[0]["render_policy"], "redraw_semantic")
+        self.assertEqual(decorative_symbols[0]["render_policy"], "preserve_original")
 
     def test_make_mask_prefers_cleanup_polygons_over_legacy_source_polygons(self) -> None:
         mask = make_mask(
@@ -88,6 +275,7 @@ class IntelligentCleanupGeometryTests(unittest.TestCase):
         )
 
         self.assertEqual(int(mask[20, 20]), 255)
+        self.assertEqual(int(mask[40, 40]), 0)
         self.assertEqual(int(mask[60, 100]), 0)
 
     def test_make_mask_excludes_preserved_mark_polygons(self) -> None:
@@ -122,6 +310,22 @@ class IntelligentCleanupGeometryTests(unittest.TestCase):
 
         self.assertEqual(int(mask[20, 20]), 255)
         self.assertEqual(int(mask[40, 40]), 255)
+
+    def test_make_mask_preserves_isolated_decorative_symbol(self) -> None:
+        mask = make_mask(
+            (140, 100),
+            [{
+                "cleanup_polygons": [CLEANUP, HEART],
+                "decorative_symbols": [{
+                    "polygon": HEART,
+                    "render_policy": "preserve_original",
+                }],
+            }],
+            dilation=0,
+        )
+
+        self.assertEqual(int(mask[20, 20]), 255)
+        self.assertEqual(int(mask[45, 45]), 0)
 
     def test_make_mask_clips_cleanup_to_selection_polygon_after_dilation(self) -> None:
         tapered = [[20, 0], [120, 0], [82, 100], [45, 100]]
@@ -360,6 +564,13 @@ class IntelligentCleanupGeometryTests(unittest.TestCase):
 
         rendered = report["rendered_groups"][0]
         self.assertTrue(rendered["preserved_content_aware"])
+        self.assertIn("surface_classification", rendered)
+        self.assertIn("surface_confidence", rendered)
+        self.assertIn("surface_review_reason", rendered)
+        self.assertIn("cleanup_method", rendered)
+        self.assertIn("overflow", rendered)
+        self.assertIn("text_color", rendered)
+        self.assertIn("stroke_color", rendered)
         self.assertIn(
             rendered["constraint_strategy"],
             {"preserved_content_aware", "preserved_content_distributed"},

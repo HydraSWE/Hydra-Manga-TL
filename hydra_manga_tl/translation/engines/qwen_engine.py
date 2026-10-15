@@ -329,7 +329,7 @@ class QwenGGUFEngine:
             )
         all_translations: list[dict[str, str]] = []
 
-        def _translate_batch(batch: list[dict]) -> list[dict]:
+        def _translate_batch(batch: list[dict], *, constrain_json: bool = False) -> list[dict]:
             """Translate a single batch, returning normalized translation dicts."""
             batch_expected_ids = [str(item.get("id", "")) for item in batch]
             prompt = build_page_prompt(
@@ -359,14 +359,28 @@ class QwenGGUFEngine:
                 batch_max_tokens = min(batch_max_tokens, remaining)
 
             try:
-                completion = self._llama.create_chat_completion(
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=self.temperature,
-                    max_tokens=batch_max_tokens,
-                )
+                try:
+                    completion = self._llama.create_chat_completion(
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=self.temperature,
+                        max_tokens=batch_max_tokens,
+                        **({"response_format": {"type": "json_object"}} if constrain_json else {}),
+                    )
+                except ValueError as exc:
+                    if "system role not supported" not in str(exc).casefold():
+                        raise
+                    completion = self._llama.create_chat_completion(
+                        messages=[{
+                            "role": "user",
+                            "content": f"{SYSTEM_PROMPT}\n\n{prompt}",
+                        }],
+                        temperature=self.temperature,
+                        max_tokens=batch_max_tokens,
+                        **({"response_format": {"type": "json_object"}} if constrain_json else {}),
+                    )
                 raw = completion["choices"][0]["message"]["content"]
             except AttributeError:
                 result = self._llama(prompt, max_tokens=batch_max_tokens, temperature=self.temperature, echo=False)
@@ -377,7 +391,26 @@ class QwenGGUFEngine:
             except Exception as exc:  # pragma: no cover - runtime-specific
                 raise RuntimeError(f"Qwen GGUF generation failed: {exc}") from exc
 
-            payload = extract_first_json_object(raw)
+            try:
+                payload = extract_first_json_object(raw)
+            except ValueError:
+                if len(batch_expected_ids) != 1 or not constrain_json:
+                    raise
+                plain_text = str(raw).strip()
+                if plain_text.startswith("```") and plain_text.endswith("```"):
+                    plain_text = plain_text[3:-3].strip()
+                    if plain_text.casefold().startswith("text\n"):
+                        plain_text = plain_text[5:].strip()
+                if not plain_text or plain_text[0] in "[{":
+                    raise
+                LOGGER.warning(
+                    "Qwen returned plain text for constrained single-item batch id=%s; accepting it",
+                    batch_expected_ids[0],
+                )
+                return [{
+                    "id": batch_expected_ids[0],
+                    "text": self.restore_protected_text(plain_text, entity_map),
+                }]
             batch_translations = payload.get("translations", [])
             if not isinstance(batch_translations, list):
                 raise RuntimeError("Qwen response did not include a translations array")
@@ -445,7 +478,7 @@ class QwenGGUFEngine:
             retries = 0
             while True:
                 try:
-                    result_items = _translate_batch(batch)
+                    result_items = _translate_batch(batch, constrain_json=retries > 0)
                     all_translations.extend(result_items)
                     break
                 except (RuntimeError, ValueError) as exc:

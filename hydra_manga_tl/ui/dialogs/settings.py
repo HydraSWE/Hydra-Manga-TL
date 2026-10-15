@@ -74,6 +74,7 @@ class SettingsDialog(SettingsActionsMixin, QDialog):
         self.translation_fallback = QComboBox()
         self.translation_fallback.addItem("No automatic fallback", "")
         _add_provider_item(self.translation_fallback, "Marian (local)", "marian")
+        _add_provider_item(self.translation_fallback, "Local Qwen (optional)", "qwen")
         _add_provider_item(self.translation_fallback, "Groq", "groq")
         _add_provider_item(self.translation_fallback, "OpenAI", "openai")
         _add_provider_item(self.translation_fallback, "OpenAI-Compatible", "openai_compatible")

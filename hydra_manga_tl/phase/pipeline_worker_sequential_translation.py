@@ -236,6 +236,7 @@ class PipelineWorkerSequentialTranslationMixin:
                 "preserved_marks": list(payload.get("preserved_marks", [])),
                 "source_member_texts": [str(source_regions[i - 1].get("text", "")) for i in group.member_indices],
                 "source_text_colors": list(payload.get("source_text_colors", [])),
+                "ocr_recognition": dict(payload.get("ocr_recognition", {})),
                 "bubble_segmentation": segmentation_payload,
                 "bubble_mask": str(segmentation_payload.get("mask_path", "")),
                 "safe_area": list(segmentation_payload.get("safe_area", [])),

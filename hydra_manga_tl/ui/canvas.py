@@ -347,22 +347,13 @@ class CanvasView(CanvasTextLayoutMixin, QGraphicsView):
                 event.accept()
                 return
             else:
-                rect = QRectF(base)
                 local_start = self._layout_frame.mapFromScene(start)
                 local_current = self._layout_frame.mapFromScene(current)
                 dx = local_current.x() - local_start.x()
                 dy = local_current.y() - local_start.y()
-                if "left" in role:
-                    rect.setLeft(rect.left() + dx)
-                if "right" in role:
-                    rect.setRight(rect.right() + dx)
-                if "top" in role:
-                    rect.setTop(rect.top() + dy)
-                if "bottom" in role:
-                    rect.setBottom(rect.bottom() + dy)
-                rect = rect.normalized()
+                rect = self._resized_layout_rect(base, role, dx, dy)
                 self._layout_frame.setPen(QPen(QColor("#37d3ff"), 2, Qt.PenStyle.SolidLine))
-                self._set_text_layout_rect(self._clamp_layout_rect(rect))
+                self._set_text_layout_rect(rect)
             event.accept()
             return
         if self._layout_frame is not None and self._layout_drag is None:

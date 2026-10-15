@@ -12,6 +12,7 @@ from typing import Any
 
 from hydra_manga_tl import __version__
 from hydra_manga_tl.core.normalization import normalize_global_text
+from hydra_manga_tl.core.region_types import normalize_region_type
 from hydra_manga_tl.ocr.core import OCRResult
 from hydra_manga_tl.ocr.service import current_rss_mb
 from hydra_manga_tl.phase.intelligent_page import IntelligentPageResult

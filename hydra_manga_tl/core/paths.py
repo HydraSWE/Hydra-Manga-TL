@@ -64,6 +64,8 @@ class AppPaths:
         self.cache = self.root / "cache"
         self.schema_cache = self.cache_for_schema(CURRENT_CACHE_SCHEMA)
         self.ocr_cache = self.schema_cache / "ocr"
+        self.model_cache = self.root / "models"
+        self.manga_ocr_models = self.model_cache / "manga_ocr"
         self.page_translation_cache = self.schema_cache / "page_translation"
         legacy_tm = self.root / "translation_memory.db"
         legacy_phrase = self.root / "phrase_memory.db"
@@ -84,6 +86,7 @@ class AppPaths:
         self.profile_root.mkdir(parents=True, exist_ok=True)
         self.logs.mkdir(parents=True, exist_ok=True)
         self.ocr_cache.mkdir(parents=True, exist_ok=True)
+        self.manga_ocr_models.mkdir(parents=True, exist_ok=True)
         self.page_translation_cache.mkdir(parents=True, exist_ok=True)
         self.title_style_cache.mkdir(parents=True, exist_ok=True)
         self._copy_legacy_profile_state()

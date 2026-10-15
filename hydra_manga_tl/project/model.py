@@ -77,6 +77,7 @@ class ManualRegion:
     translation_source: str = ""
     translation_provider: str = ""
     translation_memory_units: list[dict] = field(default_factory=list)
+    ocr_recognition: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.rect = [int(value) for value in self.rect]

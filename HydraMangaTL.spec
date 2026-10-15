@@ -48,7 +48,7 @@ if BUILD_SUPPORT.is_dir():
 for qt_path_name in ("plugins", "qml", "translations"):
     ensure_qt_reported_path(qt_path_name)
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 APP_STATUS = "current development"
 
 # PaddleOCR and PaddleX discover inference pipelines and operators dynamically.
@@ -72,7 +72,7 @@ if INPAINT_RUNTIME.exists():
 else:
     print("Optional inpaint runtime not bundled; build it with scripts/build_inpaint_runtime.ps1")
 
-for package in ("paddle", "paddleocr", "paddlex"):
+for package in ("paddle", "paddleocr", "paddlex", "manga_ocr"):
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += package_datas
     binaries += package_binaries
@@ -124,6 +124,8 @@ for distribution in (
     "sacremoses",
     "tokenizers",
     "safetensors",
+    "manga-ocr",
+    "huggingface-hub",
     "llama-cpp-python",
     "nvidia-cuda-runtime-cu12",
     "nvidia-cublas-cu12",
@@ -155,6 +157,10 @@ a = Analysis(
     noarchive=False,
     optimize=1,
 )
+
+# Prevent external/poppler ICU libraries from hijacking Windows System32 DirectWrite/Qt
+a.binaries = [x for x in a.binaries if not x[0].lower().startswith(("icuuc", "icudt"))]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

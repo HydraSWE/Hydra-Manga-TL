@@ -107,6 +107,26 @@ class AppSettings:
 
     @classmethod
     def load(cls, paths: AppPaths = PATHS) -> "AppSettings":
+        # The legacy root-level file also acts as a bootstrap pointer when the
+        # user moves Hydra's data folder. Resolve that pointer before choosing
+        # a profile file; otherwise a stale profile in the default root masks
+        # the new location on every subsequent launch.
+        bootstrap_path = paths.settings
+        if bootstrap_path.is_file():
+            try:
+                bootstrap_payload = json.loads(
+                    bootstrap_path.read_text(encoding="utf-8")
+                )
+                bootstrap_root = str(
+                    bootstrap_payload.get("app_data_root") or ""
+                ).strip()
+                if (
+                    bootstrap_root
+                    and Path(bootstrap_root).expanduser().resolve() != paths.root
+                ):
+                    paths.configure(bootstrap_root)
+            except (OSError, RuntimeError, ValueError, TypeError):
+                pass
         source_path = (
             paths.profile_settings
             if paths.profile_settings.is_file()

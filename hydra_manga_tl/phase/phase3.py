@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
-from hydra_manga_tl.phase.art_inpaint import inpaint_python, is_art_text_group, render_art_text
+from hydra_manga_tl.phase.art_inpaint import inpaint_python, render_art_text
 from hydra_manga_tl.core.fonts import default_font_file, resolve_font_file
 from hydra_manga_tl.project.artifacts import rendered_filename
 from hydra_manga_tl.core.normalization import normalize_global_text
@@ -30,7 +30,8 @@ from hydra_manga_tl.phase.renderer import (
     fit_text_avoiding_preserved,
     has_preserved_content,
     make_mask,
-    render_group
+    render_group,
+    render_decorative_symbols,
 )
 
 DEFAULT_FONT = default_font_file()
@@ -81,7 +82,7 @@ def inputs(path: Path) -> list[Path]:
 
 
 def should_replace(group: dict, source_language: str, policy: str) -> tuple[bool, str | None]:
-    if source_language == "Latin-script" or group["status"] == "preserved":
+    if source_language == "Latin-script" or group.get("status") == "preserved":
         return False, "preserved"
     if (
         group_region_type(group) == "title"
@@ -91,12 +92,15 @@ def should_replace(group: dict, source_language: str, policy: str) -> tuple[bool
         return True, None
     if not group.get("translated_text") or "translation_unchanged" in group.get("review_reasons", []):
         return False, "no_reliable_translation"
+    # When force or all policy is active, or group was manually edited, render translated text
+    if policy in {"all", "force"} or group.get("manual") or group.get("edited"):
+        return True, None
     if group.get("status") == "review" and "low_confidence_or_empty" in group.get("review_reasons", []):
         return False, "low_confidence_or_empty"
     if str(group.get("translated_text", "")).strip() == str(group.get("original_text", "")).strip():
         return False, "translation_unchanged"
-    if policy == "safe" and group["status"] != "translated":
-        return False, group["status"]
+    if policy == "safe" and group.get("status") != "translated":
+        return False, group.get("status", "review")
     if policy == "safe" and decorative_horizontal(group, (10_000, 10_000)):
         return False, "decorative_or_title"
     return True, None
@@ -106,7 +110,9 @@ def renderer_for_region(group: dict) -> str:
     """Return the renderer family for a region payload."""
     if is_title_like_region(group):
         return "title"
-    if is_art_text_group(group, (10_000, 10_000)):
+    if group.get("manual") and (
+        group.get("art_text") is True or group.get("render_mode") == "art_text"
+    ):
         return "title"
     return "dialogue"
 
@@ -140,7 +146,31 @@ def _render_text_color(group: dict) -> str | None:
     explicit = group.get("text_color")
     if isinstance(explicit, str) and explicit.strip().startswith("#"):
         return explicit
+    surface = str(
+        (group.get("bubble_segmentation") or {}).get("mask_quality", {}).get("surface", "")
+    )
+    if surface == "dark":
+        return "#ffffff"
+    if surface == "light":
+        return "#0a0a0a"
     return _source_solid_text_color(group)
+
+
+def _surface_classification(group: dict) -> str:
+    return str(
+        (group.get("bubble_segmentation") or {}).get("mask_quality", {}).get("surface", "unknown")
+    )
+
+
+def _surface_report(group: dict) -> tuple[float, str]:
+    segmentation = group.get("bubble_segmentation") or {}
+    quality = segmentation.get("mask_quality") or {}
+    confidence = float(quality.get("surface_confidence", segmentation.get("confidence", 0.0)) or 0.0)
+    failure_reason = str(segmentation.get("failure_reason") or "")
+    if failure_reason:
+        confidence = min(confidence, 0.69)
+    review_reason = f"surface_fallback:{failure_reason}" if failure_reason else ""
+    return confidence, review_reason
 
 
 def _region_layout_polygon(group: dict, image_size: tuple[int, int]) -> list[list[int]] | None:
@@ -159,6 +189,19 @@ def _title_render_group(group: dict, image_size: tuple[int, int]) -> dict:
     routed["bubble_type"] = region_type
     routed["renderable_type"] = region_type
     routed["render_mode"] = "art_text"
+    surface = str(
+        (routed.get("bubble_segmentation") or {}).get("mask_quality", {}).get("surface", "")
+    )
+    if surface == "art" and region_type not in {"title", "credit"}:
+        routed["art_dialogue"] = True
+        routed["preserve_translation_case"] = True
+        routed["art_cleanup_fallback"] = "outlined-review"
+        placement = routed.get("placement_polygon") or routed.get("polygon") or []
+        if placement:
+            box = expanded_box(placement, image_size)
+            routed["title_render_polygon"] = [
+                [box[0], box[1]], [box[2], box[1]], [box[2], box[3]], [box[0], box[3]],
+            ]
     layout_polygon = _region_layout_polygon(routed, image_size)
     if layout_polygon is not None:
         routed["title_render_polygon"] = layout_polygon
@@ -611,11 +654,25 @@ def run(
                 direction=group.get("render_direction", group.get("direction", "horizontal-ltr")),
                 angle=float(group.get("text_layout", {}).get("angle", 0.0)),
             )
+            details.update(render_decorative_symbols(
+                final, fitted, group, group_font, color=_render_text_color(group)
+            ))
             details["group"] = group["index"]
             details["source_region_indices"] = group.get("member_region_indices", [])
             details["placement_strategy"] = strategy
             details["renderer"] = "dialogue"
             details["region_type"] = group_region_type(group)
+            details["surface_classification"] = _surface_classification(group)
+            details["surface_confidence"], details["surface_review_reason"] = _surface_report(group)
+            details["cleanup_method"] = cleaning_method
+            recognition = group.get("ocr_recognition", {})
+            if isinstance(recognition, dict) and recognition:
+                details["ocr_selected_recognizer"] = recognition.get("recognizer", "paddle")
+                details["ocr_paddle_candidate"] = recognition.get("paddle_candidate", "")
+                details["ocr_manga_candidate"] = recognition.get("manga_candidate", "")
+                details["ocr_variant_agreement"] = recognition.get("agreement", 0.0)
+                details["ocr_review_reason"] = list(recognition.get("review_reasons", []))
+                details["ocr_model_fallback"] = recognition.get("fallback_reason", "")
             rendered.append(details)
         for group in title_jobs:
             details = render_art_text(
@@ -631,12 +688,18 @@ def run(
             details["placement_strategy"] = "title_renderer"
             details["renderer"] = "title"
             details["region_type"] = group_region_type(group)
+            details["surface_classification"] = _surface_classification(group)
+            details["surface_confidence"], details["surface_review_reason"] = _surface_report(group)
+            details["cleanup_method"] = cleaning_method
             if isinstance(group.get("title_mask_report"), dict):
                 details.update(group["title_mask_report"])
             if isinstance(group.get("title_background_plate_report"), dict):
                 details.update(group["title_background_plate_report"])
             if isinstance(group.get("title_reconstruction_report"), dict):
                 details.update(group["title_reconstruction_report"])
+                details["review_reason"] = group["title_reconstruction_report"].get(
+                    "title_reconstruction_warning", ""
+                )
             rendered.append(details)
 
         final.save(final_path)

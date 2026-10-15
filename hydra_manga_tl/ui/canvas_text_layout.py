@@ -47,9 +47,13 @@ class CanvasTextLayoutMixin:
             "bottom-right": Qt.CursorShape.SizeFDiagCursor,
             "top-right": Qt.CursorShape.SizeBDiagCursor,
             "bottom-left": Qt.CursorShape.SizeBDiagCursor,
+            "left": Qt.CursorShape.SizeHorCursor,
+            "right": Qt.CursorShape.SizeHorCursor,
+            "top": Qt.CursorShape.SizeVerCursor,
+            "bottom": Qt.CursorShape.SizeVerCursor,
             "rotate": Qt.CursorShape.PointingHandCursor,
         }
-        for role in ("top-left", "top-right", "bottom-left", "bottom-right", "rotate"):
+        for role in ("top-left", "top", "top-right", "right", "bottom-right", "bottom", "bottom-left", "left", "rotate"):
             handle = QGraphicsEllipseItem(-5, -5, 10, 10)
             handle.setData(0, row)
             handle.setData(1, role)
@@ -109,9 +113,13 @@ class CanvasTextLayoutMixin:
         rect = self._layout_frame.rect()
         scene_positions = {
             "top-left": self._layout_frame.mapToScene(rect.topLeft()),
+            "top": self._layout_frame.mapToScene(QPointF(rect.center().x(), rect.top())),
             "top-right": self._layout_frame.mapToScene(rect.topRight()),
+            "right": self._layout_frame.mapToScene(QPointF(rect.right(), rect.center().y())),
             "bottom-left": self._layout_frame.mapToScene(rect.bottomLeft()),
+            "bottom": self._layout_frame.mapToScene(QPointF(rect.center().x(), rect.bottom())),
             "bottom-right": self._layout_frame.mapToScene(rect.bottomRight()),
+            "left": self._layout_frame.mapToScene(QPointF(rect.left(), rect.center().y())),
             "rotate": self._layout_frame.mapToScene(QPointF(rect.center().x(), rect.top() - 24.0)),
         }
         for handle in self._layout_handles:
@@ -125,10 +133,15 @@ class CanvasTextLayoutMixin:
         if self._layout_frame is None:
             return None
         for handle in self._layout_handles:
-            if str(handle.data(1)) != "rotate":
+            role = str(handle.data(1))
+            if role == "rotate":
+                if math.hypot(scene_pos.x() - handle.pos().x(), scene_pos.y() - handle.pos().y()) <= 10.0:
+                    return ("rotate", "rotate")
                 continue
-            if math.hypot(scene_pos.x() - handle.pos().x(), scene_pos.y() - handle.pos().y()) <= 10.0:
-                return ("rotate", "rotate")
+            if role in {"left", "right", "top", "bottom"} and math.hypot(
+                scene_pos.x() - handle.pos().x(), scene_pos.y() - handle.pos().y()
+            ) <= 10.0:
+                return (role, "resize")
         rect = self._layout_frame.rect()
         corners = {
             "top-left": self._layout_frame.mapToScene(rect.topLeft()),
@@ -164,6 +177,10 @@ class CanvasTextLayoutMixin:
             "bottom-right": Qt.CursorShape.SizeFDiagCursor,
             "top-right": Qt.CursorShape.SizeBDiagCursor,
             "bottom-left": Qt.CursorShape.SizeBDiagCursor,
+            "left": Qt.CursorShape.SizeHorCursor,
+            "right": Qt.CursorShape.SizeHorCursor,
+            "top": Qt.CursorShape.SizeVerCursor,
+            "bottom": Qt.CursorShape.SizeVerCursor,
             "rotate": Qt.CursorShape.PointingHandCursor,
         }
         for handle in self._layout_handles:
@@ -181,6 +198,19 @@ class CanvasTextLayoutMixin:
                 handle.setPen(QPen(QColor("#081018"), 1))
                 handle.setBrush(QColor("#37d3ff"))
                 handle.setCursor(cursors.get(role, Qt.CursorShape.SizeAllCursor))
+
+    def _resized_layout_rect(self, base: QRectF, role: str, dx: float, dy: float) -> QRectF:
+        bounds = self._pixmap.boundingRect()
+        left, top, right, bottom = base.left(), base.top(), base.right(), base.bottom()
+        if "left" in role:
+            left = max(bounds.left(), min(left + dx, right - 20.0))
+        if "right" in role:
+            right = min(bounds.right(), max(right + dx, left + 20.0))
+        if "top" in role:
+            top = max(bounds.top(), min(top + dy, bottom - 12.0))
+        if "bottom" in role:
+            bottom = min(bounds.bottom(), max(bottom + dy, top + 12.0))
+        return QRectF(left, top, right - left, bottom - top)
 
     def _update_rotation_hud(self, center: QPointF, mouse_pos: QPointF, angle: float) -> None:
         if self._rotation_pivot_item is None:

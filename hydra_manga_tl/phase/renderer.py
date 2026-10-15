@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 
 import cv2
 import numpy as np
@@ -55,25 +56,25 @@ def compute_safe_text_area(image: Image.Image, polygon: list[list[int]], base_pa
 
     w, h = max(1, x2 - x1), max(1, y2 - y1)
     cx, cy = x1 + (w // 2), y1 + (h // 2)
-    
+
     pad_x = max(50, min(300, int(w * 1.5)))
     pad_y = max(50, min(300, int(h * 1.5)))
-    
+
     crop_x1, crop_y1 = max(0, cx - pad_x), max(0, cy - pad_y)
     crop_x2, crop_y2 = min(width, cx + pad_x), min(height, cy + pad_y)
-    
+
     roi = gray[crop_y1:crop_y2, crop_x1:crop_x2]
     if roi.size == 0:
         return None
 
     blurred = cv2.GaussianBlur(roi, (5, 5), 0)
     binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 10)
-    
+
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
-    
+
     best_label = -1
     best_score = float('inf')
-    
+
     roi_x1, roi_y1 = x1 - crop_x1, y1 - crop_y1
     roi_x2, roi_y2 = x2 - crop_x1, y2 - crop_y1
     roi_cx, roi_cy = cx - crop_x1, cy - crop_y1
@@ -117,7 +118,7 @@ def compute_safe_text_area(image: Image.Image, polygon: list[list[int]], base_pa
 
     bubble_mask = np.uint8(labels == best_label) * 255
     dist_map = cv2.distanceTransform(bubble_mask, cv2.DIST_L2, 5)
-    
+
     bubble_w, bubble_h = stats[best_label, cv2.CC_STAT_WIDTH], stats[best_label, cv2.CC_STAT_HEIGHT]
     dynamic_margin = max(base_padding, int(min(bubble_w, bubble_h) * 0.08))
     
@@ -171,12 +172,12 @@ def detect_bubble_box(image: Image.Image, polygon: list[list[int]], padding: int
         
         if bw < source_width or bh < source_height:
             continue
-            
+
         if area < source_area * 1.15 or area > width * height * 0.55:
             continue
         if bw > max_width or bh > max_height or area > max_area:
             continue
-            
+
         ix1, iy1 = max(bx, x1), max(by, y1)
         ix2, iy2 = min(bx + bw, x2), min(by + bh, y2)
         inter_w, inter_h = max(0, ix2 - ix1), max(0, iy2 - iy1)
@@ -265,18 +266,43 @@ def clean_background(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, s
     selected = mask > 0
     if not selected.any():
         return image.copy(), "unchanged"
-    expanded = cv2.dilate(mask, np.ones((9, 9), np.uint8)) > 0
-    ring = expanded & ~selected
-    ring_pixels = image[ring]
-    light_ratio = float(np.mean(gray[expanded] > 190)) if expanded.any() else 0.0
-    if light_ratio >= 0.62 and len(ring_pixels):
-        fill = np.percentile(ring_pixels, 75, axis=0).astype(np.uint8)
-        cleaned = image.copy()
-        cleaned[selected] = fill
-        return cleaned, "light-background-fill"
-    bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    cleaned = cv2.inpaint(bgr, mask, 3, cv2.INPAINT_TELEA)
-    return cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB), "opencv-inpaint"
+    count, labels = cv2.connectedComponents(np.uint8(selected), 8)
+    cleaned = image.copy()
+    methods: list[str] = []
+    for label in range(1, count):
+        component = labels == label
+        component_mask = np.uint8(component) * 255
+        expanded = cv2.dilate(component_mask, np.ones((9, 9), np.uint8)) > 0
+        ring = expanded & ~component
+        ring_pixels = image[ring]
+        method = "opencv-inpaint"
+        if len(ring_pixels):
+            ring_gray = gray[ring]
+            light_ratio = float(np.mean(ring_gray >= 180))
+            dark_ratio = float(np.mean(ring_gray <= 65))
+            if light_ratio >= 0.45 or float(np.percentile(ring_gray, 75)) >= 195:
+                bright_pixels = ring_pixels[ring_gray >= 160]
+                fill = np.percentile(bright_pixels, 90, axis=0).astype(np.uint8) if len(bright_pixels) else np.array([255, 255, 255], dtype=np.uint8)
+                if float(fill.mean()) >= 225:
+                    fill = np.array([255, 255, 255], dtype=np.uint8)
+                cleaned[component] = fill
+                method = "light-background-fill"
+            elif dark_ratio >= 0.50 or float(np.percentile(ring_gray, 25)) <= 70:
+                dark_pixels = ring_pixels[ring_gray <= 80]
+                fill = np.percentile(dark_pixels, 15, axis=0).astype(np.uint8) if len(dark_pixels) else np.array([0, 0, 0], dtype=np.uint8)
+                if float(fill.mean()) <= 25:
+                    fill = np.array([0, 0, 0], dtype=np.uint8)
+                cleaned[component] = fill
+                method = "dark-background-fill"
+            else:
+                bgr = cv2.cvtColor(cleaned, cv2.COLOR_RGB2BGR)
+                cleaned = cv2.cvtColor(cv2.inpaint(bgr, component_mask, 3, cv2.INPAINT_TELEA), cv2.COLOR_BGR2RGB)
+        else:
+            bgr = cv2.cvtColor(cleaned, cv2.COLOR_RGB2BGR)
+            cleaned = cv2.cvtColor(cv2.inpaint(bgr, component_mask, 3, cv2.INPAINT_TELEA), cv2.COLOR_BGR2RGB)
+        methods.append(method)
+    unique_methods = list(dict.fromkeys(methods))
+    return cleaned, unique_methods[0] if len(unique_methods) == 1 else "+".join(unique_methods)
 
 
 def render_group(
@@ -290,73 +316,178 @@ def render_group(
     direction: str = "horizontal-ltr",
     angle: float = 0.0,
 ) -> dict:
-    font = ImageFont.truetype(str(font_path), fitted.font_size)
     x1, y1, x2, y2 = fitted.box
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+
     crop = np.asarray(image.crop((x1, y1, x2, y2)).convert("L"))
     light = float(crop.mean()) >= 130 if crop.size else True
+
+    # Text colors: high contrast pure black for light bubble, pure white for dark
     if color and color.startswith("#") and len(color) == 7:
-        fill = tuple(int(color[index:index + 2], 16) for index in (1, 3, 5))
+        fill_rgb = tuple(int(color[index:index + 2], 16) for index in (1, 3, 5))
     else:
-        fill = (15, 15, 15) if light else (255, 255, 255)
-    stroke_fill = (255, 255, 255) if light else (0, 0, 0)
-    stroke_width = 0 if light else max(1, fitted.font_size // 10)
-    total_height = fitted.line_height * len(fitted.lines)
-    layer = Image.new("RGBA", (max(1, x2 - x1), max(1, y2 - y1)), (0, 0, 0, 0))
+        fill_rgb = (10, 10, 10) if light else (255, 255, 255)
+    fill = fill_rgb + (255,)
+
+    # 2x Supersampling for ultra-crisp anti-aliasing and smooth rotations
+    SCALE = 2
+    hi_font_size = max(8, fitted.font_size * SCALE)
+    font = ImageFont.truetype(str(font_path), hi_font_size)
+
+    stroke_fill = None if light else (0, 0, 0, 255)
+    stroke_width = 0 if light else max(1, (hi_font_size // 9))
+
+    hi_line_height = fitted.line_height * SCALE
+    total_height = hi_line_height * len(fitted.lines)
+
+    layer_w = box_w * SCALE
+    layer_h = box_h * SCALE
+    layer = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
 
     explicit_positions = fitted.line_positions or []
-    y = max(0, int((y2 - y1 - total_height) / 2))
+    y = max(0, int((layer_h - total_height) / 2))
     positions = []
+    overflow = False
+
     for index, line in enumerate(fitted.lines):
         bounds = _text_bbox(draw, line, font, stroke_width=stroke_width)
         line_width = bounds[2] - bounds[0]
         if index < len(explicit_positions):
-            x = int(explicit_positions[index][0])
-            y_for_line = int(explicit_positions[index][1])
+            x = int(explicit_positions[index][0] * SCALE)
+            y_for_line = int(explicit_positions[index][1] * SCALE)
         elif alignment == "left":
             x = -bounds[0]
             y_for_line = y
         elif alignment == "right":
-            x = (x2 - x1) - line_width - bounds[0]
+            x = layer_w - line_width - bounds[0]
             y_for_line = y
         else:
-            x = max(0, (x2 - x1 - line_width) // 2) - bounds[0]
+            x = max(0, (layer_w - line_width) // 2) - bounds[0]
             y_for_line = y
+
         draw.text((x, y_for_line), line, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
-        positions.append([x1 + x, y1 + y_for_line])
-        y += fitted.line_height
-        
+        overflow = overflow or (
+            x + bounds[0] < 0
+            or x + bounds[2] > layer_w
+            or y_for_line + bounds[1] < 0
+            or y_for_line + bounds[3] > layer_h
+        )
+        positions.append([x1 + (x // SCALE), y1 + (y_for_line // SCALE)])
+        y += hi_line_height
+
     if angle and abs(angle) > 0.01:
         rotated = layer.rotate(-angle, expand=True, resample=Image.Resampling.BICUBIC)
-        center_x = x1 + (x2 - x1) / 2
-        center_y = y1 + (y2 - y1) / 2
-        paste_x = int(round(center_x - rotated.width / 2))
-        paste_y = int(round(center_y - rotated.height / 2))
+        downsampled = rotated.resize(
+            (max(1, rotated.width // SCALE), max(1, rotated.height // SCALE)),
+            resample=Image.Resampling.LANCZOS,
+        )
+        center_x = x1 + box_w / 2
+        center_y = y1 + box_h / 2
+        paste_x = int(round(center_x - downsampled.width / 2))
+        paste_y = int(round(center_y - downsampled.height / 2))
         if image.mode != "RGBA":
             base = image.convert("RGBA")
-            base.alpha_composite(rotated, (paste_x, paste_y))
+            base.alpha_composite(downsampled, (paste_x, paste_y))
             image.paste(base.convert(image.mode))
         else:
-            image.alpha_composite(rotated, (paste_x, paste_y))
+            image.alpha_composite(downsampled, (paste_x, paste_y))
     else:
+        downsampled = layer.resize((box_w, box_h), resample=Image.Resampling.LANCZOS)
         if image.mode != "RGBA":
             base = image.convert("RGBA")
-            base.alpha_composite(layer, (x1, y1))
+            base.alpha_composite(downsampled, (x1, y1))
             image.paste(base.convert(image.mode))
         else:
-            image.alpha_composite(layer, (x1, y1))
+            image.alpha_composite(downsampled, (x1, y1))
+
     return {
         "text": text,
         "lines": fitted.lines,
         "font_size": fitted.font_size,
         "box": fitted.box,
         "positions": positions,
+        "text_color": "#%02x%02x%02x" % fill_rgb,
+        "stroke_color": None if stroke_fill is None else "#%02x%02x%02x" % stroke_fill[:3],
+        "stroke_width": stroke_width // SCALE,
+        "overflow": overflow,
         "preserved_content_aware": bool(fitted.preserved_content_aware),
         "preserved_overlap_pixels": int(fitted.preserved_overlap_pixels),
         "constraint_strategy": fitted.constraint_strategy,
         "preserved_overlap_fallback": fitted.fallback_reason == "preserved_overlap_fallback",
         "constraint_fallback_reason": fitted.fallback_reason,
     }
+
+
+def render_decorative_symbols(
+    image: Image.Image,
+    fitted: FittedText,
+    group: dict,
+    font_path: Path,
+    *,
+    color: str | None = None,
+) -> dict:
+    symbols = [
+        str(item.get("text", ""))
+        for item in group.get("decorative_symbols", []) or []
+        if isinstance(item, dict) and item.get("render_policy") == "redraw_semantic"
+    ]
+    preserved = sum(
+        1 for item in group.get("decorative_symbols", []) or []
+        if isinstance(item, dict) and item.get("render_policy") == "preserve_original"
+    )
+    if not symbols:
+        return {"symbols_preserved": preserved, "symbols_redrawn": 0, "symbol_overlap": False}
+
+    x1, y1, x2, y2 = fitted.box
+    size = max(8, min(22, round(min(x2 - x1, y2 - y1) * 0.13)))
+    total_width = size * len(symbols)
+    font = ImageFont.truetype(str(font_path), fitted.font_size)
+    draw = ImageDraw.Draw(image)
+    occupied = []
+    for index, line in enumerate(fitted.lines):
+        if index < len(fitted.line_positions or []):
+            occupied.append(draw.textbbox(tuple(fitted.line_positions[index]), line, font=font, stroke_width=1))
+
+    def overlaps(rect: tuple[int, int, int, int]) -> bool:
+        return any(not (rect[2] <= box[0] or rect[0] >= box[2] or rect[3] <= box[1] or rect[1] >= box[3]) for box in occupied)
+
+    candidates = [
+        (x2 - total_width - 3, y2 - size - 3), (x1 + 3, y2 - size - 3),
+        (x2 - total_width - 3, y1 + 3), (x1 + 3, y1 + 3),
+    ]
+    position = next((point for point in candidates if not overlaps((point[0], point[1], point[0] + total_width, point[1] + size))), None)
+    if position is None:
+        return {
+            "symbols_preserved": preserved, "symbols_redrawn": 0, "symbol_overlap": True,
+            "symbol_review_reason": "no_non_overlapping_symbol_position",
+        }
+
+    fill = color if color and color.startswith("#") else "#111111"
+    for index, symbol in enumerate(symbols):
+        left, top = position[0] + index * size, position[1]
+        right, bottom = left + size - 2, top + size - 2
+        if symbol in {"♥", "♡", "❤"}:
+            draw.polygon([
+                (left + size // 2, bottom), (left + 1, top + size // 3),
+                (left + size // 4, top), (left + size // 2, top + size // 4),
+                (left + size * 3 // 4, top), (right, top + size // 3),
+            ], fill=fill)
+        elif symbol in {"★", "☆"}:
+            points = []
+            for point_index in range(10):
+                radius = size / 2 if point_index % 2 == 0 else size / 4
+                angle = -math.pi / 2 + point_index * math.pi / 5
+                points.append((left + size / 2 + math.cos(angle) * radius, top + size / 2 + math.sin(angle) * radius))
+            draw.polygon(points, fill=fill)
+        elif symbol in {"●", "○", "◎"}:
+            draw.ellipse((left, top, right, bottom), fill=fill)
+        elif symbol in {"◆", "◇", "■", "□"}:
+            draw.polygon([(left + size // 2, top), (right, top + size // 2), (left + size // 2, bottom), (left, top + size // 2)], fill=fill)
+        else:
+            draw.text((left, top), symbol, font=ImageFont.truetype(str(font_path), size), fill=fill)
+    return {"symbols_preserved": preserved, "symbols_redrawn": len(symbols), "symbol_overlap": False}
 
 def expanded_box(polygon: list[list[int]], image_size: tuple[int, int]) -> list[int]:
     xs, ys = [point[0] for point in polygon], [point[1] for point in polygon]

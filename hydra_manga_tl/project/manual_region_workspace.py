@@ -27,6 +27,28 @@ from hydra_manga_tl.translation.requests import RenderRequest
 LOGGER = logging.getLogger(__name__)
 
 
+def _manual_render_skip_reason(
+    render_dir: Path,
+    source_path: Path,
+    manual_key: str,
+) -> str | None:
+    report_path = render_dir / f"{source_path.stem}_render.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return "render_report_unavailable"
+    if any(str(item.get("group", "")) == manual_key for item in report.get("rendered_groups", [])):
+        return None
+    skipped = next(
+        (
+            item for item in report.get("skipped_groups", [])
+            if str(item.get("group", "")) == manual_key
+        ),
+        None,
+    )
+    return str(skipped.get("reason") or "render_skipped") if skipped else "manual_group_missing"
+
+
 class ManualRegionWorkspaceMixin:
     """Provide manual text-box requests, rendering, and status updates."""
     def request_manual_region(self, image_index: int, region: list[int] | list[list[int]]) -> bool:
@@ -304,6 +326,38 @@ class ManualRegionWorkspaceMixin:
             return
         source = Path(str(context.get("source_path", image.source_path)))
         render_dir = Path(str(result.get("render_dir") or context.get("render_dir")))
+        manual_key = str(context.get("manual_key", ""))
+        skip_reason = _manual_render_skip_reason(render_dir, source, manual_key)
+        if skip_reason is not None:
+            manual = next(
+                (
+                    item for item in image.manual_regions
+                    if item.id == str(context.get("manual_id", ""))
+                ),
+                None,
+            )
+            if manual is not None:
+                manual.status = "review"
+                if skip_reason not in manual.review_reasons:
+                    manual.review_reasons.append(skip_reason)
+            self._update_image_review_status(image_index)
+            self.save()
+            self.image_updated.emit(image_index)
+            message = {
+                "text_does_not_fit": "The translation could not fit inside this text box. Enlarge the box or shorten the translation.",
+                "disabled_in_editor": "This text box is disabled in the editor.",
+                "render_report_unavailable": "The renderer finished without a readable render report.",
+                "manual_group_missing": "The renderer did not report this manual text box.",
+            }.get(skip_reason, f"The renderer skipped this text box: {skip_reason}.")
+            LOGGER.warning(
+                "Manual box: render skipped image=%s manual_key=%s reason=%s",
+                image_index,
+                manual_key,
+                skip_reason,
+            )
+            self.manual_region_failed.emit(image_index, message)
+            self.translation_request_state_changed.emit(request_id, "failed", message)
+            return
         image.rendered_image = str(render_dir / f"{source.stem}_translated_en.png")
         image.preview_image = str(render_dir / f"{source.stem}_preview.png")
         self._persist_rendered_style_profiles(image_index, render_dir)
